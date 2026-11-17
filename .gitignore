@@ -1,0 +1,74 @@
+# Private development evidence, backups, screenshots, and generated helpers.
+/evidence/
+
+# Build products and locally packaged applications.
+/build/
+/dist/
+/DerivedData/
+.build/
+*.app/
+*.dSYM/
+*.o
+*.swiftmodule
+*.swiftdoc
+*.swiftsourceinfo
+
+# Interpreter, editor, and environment caches.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+node_modules/
+.DS_Store
+*.swp
+*.tmp
+
+# Never publish local VM images, restored state, or installers.
+.tart/
+*.ipsw
+*.img
+*.dmg
+*.qcow2
+*.raw
+*.asif
+nvram.bin
+savedstate
+saved-state/
+
+# Private application/controller state and guest payloads.
+GoldVMManager/
+Gold*Network/
+/environments/
+/build-jobs/
+/restore-images/
+/profiles/
+/logs/
+/setup/
+/guest_setup/config.json
+/guest_setup/policy.json
+server.json
+environment.json
+policy.json
+control.json
+status.json
+registry.json
+build-current.json
+shares.last-start.json
+*.sock
+*.lock
+*.log
+
+# Local authentication material (examples must be deliberately reviewed).
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.keychain
+*.keychain-db
+credentials.json
+.credentials.json

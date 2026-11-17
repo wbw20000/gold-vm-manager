@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="referrer" content="no-referrer">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'">
+  <title>Gold · 本地虚拟机工作空间</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">跳到工作空间</a>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="工作空间导航">
+      <a class="brand" href="/" aria-label="Gold VM Manager 首页"><span class="brand-mark" aria-hidden="true">g<span>·</span></span><span>gold<span class="brand-caption">VM MANAGER</span></span></a>
+      <div class="workspace-label"><span class="tiny-dot"></span> 独立本地工作空间</div>
+      <div class="nav-label">虚拟机 <span id="vm-total">04</span></div>
+      <nav id="vm-navigation" class="vm-navigation" aria-label="选择虚拟机"></nav>
+      <div class="sidebar-note"><span class="local-icon" aria-hidden="true">⌘</span><strong>你的 Mac，你的边界。</strong><p>所有操作仅在本机执行。<br>目录共享由你明确授权。</p></div>
+      <div class="sidebar-bottom"><span id="connection-indicator" class="connection-dot"></span><span id="connection-label">正在连接本机</span><button id="connection-settings" class="icon-button" type="button" aria-label="配置访问令牌" title="配置访问令牌">⚙</button></div>
+    </aside>
+    <main id="main" class="main" tabindex="-1">
+      <header class="topbar"><div class="breadcrumb">工作空间 <span>/</span> 虚拟机控制台</div><div class="topbar-right"><button id="new-vm" class="button button-primary" type="button" disabled>＋ 新建 VM</button><span class="local-badge">LOCAL ONLY</span><span id="last-sync">等待同步</span><button id="refresh" class="icon-button" type="button" title="立即刷新" aria-label="立即刷新状态">↻</button></div></header>
+      <section class="page-heading"><div><h1>虚拟机</h1><p>你的本地环境，一目了然。</p></div><div class="heading-badge"><span class="tiny-dot"></span> Gold VM Manager <span id="app-version"></span></div></section>
+      <section id="connection-banner" class="banner" hidden aria-live="polite"></section>
+      <section class="host-overview" aria-label="本机资源"><div class="host-title"><span class="host-symbol" aria-hidden="true">⌘</span><div><strong>本机资源</strong><span>HOST MACHINE</span></div></div><div class="host-metric"><span>处理器</span><strong id="host-cpu">—</strong></div><div class="host-metric"><span>统一内存</span><strong id="host-memory">—</strong></div><div class="host-metric"><span>可用磁盘</span><strong id="host-disk">—</strong></div><div class="host-summary"><span id="running-count">—</span><small>台虚拟机运行中</small></div></section>
+      <section id="build-job" class="banner" hidden aria-live="polite"></section>
+      <section id="initialization-job" class="banner" hidden aria-live="polite"></section>
+      <section id="vm-overview" class="vm-overview" aria-label="虚拟机概览"></section>
+      <div class="section-heading"><h2>虚拟机管理</h2><span>操作与共享目录</span></div>
+      <section id="workspace-detail" class="workspace-detail" aria-label="当前虚拟机"><div class="loading-panel"><span class="loading-ring" aria-hidden="true"></span><h2>正在连接你的工作空间</h2><p>从本机读取真实状态，不预填演示数据。</p></div></section>
+      <section class="activity-section"><div class="section-heading"><h2>最近动态</h2><span>由本机服务提供</span></div><div id="activity-list" class="activity-list"><p class="empty-inline">连接后显示操作记录</p></div></section>
+      <footer class="page-footer"><span>GOLD / LOCAL COMPUTING, CONSIDERED.</span><span>共享目录只在下次冷启动时应用；恢复不会更新挂载。</span></footer>
+    </main>
+  </div>
+  <dialog id="build-dialog" class="modal share-modal" aria-labelledby="build-title">
+    <form id="build-form" novalidate>
+      <div class="modal-heading"><div><div class="eyebrow">A CLEAN START</div><h2 id="build-title">新建 VM</h2></div><button class="icon-button dialog-close" type="button" aria-label="关闭对话框">×</button></div>
+      <p id="build-description" class="modal-description"></p>
+      <div class="field"><label for="build-name">虚拟机名称 · 由你填写</label><input id="build-name" maxlength="64" autocomplete="off" spellcheck="false" placeholder="输入名称，不会自动命名" required><button id="build-keep-name" class="text-button" type="button" hidden>使用原名称</button><small>支持中文、字母、数字、空格、短横线、下划线；不能覆盖其他 VM。</small></div>
+      <div class="field"><label for="build-cpu">CPU（vCPU）</label><input id="build-cpu" type="number" min="2" step="1" value="2" required></div>
+      <div class="field"><label for="build-memory">内存（GiB）</label><input id="build-memory" type="number" min="4" step="1" value="4" required></div>
+      <div class="field"><label for="build-disk">磁盘容量（GiB）</label><input id="build-disk" type="number" min="50" max="1024" step="1" value="50" required><small>默认 2 vCPU／4 GiB，可手动调整。镜像最低要求不满足时会拒绝，不会偷偷增加资源。2 核可能较慢或有稳定性风险。</small></div>
+      <div class="field"><label for="build-image-mode">全新 macOS 来源</label><select id="build-image-mode"><option value="latest">从 Apple 下载当前宿主支持的最新恢复镜像</option><option value="local">选择已有 Apple IPSW 恢复镜像</option></select></div>
+      <div id="build-image-local" class="field" hidden><label for="build-ipsw">本机 IPSW 文件</label><div class="path-input"><input id="build-ipsw" autocomplete="off" placeholder="/绝对路径/macOS.ipsw"><button id="pick-ipsw" class="button button-secondary" type="button">选择镜像…</button></div></div>
+      <div id="build-setup-profile"></div>
+      <p class="form-note">从零安装：新磁盘、NVRAM、ECID 与 MAC；硬件型号受 Apple 限制，不承诺全部硬件字段不同。安装阶段无网卡，完成后仅通过专属端点防护联网。</p>
+      <p class="write-warning">原型功能：创建、重建、删除和启动已在开发环境通过面板验证，不代表完整自动初始化或任意环境兼容。首次设置与软件安装仍需手动完成。失败可能保留暂存文件；请先备份重要数据。</p>
+      <label class="checkbox-label"><input id="build-setup-ack" type="checkbox"><span>允许复制宿主当前 Clash 节点配置到新 VM 的只读安装材料；不复制 Claude／CCBaga 身份库、钥匙串或浏览器资料。<small>首次需要在 VM 内完成 macOS 设置并运行 setup 安装向导，授权 Clash/Mihomo 核心服务（不含 Verge 图形客户端）、安装软件、检查代理并自行登录 Claude。创建成功不代表这些步骤已完成。</small></span></label>
+      <div id="build-erase-warning" class="write-warning" hidden><strong>不可撤销：旧 VM 内的内容将全部丢弃</strong><p>确认后会先准备镜像和新系统，再删除旧磁盘及暂停状态，不保留旧 VM 备份。宿主共享原文件不会删除，但新 VM 的共享配置会清空。远端 token 不会因此撤销，宿主备份也不会自动擦除。</p><label class="checkbox-label"><input id="build-erase-ack" type="checkbox"><span>我确认删除选中的旧 VM 全部内容</span></label><div class="field"><label id="build-confirm-label" for="build-confirm">完整输入旧 VM 名称</label><input id="build-confirm" autocomplete="off" spellcheck="false"></div></div>
+      <p id="build-error" class="form-error" role="alert" hidden></p>
+      <div class="modal-footer"><button class="button button-secondary dialog-close" type="button">取消</button><button id="build-submit" class="button button-primary" type="submit" disabled>开始新建</button></div>
+    </form>
+  </dialog>
+  <dialog id="delete-dialog" class="modal confirm-modal" aria-labelledby="delete-title" aria-describedby="delete-description">
+    <form id="delete-form" novalidate>
+      <div class="modal-heading"><h2 id="delete-title">永久删除 VM</h2><button class="icon-button dialog-close" type="button" aria-label="关闭">×</button></div>
+      <p id="delete-description" class="write-warning">不可撤销：永久删除选中 VM 的磁盘、配置与暂停状态，不提供撤销或备份。不会删除宿主共享目录原文件；不会撤销远端令牌或清除宿主备份。运行中的 VM 必须先正常关机；本操作不会自动关机或强制停止。</p>
+      <div class="field"><label id="delete-name-label" for="delete-name">完整输入 VM 名称</label><input id="delete-name" autocomplete="off" spellcheck="false" required></div>
+      <label class="checkbox-label"><input id="delete-erase-ack" type="checkbox" required><span>我确认永久抹除这台 VM 的全部内容，且已有需要的备份。</span></label>
+      <p id="delete-error" class="form-error" role="alert" hidden></p>
+      <div class="modal-footer"><button class="button button-secondary dialog-close" type="button">取消</button><button id="delete-submit" class="button button-danger" type="submit" disabled>永久删除 VM</button></div>
+    </form>
+  </dialog>
+  <dialog id="initialize-dialog" class="modal share-modal" aria-labelledby="initialize-title">
+    <form id="initialize-form" novalidate>
+      <div class="modal-heading"><h2 id="initialize-title">自动初始化 · 预览</h2><button class="icon-button dialog-close" type="button" aria-label="关闭">×</button></div>
+      <p class="write-warning">预览：当前宿主 macOS 26 的客机 UI 自动化尚未完成真实端到端验收。遇到未知页面必须停止，不猜测点击；启动请求不代表初始化完成。已有账号或恢复模式不适用。</p>
+      <div id="initialize-setup-profile"></div>
+      <p id="initialize-native-note" class="form-note"></p>
+      <p class="form-note">用户名、全名和密码仅在原生 App 的安全表单内填写，不会进入网页、模型或此请求。此页面只提交非敏感初始化模板；不会自动使用 Apple Account。</p>
+      <p id="initialize-error" class="form-error" role="alert" hidden></p>
+      <div class="modal-footer"><button class="button button-secondary dialog-close" type="button">取消</button><button id="initialize-submit" class="button button-primary" type="submit">在原生 App 继续…</button></div>
+    </form>
+  </dialog>
+  <dialog id="share-dialog" class="modal share-modal" aria-labelledby="share-title" aria-describedby="share-description">
+    <form id="share-form" novalidate>
+      <div class="modal-heading"><div><div class="eyebrow">SHARED DIRECTORY</div><h2 id="share-title">添加共享目录</h2></div><button class="icon-button dialog-close" type="button" aria-label="关闭对话框">×</button></div>
+      <p id="share-description" class="modal-description">只共享你需要的目录。不会创建、移动或删除主机文件。</p>
+      <div class="field"><label for="share-name">共享名称</label><input id="share-name" name="name" autocomplete="off" maxlength="100" placeholder="例如 project" required><small>客机挂载位置 <code id="guest-path-preview">/Volumes/My Shared Files/…</code></small></div>
+      <div class="field"><label for="share-path">主机目录</label><div class="path-input"><input id="share-path" name="path" autocomplete="off" spellcheck="false" placeholder="/Users/你的用户名/Projects" required><button id="pick-directory" class="button button-secondary" type="button">选择目录…</button></div><small id="picker-hint">可以打开原生目录选择器，也可以手动填写绝对路径。</small></div>
+      <div class="field"><label for="share-mode">访问权限</label><select id="share-mode" name="mode"><option value="ro">只读 · 客机可查看，不可修改</option><option value="rw">读写 · 客机可修改主机文件</option></select></div>
+      <div id="write-warning" class="write-warning" hidden><strong>读写权限会直接影响主机文件</strong><p>客机对该目录的修改、覆盖和删除会同步到主机。请勿共享密钥、系统目录或虚拟机镜像。</p><label class="checkbox-label"><input id="write-ack" type="checkbox"><span>我了解风险，允许客机写入这个主机目录</span></label></div>
+      <label class="checkbox-label enabled-field"><input id="share-enabled" type="checkbox" checked><span>启用这个共享目录<small>关闭后仍保留配置，不会删除任何文件。</small></span></label>
+      <p class="form-note">运行或暂停期间保存的变更，需正常关机后重新启动才会生效。</p>
+      <p id="share-form-error" class="form-error" role="alert" hidden></p>
+      <div class="modal-footer"><button class="button button-secondary dialog-close" type="button">取消</button><button id="share-submit" class="button button-primary" type="submit">保存目录</button></div>
+    </form>
+  </dialog>
+  <dialog id="confirm-dialog" class="modal confirm-modal" aria-labelledby="confirm-title" aria-describedby="confirm-description">
+    <form id="confirm-form" novalidate><div class="modal-heading"><div><div id="confirm-eyebrow" class="eyebrow">PLEASE CONFIRM</div><h2 id="confirm-title">确认操作</h2></div><button class="icon-button dialog-close" type="button" aria-label="关闭对话框">×</button></div><p id="confirm-description" class="modal-description"></p><div id="confirm-input-group" class="field" hidden><label id="confirm-input-label" for="confirm-name">输入虚拟机名称</label><input id="confirm-name" autocomplete="off" spellcheck="false"><small>必须完整匹配，包括大小写；不会自动执行强制操作。</small></div><p id="confirm-error" class="form-error" role="alert" hidden></p><div class="modal-footer"><button class="button button-secondary dialog-close" type="button">取消</button><button id="confirm-submit" class="button button-primary" type="submit">确认</button></div></form>
+  </dialog>
+  <dialog id="token-dialog" class="modal" aria-labelledby="token-title" aria-describedby="token-description"><form id="token-form"><div class="modal-heading"><div><div class="eyebrow">LOCAL CONNECTION</div><h2 id="token-title">连接本机服务</h2></div><button class="icon-button dialog-close" type="button" aria-label="关闭对话框">×</button></div><p id="token-description" class="modal-description">请从启动器打开带访问令牌的链接，或在这里手动输入令牌。令牌仅保存在当前标签页的会话中。</p><div class="field"><label for="token-input">访问令牌</label><input id="token-input" type="password" required autocomplete="off" spellcheck="false" placeholder="粘贴本机访问令牌"></div><div class="modal-footer"><button class="button button-secondary dialog-close" type="button">取消</button><button class="button button-primary" type="submit">连接</button></div></form></dialog>
+  <div id="toast-region" class="toast-region" role="status" aria-live="polite" aria-atomic="false"></div>
+  <noscript><div class="noscript">请启用 JavaScript，以安全地连接本机虚拟机服务。</div></noscript>
+</body>
+</html>

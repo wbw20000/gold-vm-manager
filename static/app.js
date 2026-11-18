@@ -4,6 +4,8 @@
   let VM_IDS = [];
   let buildContext = null;
   let buildBusy = false;
+  let preinstallBusy = false;
+  let preinstallUI = null;
   const TOKEN_KEY = 'gold-vm-manager-token';
   const STATE_LABELS = { running: '运行中', stopped: '已关机', suspended: '已暂停', missing: '未找到' };
   const ACTION_LABELS = { start: '启动', 'recovery-start': '恢复模式启动', pause: '暂停', shutdown: '正常关机', 'force-stop': '强制停止', 'discard-state': '丢弃暂停状态', focus: '打开窗口' };
@@ -91,7 +93,7 @@
   function sharesOf(vm) { return Array.isArray(vm?.shares) ? vm.shares : []; }
   function activeShares(vm) { return Array.isArray(vm?.active_shares) ? vm.active_shares : []; }
   function vmBusy(vm) { return Boolean(vm?.busy || busyVMs.has(vm?.id)); }
-  function locked(vm) { return !connected || vmBusy(vm); }
+  function locked(vm) { return !connected || vmBusy(vm) || buildActive(); }
   function stateLabel(vm) { return vmBusy(vm) ? '操作中' : STATE_LABELS[vm.state] || '未知状态'; }
   function configKey(shares) {
     return JSON.stringify(shares.map((s) => ({ id: s.id || null, name: s.name, path: s.path, read_only: Boolean(s.read_only), enabled: Boolean(s.enabled) })));
@@ -139,7 +141,11 @@
   function renderConnection() {
     $('connection-indicator').className = `connection-dot ${connected ? 'connected' : 'error'}`;
     $('connection-label').textContent = connected ? '本机服务已连接' : token ? '本机连接不可用' : '需要访问令牌';
-    $('new-vm').disabled = !connected || !state?.capabilities?.create_vm || buildActive();
+    $('new-vm').disabled = !connected || !state?.capabilities?.offline_validate || buildActive();
+    $('preinstall-new').disabled = !connected || !preinstallUI || buildActive();
+    preinstallUI?.update();
+    if (buildContext) updateBuildForm();
+    if (confirmContext && ['action', 'remove'].includes(confirmContext.type)) $('confirm-submit').disabled = confirmBusy || buildActive() || Boolean(confirmContext.typed && $('confirm-name').value !== confirmContext.id);
     const banner = $('connection-banner');
     banner.hidden = connected;
     banner.replaceChildren();
@@ -216,8 +222,8 @@
     protection.append(el('span', 'protection-chip', network.management_enabled ? '管理通道已启用' : '管理通道未启用'));
     panel.append(protection);
     const actions = el('div', 'machine-actions');
-    const starting = vm.state === 'suspended' ? '继续运行' : '启动虚拟机';
-    actions.append(actionButton(starting, 'play', 'button button-primary', () => runAction(vm.id, 'start'), locked(vm) || !['stopped', 'suspended'].includes(vm.state), `start-${vm.id}`));
+    const starting = vm.preinstalled ? '受保护启动…' : vm.state === 'suspended' ? '继续运行' : '启动虚拟机';
+    actions.append(actionButton(starting, 'play', 'button button-primary', () => vm.preinstalled ? openActionConfirm(vm.id, 'start') : runAction(vm.id, 'start'), locked(vm) || !(vm.preinstalled ? vm.state === 'stopped' : ['stopped', 'suspended'].includes(vm.state)), `start-${vm.id}`));
     actions.append(actionButton('打开窗口', 'window', `button ${vm.state === 'running' ? 'button-primary' : 'button-secondary'}`, () => runAction(vm.id, 'focus'), locked(vm) || vm.state !== 'running', `focus-${vm.id}`));
     const pauseAllowed = vm.state === 'running' && vm.pause_supported && activeShares(vm).length === 0;
     const pause = actionButton('暂停', 'pause', 'button button-secondary', () => runAction(vm.id, 'pause'), locked(vm) || !pauseAllowed, `pause-${vm.id}`);
@@ -239,6 +245,11 @@
     if (vm.state === 'suspended') danger.append(actionButton('丢弃暂停状态…', 'trash', 'button button-danger-outline', () => openActionConfirm(vm.id, 'discard-state'), locked(vm), `discard-${vm.id}`));
     panel.append(danger);
     if (vm.state === 'suspended') panel.append(el('p', 'machine-notice', '共享变更需关机后重新启动才会生效。'));
+    if (vm.preinstalled) {
+      const imported = vm.preinstalled.configuration === 'imported';
+      const manual = vm.preinstalled.configuration === 'manual_recovery_required';
+      panel.append(el('p', 'machine-notice', imported ? '客机报告：已导入配置。系统授权和连通性尚未验收。' : manual ? '客机报告：未覆盖已有资料，请在客机中检查配置。' : '私有配置已布置；首次登录后导入，尚无客机回执。'));
+    }
     if (vm.state === 'missing') panel.append(el('p', 'machine-notice', '本机未找到这台虚拟机，请检查磁盘位置。'));
     if (vm.recovery_mode) panel.append(el('p', 'machine-notice', '恢复模式 · 不挂载宿主共享目录，请在客机内完成密码恢复。'));
     if (vm.last_error) panel.append(el('div', 'machine-error', typeof vm.last_error === 'string' ? vm.last_error : '最近一次操作失败，请查看本机服务记录。'));
@@ -291,9 +302,7 @@
       row.append(icon, info);
       item.append(row);
       const tools = el('div', 'share-tools');
-      tools.append(button('复制 Claude 命令', 'text-button', () => copyCommand(share.path), false, `copy-${share.id}`));
       tools.append(button('在 Finder 中显示', 'text-button', () => revealDirectory(vm.id, share.id), locked(vm), `reveal-${share.id}`));
-      tools.append(el('span', 'tool-separator'));
       tools.append(button('编辑', 'text-button', () => openShare(vm.id, share.id), locked(vm), `edit-${share.id}`));
       tools.append(button(share.enabled ? '停用' : '启用', 'text-button', () => toggleShare(vm.id, share.id), locked(vm), `toggle-${share.id}`));
       tools.append(button('移除', 'text-button remove', () => openRemove(vm.id, share.id), locked(vm), `remove-${share.id}`));
@@ -302,7 +311,7 @@
     });
     panel.append(list);
     const footer = el('div', 'shares-footer');
-    footer.append(el('p', '', '↳ 客机目录：/Volumes/My Shared Files/<共享名称>'), el('p', '', 'Claude 命令在主机终端中使用。移除或停用共享不会删除主机文件。'));
+    footer.append(el('p', '', '↳ 客机目录：/Volumes/My Shared Files/<共享名称>'), el('p', '', '移除或停用共享不会删除主机文件。'));
     if (activeShares(vm).some((active) => !sharesOf(vm).some((s) => s.id === active.id))) footer.append(el('p', '', '注意：已移除的旧目录在本次启动中仍可能挂载，正常关机后才会解除。'));
     panel.append(footer);
     return panel;
@@ -386,7 +395,7 @@
     return pollFlight;
   }
 
-  async function runAction(id, action, confirmName) {
+  async function runAction(id, action, confirmName, backendAcknowledged = false) {
     lastActionError = '';
     const vm = vmById(id);
     if (!vm || locked(vm)) {
@@ -397,11 +406,16 @@
       toast('恢复启动仅适用于支持恢复模式且已关机的虚拟机，并须输入完整 VM 名称确认。', true);
       return false;
     }
+    if (action === 'start' && vm.preinstalled && (!backendAcknowledged || confirmName !== id || vm.state !== 'stopped')) {
+      toast('请在受保护启动对话框确认后端提示和完整 VM 名称。', true);
+      return false;
+    }
     busyVMs.add(id);
     render();
     try {
       const body = { action };
       if (confirmName !== undefined) body.confirm_name = confirmName;
+      if (action === 'start' && vm.preinstalled && backendAcknowledged) body.acknowledge_reviewed_unsigned_backend = true;
       const result = await api(`/api/vms/${encodeURIComponent(id)}/action`, { method: 'POST', body });
       toast(result.message || '请求已发送，请等待虚拟机状态更新。');
       await refresh();
@@ -417,15 +431,17 @@
     const vm = vmById(id);
     if (!vm || locked(vm)) return;
     if (action === 'recovery-start' && (!vm.recovery_supported || vm.state !== 'stopped')) return;
-    const dangerous = action === 'force-stop' || action === 'discard-state' || action === 'recovery-start';
-    confirmContext = { type: 'action', id, action, typed: dangerous };
+    const backend = action === 'start' && Boolean(vm.preinstalled);
+    if (backend && vm.state !== 'stopped') return;
+    const dangerous = backend || action === 'force-stop' || action === 'discard-state' || action === 'recovery-start';
+    confirmContext = { type: 'action', id, action, typed: dangerous, backend };
     $('confirm-title').textContent = `${ACTION_LABELS[action]} ${id}？`;
-    $('confirm-description').textContent = action === 'recovery-start' ? '仅为找回这台虚拟机遗忘的本地登录密码而进入 macOS 恢复模式。保留现有磁盘、数据与 VM 身份，不创建新身份，不抹除、不重建，也不清除钥匙串。本次恢复启动挂载的宿主共享目录为零。你需要亲自在虚拟机窗口内完成恢复，可能需要 FileVault 恢复密钥或 Apple Account。不要向模型提供任何密码、恢复密钥或账号凭据。此操作仅启动恢复模式，不保证能重设密码。请输入完整 VM 名称确认。' : action === 'shutdown' ? '向客机发送正常关机请求，不会强制终止进程。客机可能弹出确认窗口，请在虚拟机内完成确认；发送请求不等于已关机。' : action === 'force-stop' ? '将立即终止虚拟机，未保存的工作可能永久丢失。请优先使用正常关机。此操作不会删除虚拟机或主机共享目录。' : '将丢弃保存的运行状态，暂停时未保存的工作可能永久丢失。此操作不会删除虚拟机磁盘或主机共享目录；随后需重新启动。';
+    $('confirm-description').textContent = backend ? '固定版本 gvproxy 的 SHA-256 已核验，但它没有可用的 Developer ID 签名或公证。输入完整 VM 名称并点击「同意尝试受保护启动」，即允许仅为本机这份私有副本设置所有者执行位，并请求 macOS 正常执行。不会清除隔离属性或关闭系统保护；如被 macOS 拒绝则不启动或改用普通网络。首次系统设置、账号及服务授权仍需亲自完成。' : action === 'recovery-start' ? '仅为找回这台虚拟机遗忘的本地登录密码而进入 macOS 恢复模式。保留现有磁盘、数据与 VM 身份，不创建新身份，不抹除、不重建，也不清除钥匙串。本次恢复启动挂载的宿主共享目录为零。你需要亲自在虚拟机窗口内完成恢复，可能需要 FileVault 恢复密钥或 Apple Account。不要向模型提供任何密码、恢复密钥或账号凭据。此操作仅启动恢复模式，不保证能重设密码。请输入完整 VM 名称确认。' : action === 'shutdown' ? '向客机发送正常关机请求，不会强制终止进程。客机可能弹出确认窗口，请在虚拟机内完成确认；发送请求不等于已关机。' : action === 'force-stop' ? '将立即终止虚拟机，未保存的工作可能永久丢失。请优先使用正常关机。此操作不会删除虚拟机或主机共享目录。' : '将丢弃保存的运行状态，暂停时未保存的工作可能永久丢失。此操作不会删除虚拟机磁盘或主机共享目录；随后需重新启动。';
     $('confirm-input-group').hidden = !dangerous;
     $('confirm-input-label').textContent = `请输入「${id}」以确认`;
     $('confirm-name').value = '';
     $('confirm-name').required = dangerous;
-    $('confirm-submit').textContent = ACTION_LABELS[action];
+    $('confirm-submit').textContent = backend ? '同意尝试受保护启动' : ACTION_LABELS[action];
     $('confirm-submit').className = dangerous ? 'button button-danger' : 'button button-primary';
     $('confirm-submit').disabled = dangerous;
     $('confirm-error').hidden = true;
@@ -595,7 +611,7 @@
     $('confirm-error').hidden = true;
     try {
       if (context.type === 'action') {
-        const done = await runAction(context.id, context.action, context.typed ? $('confirm-name').value : undefined);
+        const done = await runAction(context.id, context.action, context.typed ? $('confirm-name').value : undefined, context.backend === true);
         if (!done) { showError('confirm-error', lastActionError || '操作未完成，请刷新状态后核对；不要重复执行危险操作。'); return; }
       } else {
         const vm = vmById(context.id);
@@ -607,33 +623,6 @@
       confirmBusy = false;
       $('confirm-submit').disabled = Boolean(context.typed && $('confirm-name').value !== context.id);
       $('confirm-dialog').querySelectorAll('.dialog-close').forEach((item) => { item.disabled = false; });
-    }
-  }
-
-  function shellQuote(path) { return `'${String(path).replace(/'/g, "'\\''")}'`; }
-  async function copyCommand(path) {
-    const command = `cd -- ${shellQuote(path)} && claude`;
-    try {
-      if (!navigator.clipboard?.writeText) throw new Error('clipboard_unavailable');
-      await navigator.clipboard.writeText(command);
-      toast('已复制主机 Claude Code 命令，请在主机终端中粘贴执行。');
-    } catch (_) {
-      // Accessible fallback stays local and requires another explicit copy action.
-      confirmContext = { type: 'copy', command, typed: false };
-      $('confirm-title').textContent = '复制主机终端命令';
-      $('confirm-description').textContent = '浏览器未允许自动写入剪贴板。请选中下方命令并按 ⌘C（或 Ctrl+C）复制。命令不会自动执行。';
-      $('confirm-input-group').hidden = false;
-      $('confirm-input-label').textContent = '在主机终端运行';
-      $('confirm-name').value = command;
-      $('confirm-name').readOnly = true;
-      $('confirm-name').required = false;
-      $('confirm-submit').textContent = '完成';
-      $('confirm-submit').className = 'button button-primary';
-      $('confirm-submit').disabled = false;
-      $('confirm-error').hidden = true;
-      $('confirm-dialog').showModal();
-      $('confirm-name').focus();
-      $('confirm-name').select();
     }
   }
 
@@ -722,7 +711,21 @@
   }
 
   function buildActive() {
-    return Boolean(state?.build_job?.recovery_required) || ['queued', 'preflight', 'downloading', 'inspecting', 'installing', 'provisioning', 'committing', 'deleting'].includes(state?.build_job?.phase);
+    const job = state?.build_job;
+    return Boolean((typeof preinstallBusy !== 'undefined' && preinstallBusy) || job?.recovery_required || job?.offline_preinstall?.active || job?.vpn_configuration?.active
+      || (job?.mode === 'preinstall' && !job.published && ['awaiting_offline_preinstall', 'awaiting_first_desktop_acceptance'].includes(job.phase)))
+      || ['queued', 'preflight', 'downloading', 'inspecting', 'acquiring', 'installing', 'preinstalling', 'awaiting_vpn_configuration', 'vpn_resume_queued', 'resuming_vpn', 'configuring_vpn', 'awaiting_system_authorization', 'verifying', 'preparing_runtime', 'publishing', 'provisioning', 'committing', 'deleting'].includes(job?.phase);
+  }
+
+  function waitingVpnJob() {
+    const job = state?.build_job;
+    return window.GoldPreinstall?.isWaitingVpnJob(job) ? job : null;
+  }
+
+  function openWaitingVpnConfiguration(id, name) {
+    const job = waitingVpnJob();
+    if (!connected || preinstallBusy || !job || job.id !== id || job.name !== name) return;
+    return preinstallUI?.openResume(id);
   }
 
   function renderBuildJob() {
@@ -740,25 +743,41 @@
       return;
     }
     const labels = { queued: '已排队', preflight: '前置检查', downloading: '下载恢复镜像', inspecting: '检查镜像', installing: '离线安装系统', provisioning: '准备软件与防护', committing: '发布新环境', awaiting_user_setup: '等待客机初始设置', failed: '任务未完成', interrupted: '任务已中断' };
+    labels.awaiting_offline_preinstall = '系统已恢复 · 应用未预装 · 未启动';
+    labels.awaiting_first_desktop_acceptance = '完整应用已离线预装 · 未启动 · 待首次桌面验收';
     labels.deleted = '已删除';
     labels.deleting = '正在删除';
-    region.append(el('strong', '', `${job.mode === 'delete' ? '删除' : job.mode === 'rebuild' ? '重建' : '新建'} ${job.name || ''} · ${labels[job.phase] || job.phase}`), el('span', '', job.message || ''));
+    Object.assign(labels, { acquiring: '获取经审核原始材料', preinstalling: '离线预装 4 个完整 App',
+      awaiting_vpn_configuration: '系统和应用已装好 · 等待配置 VPN', vpn_resume_queued: '继续配置 VPN 已排队', resuming_vpn: '继续配置 VPN',
+      configuring_vpn: '准备私有节点配置与首次登录导入', verifying: '核验原始应用与保护策略', preparing_runtime: '绑定并核对受保护启动环境', publishing: '发布新 VM · 不自动启动', awaiting_system_authorization: '等待真人系统与服务授权' });
+    const materialFailure = job.mode === 'preinstall' && job.phase === 'failed' && job.failed_phase === 'acquiring' && job.system_restored === false;
+    let message = job.message || '';
+    if (materialFailure) {
+      labels.failed = '材料准备失败';
+      message = (['unsafe-tar-path', 'invalid-tart-license-member'].includes(job.failure_code) ? 'Tart 安装包的路径未通过检查。' : '原始材料下载或校验未完成。') + '尚未创建虚拟磁盘，此阶段不涉及管理员授权。已保留下载，不自动重试。';
+    }
+    region.append(el('strong', '', `${job.mode === 'preinstall' ? '一键预装' : job.mode === 'offline_validate' ? '仅安装 VM' : job.mode === 'delete' ? '删除' : job.mode === 'rebuild' ? '重建' : '新建'} ${job.name || ''} · ${labels[job.phase] || job.phase}`), el('span', '', message));
+    if (job.mode === 'preinstall' && job.phase === 'awaiting_vpn_configuration') {
+      region.append(el('span', '', '尚未配置客机网络；VM 尚未发布或启动。完成此任务前不能开始其他 VM 操作。'));
+      if (waitingVpnJob()) region.append(button('继续配置 VPN', 'text-button', () => openWaitingVpnConfiguration(job.id, job.name),
+        !connected || preinstallBusy || !preinstallUI, 'continue-preinstall-vpn'));
+    } else if (job.mode === 'preinstall' && !materialFailure) region.append(el('span', '', '发布或写入配置不代表 VPN 已连通。首次开机、系统与服务授权、账号登录及桌面实测仍需你亲自确认。'));
     if (typeof job.progress === 'number') {
       const progress = el('progress'); progress.max = 1; progress.value = job.progress;
       progress.setAttribute('aria-label', '当前阶段进度');
       region.append(progress, el('span', '', `${Math.round(job.progress * 100)}%`));
     }
-    if (job.phase === 'awaiting_user_setup') region.append(button('选择新 VM', 'text-button', () => selectVM(job.name)));
+    if (job.phase === 'awaiting_user_setup' || (job.mode === 'preinstall' && job.published === true)) region.append(button('选择新 VM', 'text-button', () => selectVM(job.name)));
   }
 
-  function openBuild(source = null) {
-    if (!connected || buildActive()) return;
-    buildContext = { source };
+  function openBuild(source = null, offline = false) {
+    if (!connected || buildActive() || (!offline && !source) || (offline && (source || !state?.capabilities?.offline_validate))) return;
+    buildContext = { source, offline };
     buildBusy = false;
     $('build-form').reset();
     setSetupProfile('build');
-    $('build-title').textContent = source ? `彻底重建 ${source}` : '新建 VM';
-    $('build-description').textContent = source ? '不克隆旧磁盘，不继承旧账号、缓存或凭证。旧 VM 必须先关机或暂停；此向导不会强制停止。' : '创建独立的全新 macOS 环境，不删除或修改已有 VM。名称必须由你输入。';
+    $('build-title').textContent = offline ? '仅安装 VM（暂存）' : `彻底重建 ${source}`;
+    $('build-description').textContent = offline ? '只将 macOS 恢复到全新的暂存盘。不预装软件、不复制宿主节点，也不会出现在可启动的 VM 列表中。' : '不克隆旧磁盘，不继承旧账号、缓存或凭证。旧 VM 必须先关机或暂停；此向导不会强制停止。';
     $('build-name').value = '';
     $('build-cpu').value = '2'; $('build-memory').value = '4'; $('build-disk').value = '50';
     $('build-cpu').max = String(state.host?.cpu_count || 2);
@@ -766,9 +785,13 @@
     $('build-keep-name').hidden = !source;
     $('build-erase-warning').hidden = !source;
     $('build-confirm-label').textContent = `完整输入「${source || ''}」确认删除`;
-    $('build-image-local').hidden = true;
+    $('build-offline-notice').hidden = !offline;
+    $('build-legacy-setup').hidden = offline;
+    if (offline) $('build-image-mode').value = 'local';
+    $('build-image-local').hidden = !offline;
+    $('build-image-mode').disabled = offline;
     $('build-error').hidden = true;
-    $('build-submit').textContent = source ? '确认删除旧环境并重建' : '开始新建';
+    $('build-submit').textContent = offline ? '安装到暂存盘' : '确认删除旧环境并重建';
     $('build-submit').className = source ? 'button button-danger' : 'button button-primary';
     if (source && vmById(source)?.state === 'running') showError('build-error', '这台 VM 正在运行。请先退出此向导，正常关机或暂停，再重建。');
     updateBuildForm();
@@ -778,11 +801,14 @@
 
   function updateBuildForm() {
     const source = buildContext?.source;
+    const offline = buildContext?.offline === true;
+    if (offline) $('build-image-mode').value = 'local';
+    $('build-image-mode').disabled = buildBusy || offline;
     $('build-image-local').hidden = $('build-image-mode').value !== 'local';
     const resources = ['build-cpu', 'build-memory', 'build-disk'].every((id) => $(id).checkValidity() && Number.isInteger(Number($(id).value)));
     const name = $('build-name').value;
     const validName = name.length > 0 && name.length <= 64 && name.trim() === name && name.normalize('NFC') === name && /^[\p{L}\p{N} _-]+$/u.test(name) && !/^[.-]/.test(name);
-    const valid = resources && validName && $('build-setup-ack').checked &&
+    const valid = resources && validName && (offline ? $('build-offline-ack').checked : $('build-setup-ack').checked) &&
       ($('build-image-mode').value !== 'local' || $('build-ipsw').value.startsWith('/')) &&
       (!source || ($('build-erase-ack').checked && $('build-confirm').value === source && ['stopped', 'suspended'].includes(vmById(source)?.state)));
     $('build-submit').disabled = buildBusy || !connected || buildActive() || !valid;
@@ -790,15 +816,20 @@
 
   async function submitBuild(event) {
     event.preventDefault();
+    updateBuildForm();
     if (buildBusy || $('build-submit').disabled || !buildContext) return;
     const source = buildContext.source;
-    let setupProfile;
-    try { setupProfile = readSetupProfile('build'); }
-    catch (error) { showError('build-error', error.message); return; }
-    const body = { mode: source ? 'rebuild' : 'create', name: $('build-name').value,
+    const offline = buildContext.offline === true;
+    if (!offline && !source) return;
+    const body = { mode: offline ? 'offline_validate' : 'rebuild', name: $('build-name').value,
       cpu: Number($('build-cpu').value), memory_gib: Number($('build-memory').value), disk_gib: Number($('build-disk').value),
-      ipsw: $('build-image-mode').value === 'local' ? $('build-ipsw').value : 'latest', acknowledge_setup: $('build-setup-ack').checked,
-      setup_profile: setupProfile };
+      ipsw: $('build-image-mode').value === 'local' ? $('build-ipsw').value : 'latest' };
+    if (offline) body.acknowledge_offline = $('build-offline-ack').checked;
+    else {
+      try { body.setup_profile = readSetupProfile('build'); }
+      catch (error) { showError('build-error', error.message); return; }
+      body.acknowledge_setup = $('build-setup-ack').checked;
+    }
     if (source) Object.assign(body, { source_vm: source, confirm_name: $('build-confirm').value, acknowledge_erase: $('build-erase-ack').checked });
     buildBusy = true;
     $('build-dialog').querySelectorAll('input,select,button').forEach((item) => { item.disabled = true; });
@@ -868,7 +899,24 @@
     } catch (_) { showError('initialize-error', '无法打开原生初始化，请确认在原生 App 中使用。'); }
   });
 
-  $('new-vm').addEventListener('click', () => openBuild());
+  if (window.GoldPreinstall) preinstallUI = window.GoldPreinstall.mount({
+    document, api,
+    getContext: () => ({ connected, active: buildActive(), waitingJob: waitingVpnJob(), names: VM_IDS, host: state?.host || {} }),
+    onBusy: (value) => { preinstallBusy = value; render(true); },
+    onQueued: async (job, { resumed, deferred }) => {
+      // Drain a poll that may predate the POST, especially a waiting snapshot
+      // with the very same job ID. preinstallBusy keeps actions locked meanwhile.
+      if (pollFlight) await pollFlight;
+      if (state) state.build_job = { ...job, mode: 'preinstall' };
+      render(true);
+      toast(resumed ? '继续配置请求已接收；不会自动开机或连接 VPN。' :
+        deferred ? '预装请求已接收；系统与应用装好后会等待你配置 VPN，不会自动开机。' :
+        '预装请求已接收；不会自动首次开机，VPN 与桌面功能仍待真人验收。');
+      await refresh(true);
+    },
+  });
+  $('preinstall-new').addEventListener('click', () => { $('create-advanced').open = false; preinstallUI?.open(); });
+  $('new-vm').addEventListener('click', () => { $('create-advanced').open = false; openBuild(null, true); });
   $('build-form').addEventListener('submit', submitBuild);
   $('build-form').addEventListener('input', updateBuildForm);
   $('build-image-mode').addEventListener('change', updateBuildForm);
@@ -890,11 +938,8 @@
   $('connection-settings').addEventListener('click', openToken);
   $('pick-directory').addEventListener('click', pickDirectory);
   $('share-form').addEventListener('submit', submitShare);
-  $('confirm-form').addEventListener('submit', (event) => {
-    if (confirmContext?.type === 'copy') { event.preventDefault(); $('confirm-dialog').close(); return; }
-    submitConfirm(event);
-  });
-  $('confirm-name').addEventListener('input', () => { if (confirmContext?.typed) $('confirm-submit').disabled = $('confirm-name').value !== confirmContext.id; });
+  $('confirm-form').addEventListener('submit', submitConfirm);
+  $('confirm-name').addEventListener('input', () => { if (confirmContext?.typed) $('confirm-submit').disabled = confirmBusy || buildActive() || $('confirm-name').value !== confirmContext.id; });
   ['share-name', 'share-mode', 'share-enabled', 'write-ack'].forEach((id) => $(id).addEventListener('input', updateShareForm));
   $('share-path').addEventListener('input', () => { $('write-ack').checked = false; updateShareForm(); });
   $('token-form').addEventListener('submit', async (event) => {
@@ -910,7 +955,7 @@
   $('share-dialog').addEventListener('cancel', (event) => { if (dialogBusy) event.preventDefault(); });
   $('confirm-dialog').addEventListener('cancel', (event) => { if (confirmBusy) event.preventDefault(); });
   $('share-dialog').addEventListener('close', () => { shareContext = null; });
-  $('confirm-dialog').addEventListener('close', () => { confirmContext = null; $('confirm-name').readOnly = false; });
+  $('confirm-dialog').addEventListener('close', () => { confirmContext = null; });
   document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
   render();
   refresh();

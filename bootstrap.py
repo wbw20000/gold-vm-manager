@@ -15,10 +15,11 @@ HERE=Path(__file__).resolve().parent
 HOME=Path.home()
 STATE=HOME/'Library/Application Support/GoldVMManager'
 PORT=18765
+CONTROLLER_VERSION='1.3.0'
 OPENER=build_opener(ProxyHandler({}))
 
 
-def running_info():
+def running_info(*, required_version=None):
     path=STATE/'server.json'
     if path.is_symlink() or not path.exists():return None
     try:
@@ -34,6 +35,7 @@ def running_info():
         with OPENER.open(req,timeout=3) as response:data=json.load(response)
         if type(data) is not dict or type(data.get('app')) is not dict:return None
         if data.get('ok') is not True or data['app'].get('name')!='Gold VM Manager':return None
+        if required_version is not None and data['app'].get('version') != required_version:return None
         return info
     except (OSError,ValueError,URLError):return None
 
@@ -44,14 +46,14 @@ def main():
     STATE.mkdir(parents=True,mode=0o700,exist_ok=True)
     s=STATE.stat()
     if s.st_uid!=os.getuid() or s.st_mode&0o077:raise SystemExit('Application state must be private')
-    info=running_info()
+    info=running_info(required_version=CONTROLLER_VERSION)
     if info is None:
         test=socket.socket()
         test.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
         try:
             test.bind(('127.0.0.1',PORT))
         except OSError:
-            raise SystemExit('Port 18765 is occupied by an unverified process; not opening or replacing it')
+            raise SystemExit('Port 18765 is already in use by a different controller or process; close it normally before using this version')
         finally:test.close()
         logpath=STATE/'controller.log'
         if logpath.is_symlink():raise SystemExit('Unsafe controller log path')
@@ -63,7 +65,7 @@ def main():
                              stderr=subprocess.STDOUT,start_new_session=True,close_fds=True)
         deadline=time.monotonic()+12
         while time.monotonic()<deadline:
-            info=running_info()
+            info=running_info(required_version=CONTROLLER_VERSION)
             if info:break
             time.sleep(.2)
         if info is None:raise SystemExit('Controller did not become ready; see private controller.log')

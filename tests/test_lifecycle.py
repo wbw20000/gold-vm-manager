@@ -200,28 +200,49 @@ class LifecycleTests(unittest.TestCase):
         target.symlink_to(stage/'config.json')
         with self.assertRaises(ValueError):l.verify_install_output(stage,request)
 
-    def test_first_create_makes_private_environment_parent(self):
+    def assert_legacy_worker(self, mode):
         import provisioning
         import io
         from types import SimpleNamespace
         jid='c'*32;jobdir=self.state/'build-jobs'/jid;r.private_dir(jobdir)
-        request=self.payload(id=jid,source_vm=None,source_identity=None,cpu=2,memory_gib=4,disk_gib=50,ipsw='latest')
+        request=self.payload(mode=mode,id=jid,source_vm=None,source_identity=None,cpu=2,memory_gib=4,disk_gib=50,ipsw='latest')
+        values={}
+        if mode=='rebuild':
+            self.fake_vm('gold')
+            values={'gold':{'State':'stopped'}}
+            request.update(source_vm='gold',source_identity=l.source_identity('gold'),confirm_name='gold',acknowledge_erase=True)
         r.write_private(jobdir/'request.json',request)
-        r.write_private(self.state/'build-current.json',{'id':jid,'name':request['name'],'phase':'queued'})
+        r.write_private(self.state/'build-current.json',{'id':jid,'mode':mode,'name':request['name'],'phase':'queued'})
         fd=os.open(str(self.state/'build.lock'),os.O_CREAT|os.O_RDWR,0o600)
         def prepare(name,config,base,artifacts):
             self.assertTrue(base.parent.is_dir())
             self.assertEqual(base.parent.stat().st_mode&0o777,0o700)
             base.mkdir(mode=0o700);(base/'setup').mkdir(mode=0o700)
+            # Match prepare_environment's metadata contract used by setup profiles.
+            r.write_private(base/'environment.json',{'setup_sha256':{}})
             return {'status':'awaiting_user_setup'}
         child=SimpleNamespace(stdout=io.StringIO('{"event":"complete","schemaVersion":1}\n'),wait=lambda:0)
         try:
-            with patch.object(l,'inventory',return_value={}),patch.object(l.shutil,'disk_usage',return_value=SimpleNamespace(free=200*1024**3)),patch.object(provisioning,'preflight'),patch.object(provisioning,'prepare_environment',side_effect=prepare),patch.object(l,'offline_image',return_value=self.root/'fake.ipsw'),patch.object(l,'helper_json',return_value={'supported':True,'minimumCPUCount':2,'minimumMemorySize':4*1024**3}),patch.object(l.subprocess,'Popen',return_value=child),patch.object(l,'verify_install_output') as verify,patch.object(l,'new_identity_check',return_value={'cpuCount':2,'memorySize':4*1024**3}),patch.object(l,'commit') as commit:
+            with patch.object(l,'inventory',return_value=values),patch.object(l.shutil,'disk_usage',return_value=SimpleNamespace(free=200*1024**3)),patch.object(provisioning,'preflight') as preflight,patch.object(provisioning,'prepare_environment',side_effect=prepare) as provision,patch.object(l,'offline_image',return_value=self.root/'fake.ipsw'),patch.object(l,'helper_json',return_value={'supported':True,'minimumCPUCount':2,'minimumMemorySize':4*1024**3}),patch.object(l.subprocess,'Popen',return_value=child),patch.object(l,'verify_install_output') as verify,patch.object(l,'new_identity_check',return_value={'cpuCount':2,'memorySize':4*1024**3}),patch.object(l,'commit') as commit:
                 l.worker(jid,fd)
                 verify.assert_called_once();commit.assert_called_once()
-            self.assertEqual(r.read_private(self.state/'build-current.json')['phase'],'awaiting_user_setup')
-            self.assertEqual(list(self.vms.iterdir()),[])
+                preflight.assert_called_once();provision.assert_called_once()
+            current=r.read_private(self.state/'build-current.json')
+            self.assertEqual(current['phase'],'awaiting_user_setup')
+            self.assertEqual(current['old_deleted'],mode=='rebuild')
+            self.assertEqual(commit.call_args.args[0]['source_vm'],request['source_vm'])
+            self.assertNotIn('system_restored',current)
+            base=self.state/'environments'/jid
+            metadata=r.read_private(base/'environment.json')
+            self.assertEqual(metadata['setup_sha256']['profile.json'],l.fingerprint(base/'setup/profile.json'))
+            self.assertEqual(set(p.name for p in self.vms.iterdir()),set(values))
         finally:os.close(fd)
+
+    def test_first_create_makes_private_environment_parent(self):
+        self.assert_legacy_worker('create')
+
+    def test_legacy_rebuild_still_provisions_and_commits(self):
+        self.assert_legacy_worker('rebuild')
 
     def test_interrupted_job_never_auto_resumes(self):
         r.write_private(self.state/'build-current.json',{'id':'b'*32,'phase':'installing','pid':123,'name':'new'})

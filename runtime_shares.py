@@ -14,7 +14,7 @@ import re
 import stat
 import uuid
 
-VM_IDS = ("gold", "gold-backup", "gold-fresh", "dsh purge测试")
+VM_IDS = ("gold", "gold-backup", "gold-fresh")
 
 
 def allowed_vm_ids():

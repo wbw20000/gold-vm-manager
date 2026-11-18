@@ -46,7 +46,10 @@ def checked_digest(path):
     return h.hexdigest()
 
 
-def build_tart_command(vm_name, network_fd, share_plan, no_graphics=False, recovery=False):
+def build_tart_command(vm_name, network_fd, share_plan, no_graphics=False, recovery=False, *, environment=None):
+    if environment is not None and environment.get('version') == 2:
+        from preinstall_runtime import build_tart_command as build_v2
+        return build_v2(BASE, environment, vm_name, network_fd, share_plan, no_graphics, recovery)
     if share_plan is not None and any(s['name'].casefold() == 'setup' for s in share_plan.shares):
         raise RuntimeError('The setup share name is reserved')
     cmd = [TART, 'run', vm_name, '--net-fd=' + str(network_fd)]
@@ -64,6 +67,12 @@ def validate_environment():
     if BASE.resolve(strict=True) != BASE or any(c in str(BASE) for c in ':,\n\r'):
         raise RuntimeError('Unsafe private base')
     meta = json.loads(checked_file(BASE / 'environment.json'))
+    if type(meta.get('version')) is int and meta['version'] == 2:
+        # Verify the copied v2 support module before importing its validator.
+        if checked_digest(BASE / 'preinstall_runtime.py') != meta.get('source_sha256', {}).get('preinstall_runtime.py'):
+            raise RuntimeError('V2 runtime source integrity mismatch')
+        from preinstall_runtime import validate_environment as validate_v2
+        return validate_v2(BASE, meta)
     name = meta.get('vm_name')
     if (meta.get('version') != 1 or not isinstance(name, str)
             or not 1 <= len(name) <= 64 or name != name.strip()
@@ -152,39 +161,79 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--no-graphics', action='store_true')
     parser.add_argument('--recovery', action='store_true')
+    parser.add_argument('--acknowledge-reviewed-unsigned-backend', action='store_true',
+                        help='V2 only: explicitly request normal OS execution of the pinned unsigned backend; not a signature approval')
+    parser.add_argument('--enable-reviewed-backend-owner-execute', action='store_true',
+                        help='V2 only with acknowledgement: make the exact private backend owner-executable; preserve quarantine')
     args = parser.parse_args()
     args.management = False  # No guest management port is exposed by this launcher.
     os.umask(0o077)
     private_directory(BASE)
     meta = validate_environment()
     vm_name = meta['vm_name']
-    vm_config = VM_ROOT / vm_name / 'config.json'
+    v2 = meta.get('version') == 2
+    vm_config = Path(meta['vm_config']) if v2 else VM_ROOT / vm_name / 'config.json'
+    tart = meta['tart_binding']['path'] if v2 else TART
+    runtime_env = ({'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'HOME': str(HOME),
+                    'TART_HOME': meta['tart_home'], 'LANG': 'C',
+                    'PYTHONNOUSERSITE': '1', 'PYTHONDONTWRITEBYTECODE': '1',
+                    'TART_NO_AUTO_PRUNE': '1'} if v2 else ENV)
+    if ((args.acknowledge_reviewed_unsigned_backend or args.enable_reviewed_backend_owner_execute) and not v2
+            or args.enable_reviewed_backend_owner_execute and not args.acknowledge_reviewed_unsigned_backend):
+        raise RuntimeError('Backend execute permission needs explicit v2 acknowledgement')
     from packet_policy import PacketPolicy
     from share_support import prepare_vm_shares
     lock_path = BASE / 'run.lock'
     if lock_path.is_symlink():
         raise RuntimeError('Refusing symlinked run lock')
-    lock = lock_path.open('a+')
+    lock = (os.fdopen(os.open(str(lock_path), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                              0o600), 'a+') if v2 else lock_path.open('a+'))
+    if v2:
+        try:
+            checked_file(lock_path, read=False)
+            opened, entry = os.fstat(lock.fileno()), lock_path.stat()
+            if (opened.st_dev, opened.st_ino) != (entry.st_dev, entry.st_ino):
+                raise RuntimeError('Run lock identity changed')
+        except BaseException:
+            lock.close()
+            raise
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         print('Protected launcher is already running.', flush=True)
+        if v2:
+            lock.close()
         return 0
     write_status(BASE/'status.json',{'state':'validating','launcher_pid':os.getpid(),'started_unix':time.time()})
     gv = BASE / 'gvproxy-darwin'
-    if gv.is_symlink() or hashlib.sha256(gv.read_bytes()).hexdigest() != GV_SHA256:
+    if v2:
+        import preinstall_runtime as runtime_v2
+        try:
+            runtime_v2.require_backend_authorization(meta, args.acknowledge_reviewed_unsigned_backend)
+            runtime_v2.validate_bindings(BASE, meta)
+            if args.enable_reviewed_backend_owner_execute:
+                runtime_v2.authorize_backend_execution_bit(BASE, meta, acknowledged=True)
+            runtime_v2.backend_is_executable(BASE)
+        except runtime_v2.RuntimePreparationError as error:
+            write_status(BASE/'status.json', {'state': 'awaiting_host_authorization',
+                         'launcher_pid': os.getpid(), 'reason': error.code,
+                         'native_execution_approved': False, 'vm_started': False})
+            lock.close()
+            raise
+    elif gv.is_symlink() or hashlib.sha256(gv.read_bytes()).hexdigest() != GV_SHA256:
         raise RuntimeError('Network backend integrity mismatch; VM not started')
     cfg = json.loads((BASE / 'policy.json').read_text())
     vm = json.loads(vm_config.read_text())
     if cfg['guest_mac'].lower() != vm['macAddress'].lower() or str(vm.get('ecid')) != meta['ecid']:
         raise RuntimeError('VM identity changed; refusing network startup')
-    inventory = subprocess.run([TART, 'list', '--format', 'json'], env=ENV, capture_output=True, text=True, check=True)
+    inventory = subprocess.run([tart, 'list', '--format', 'json'], env=runtime_env, capture_output=True, text=True, check=True)
     gold = [x for x in json.loads(inventory.stdout) if x['Name'] == vm_name and x['Source'] == 'local']
     if len(gold) != 1 or gold[0]['Running'] or gold[0]['State'] != 'stopped':
         raise RuntimeError('VM must exist and be stopped; suspended setup resumes are not supported')
     share_plan = prepare_vm_shares(vm_name, BASE, gold[0]['State']) if not args.recovery else None
-    if share_plan is not None and any(s['name'].casefold() == 'setup' for s in share_plan.shares):
-        raise RuntimeError('The setup share name is reserved')
+    reserved_names = ('setup', 'gold-status') if v2 else ('setup',)
+    if share_plan is not None and any(s['name'].casefold() in reserved_names for s in share_plan.shares):
+        raise RuntimeError('A protected runtime share name is reserved')
     endpoints = [tuple(x) for x in cfg['endpoints']]
     local_control(args.management)  # Validate before any VM can start.
     policy = PacketPolicy(guest_mac=cfg['guest_mac'], endpoints=endpoints, allow_management=args.management)
@@ -206,6 +255,7 @@ def main():
     vm_log = (run/'tart.log').open('xb')
     backend = child = None
     host_sock = vm_sock = backend_sock = None
+    sel = None
     shutdown = False
     def request_stop(signum, frame):
         nonlocal shutdown
@@ -215,10 +265,16 @@ def main():
     status = {'launcher_pid':os.getpid(),'runtime_directory':str(run),'management_enabled':args.management,
               'endpoint_count':len(endpoints),'policy':'deny except pinned proxy tuples, narrow DHCP/ARP, optional temporary SSH',
               'state':'initializing','started_unix':time.time()}
+    if v2:
+        status.update(native_execution_approved=False, backend_execution_acknowledged=True,
+                      backend_startup_pending=True, guest_bootstrap_evidence='not_observed',
+                      desktop_verified=False, network_independently_verified=False)
     try:
+        if v2:
+            runtime_v2.validate_bindings(BASE, meta)
         backend = subprocess.Popen([str(gv),'--config',str(gv_config),'--listen-vfkit','unixgram://'+str(gv_sock),
                                     '--services','unix://'+str(api_sock),'--mtu','1500'],
-                                   stdin=subprocess.DEVNULL,stdout=backend_log,stderr=subprocess.STDOUT,env=ENV,close_fds=True)
+                                   stdin=subprocess.DEVNULL,stdout=backend_log,stderr=subprocess.STDOUT,env=runtime_env,close_fds=True)
         deadline = time.monotonic()+15
         while not gv_sock.exists():
             if backend.poll() is not None or time.monotonic()>deadline or shutdown:
@@ -226,6 +282,8 @@ def main():
             time.sleep(0.05)
         if not stat.S_ISSOCK(gv_sock.stat().st_mode):
             raise RuntimeError('Unexpected backend socket type')
+        if v2:
+            status['backend_startup_pending'] = False
         backend_sock = socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM)
         backend_sock.bind(str(client_sock))
         backend_sock.connect(str(gv_sock))
@@ -236,18 +294,22 @@ def main():
         backend_sock.send(b'VFKT')
         backend_sock.setblocking(False)
         host_sock.setblocking(False)
-        # Setup is always read-only and non-suspendable; never silently omit it.
-        cmd = build_tart_command(vm_name, vm_sock.fileno(), share_plan, args.no_graphics, args.recovery)
+        # V1 keeps readonly setup. V2 exposes only its owned status mailbox plus
+        # the unchanged validated user-share plan; both remain non-suspendable.
+        if v2:
+            runtime_v2.validate_bindings(BASE, meta)
+        cmd = build_tart_command(vm_name, vm_sock.fileno(), share_plan, args.no_graphics, args.recovery,
+                                 environment=meta if v2 else None)
         # Only explicitly configured named shares; no NAT fallback or extra disks.
         if shutdown or backend.poll() is not None:
             raise RuntimeError('Startup cancelled or backend exited; VM not started')
-        child=subprocess.Popen(cmd,env=ENV,pass_fds=(vm_sock.fileno(),),stdin=subprocess.DEVNULL,
+        child=subprocess.Popen(cmd,env=runtime_env,pass_fds=(vm_sock.fileno(),),stdin=subprocess.DEVNULL,
                                stdout=vm_log,stderr=subprocess.STDOUT,close_fds=True)
         if share_plan is not None:
             share_plan.record_launch(child.pid)
         vm_sock.close()
         vm_sock=None
-        status.update(state='starting',tart_pid=child.pid,backend_pid=backend.pid,vm_network_seen=False,shared_directory_count=0 if args.recovery else len(share_plan.shares)+1,sharing_allows_suspend=False,recovery_mode=args.recovery,setup_status='recovery' if args.recovery else 'awaiting_user_setup')
+        status.update(state='starting',tart_pid=child.pid,backend_pid=backend.pid,vm_network_seen=False,shared_directory_count=0 if args.recovery else len(share_plan.shares)+1,sharing_allows_suspend=False,recovery_mode=args.recovery,setup_status='recovery' if args.recovery else ('preinstalled-awaiting-guest-report' if v2 else 'awaiting_user_setup'))
         write_status(BASE/'status.json',status)
         print('Protected network is running; default egress is denied.',flush=True)
         sel=selectors.DefaultSelector()
@@ -261,7 +323,14 @@ def main():
             # Host-only control has no guest-visible API. Absence means allow configured endpoints.
             management,drop_proxy=local_control(args.management)
             policy.set_management_enabled(management)
-            for key,_ in sel.select(timeout=0.25):
+            ready = sel.select(timeout=0.25)
+            # Readiness only means a datagram is queued. The backend may have
+            # exited while select was waiting; do not relay that queued batch.
+            if shutdown or child.poll() is not None:
+                break
+            if backend.poll() is not None:
+                raise RuntimeError('Network backend exited; keeping VM disconnected and stopping it')
+            for key,_ in ready:
                 packet,anc,flags,addr=key.fileobj.recvmsg(65536)
                 if flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC):
                     overflow+=1
@@ -290,10 +359,12 @@ def main():
                               proxy_fault_test=drop_proxy,counters=policy.snapshot())
                 write_status(BASE/'status.json',status)
                 last_status=time.monotonic()
-        sel.close()
         status['state']='stopping' if shutdown else 'guest-exited'
     except Exception as error:
-        status['state']='failed-closed'
+        # A normal OS execution refusal/early backend exit is not repaired with
+        # xattr removal, re-signing, a policy exception, retry or a NAT fallback.
+        status['state']=('awaiting_host_authorization' if v2 and status.get('backend_startup_pending')
+                         else 'failed-closed')
         status['error_type']=type(error).__name__
         print('Protected launcher failed closed ('+type(error).__name__+').',file=sys.stderr,flush=True)
         raise
@@ -306,6 +377,11 @@ def main():
                     s.close()
                 except Exception as error:
                     cleanup_errors.append(type(error).__name__)
+        if sel is not None:
+            try:
+                sel.close()
+            except Exception as error:
+                cleanup_errors.append(type(error).__name__)
         for proc,signum in ((child,signal.SIGINT),(backend,signal.SIGTERM)):
             try:
                 stop_process(proc,signum)
@@ -318,6 +394,8 @@ def main():
         finally:
             backend_log.close()
             vm_log.close()
+            if v2:
+                lock.close()
         # Runtime artifacts retained for diagnostics; no broad path deletion.
     return 0
 

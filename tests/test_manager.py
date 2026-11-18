@@ -135,6 +135,7 @@ class ControllerTests(PrivateFixture):
         self.assertEqual([vm['id'] for vm in result['vms']], list(self.bases))
         self.assertTrue(all(vm['shares'] == [] and vm['active_shares'] == [] for vm in result['vms']))
         self.assertEqual(result['host']['memory_gib'], 32)
+        self.assertTrue(result['capabilities']['offline_validate'])
         self.assertFalse(self.config_path.exists())
         self.run.assert_not_called()
         self.popen.assert_not_called()
@@ -318,6 +319,41 @@ class ControllerTests(PrivateFixture):
         self.run.assert_not_called()
         self.kill.assert_not_called()
 
+    def test_preinstalled_start_requires_own_named_execution_consent(self):
+        base = self.bases['gold']
+        self.write_json(base / 'environment.json', {'version': 2})
+        original = self.controller._require_preinstall_publication
+        with patch.object(self.controller, '_require_preinstall_publication', wraps=original) as fence:
+            self.denied(self.controller.action, 'gold', {'action': 'start'}, code='host_authorization_required')
+            self.denied(self.controller.action, 'gold', {'action': 'start', 'confirm_name': 'gold',
+                        'acknowledge_reviewed_unsigned_backend': 1}, code='host_authorization_required')
+            self.denied(self.controller.action, 'gold', {'action': 'start', 'confirm_name': 'gold-backup',
+                        'acknowledge_reviewed_unsigned_backend': True}, code='host_authorization_required')
+            fence.assert_not_called()
+            self.denied(self.controller.action, 'gold', {'action': 'start', 'confirm_name': 'gold',
+                        'acknowledge_reviewed_unsigned_backend': True}, code='preinstall_start_rejected')
+            fence.assert_called_once_with('gold', base)
+        self.worker.assert_not_called()
+        with patch.object(self.controller, '_require_preinstall_publication') as fence, patch.object(m.shares_lib, 'prepare_vm_shares'):
+            result = self.controller.action('gold', {'action': 'start', 'confirm_name': 'gold',
+                            'acknowledge_reviewed_unsigned_backend': True})
+            self.assertTrue(result['ok'])
+            fence.assert_called_once_with('gold', base)
+            self.assertEqual(self.worker.call_args.kwargs['args'], ('gold', 'start', True))
+        self.popen.assert_not_called()
+
+    def test_validation_binds_only_an_explicit_submission_without_resolving(self):
+        payload = {'submission': {'input_mode': 'fields', 'nodes': [{'type': 'trojan',
+            'server': '8.8.8.8', 'port': 443, 'password': 'fixture-only', 'sni': 'example.com'}]},
+            'allow_resolve': False}
+        result = self.controller.validate_vpn(payload)
+        self.assertTrue(result['configuration_stored_privately'])
+        self.assertFalse(result['vpn_connected'])
+        self.assertNotIn('fixture-only', repr(result))
+        self.assertNotIn('8.8.8.8', repr(result))
+        self.run.assert_not_called()
+        self.denied(self.controller.validate_vpn, dict(payload, allow_resolve=1), code='vpn_validation_failed')
+
     def test_picker_requires_explicit_controller_call_and_valid_vm(self):
         self.denied(self.controller.pick_directory, {'vm': 'other'}, code='unknown_vm')
         self.controller._run.assert_not_called()
@@ -396,6 +432,12 @@ class FakeController:
         self.calls.append(('action', vm, value))
         return {'ok': True, 'message': 'queued'}
 
+    def delete_vm(self, vm, value):
+        if value != {'confirm_name': vm, 'acknowledge_erase': True}:
+            raise m.AppError('删除确认无效', 'delete_rejected', 409)
+        self.calls.append(('delete', vm, value))
+        return {'ok': True, 'job_id': 'unit-only-delete'}
+
     def save_shares(self, vm, value):
         self.calls.append(('shares', vm, value))
         return {'ok': True, 'shares': value.get('shares', [])}
@@ -403,6 +445,26 @@ class FakeController:
     def create_build(self, value):
         self.calls.append(('build', value))
         return {'ok': True, 'job_id': 'unit-only-job'}
+
+    def preinstall_capabilities(self):
+        self.calls.append(('preinstall-capabilities',))
+        return {'ok': True, 'ready': False}
+
+    def preinstall_examples(self):
+        self.calls.append(('preinstall-examples',))
+        return {'ok': True, 'yaml': 'sample only', 'fields': {'input_mode': 'fields'}}
+
+    def validate_vpn(self, value):
+        self.calls.append(('validate-vpn', value))
+        return {'ok': True, 'configuration_id': '1' * 32, 'vpn_connected': False}
+
+    def create_preinstall(self, value):
+        self.calls.append(('create-preinstall', value))
+        return {'ok': True, 'job': {'id': '2' * 32, 'phase': 'queued'}}
+
+    def resume_preinstall(self, value):
+        self.calls.append(('resume-preinstall', value))
+        return {'ok': True, 'job': {'id': '2' * 32, 'phase': 'vpn_resume_queued'}}
 
     def pick_ipsw(self, value):
         self.calls.append(('ipsw', value))
@@ -517,7 +579,10 @@ class HTTPSecurityTests(unittest.TestCase):
     def test_routes_accept_registered_names_and_never_expose_raw_delete(self):
         unknown = self.request('/api/vms/other/action', 'POST', {'action': 'start'}, self.mutation_headers())
         self.assertEqual((unknown[0], unknown[1]['code']), (404, 'unknown_vm'))
-        for path in ('/api/vms/gold/delete', '/api/vms/gold/../gold/action', '/api/vms/gold/action/', '/api/exec', '/api/delete'):
+        # A dedicated confirmed-delete endpoint now exists; raw deletion still does not.
+        rejected = self.request('/api/vms/gold/delete', 'POST', {'action': 'start'}, self.mutation_headers())
+        self.assertEqual((rejected[0], rejected[1]['code']), (409, 'delete_rejected'))
+        for path in ('/api/vms/gold/../gold/action', '/api/vms/gold/action/', '/api/exec', '/api/delete'):
             with self.subTest(path=path):
                 status, result, _ = self.request(path, 'POST', {'action': 'start'}, self.mutation_headers())
                 self.assertEqual((status, result['code']), (404, 'not_found'))
@@ -548,10 +613,52 @@ class HTTPSecurityTests(unittest.TestCase):
         self.assertEqual(status,202)
         self.assertEqual(self.fake.calls,[('build',{'mode':'create'})])
 
+    def test_offline_build_route_keeps_auth_origin_and_payload_contract(self):
+        payload = {'mode': 'offline_validate', 'name': 'gg1', 'ipsw': '/fixture/local.ipsw',
+                   'acknowledge_offline': True}
+        for headers, expected in (({'Content-Type': 'application/json', 'Origin': self.origin}, 401),
+                                  ({**self.mutation_headers(), 'Origin': 'https://untrusted.invalid'}, 403)):
+            self.assertEqual(self.request('/api/build', 'POST', payload, headers)[0], expected)
+        self.assertEqual(self.fake.calls, [])
+        self.assertEqual(self.request('/api/build', 'POST', payload, self.mutation_headers())[0], 202)
+        self.assertEqual(self.fake.calls, [('build', payload)])
+
     def test_destructive_duplicate_fields_rejected_before_dispatch(self):
         status, result, _ = self.request('/api/build','POST',headers=self.mutation_headers(),raw=b'{"mode":"create","mode":"rebuild"}')
         self.assertEqual(status,400)
         self.assertEqual(self.fake.calls,[])
+
+    def test_preinstall_requires_authentication_and_same_origin(self):
+        for route in ('/api/preinstall/capabilities', '/api/preinstall/examples'):
+            self.assertEqual(self.request(route)[0], 401)
+            self.assertEqual(self.request(route, headers=self.auth())[0], 200)
+        vpn = '/api/preinstall/vpn/validate'
+        create = '/api/preinstall/create'
+        resume = '/api/preinstall/resume'
+        for route in (vpn, create, resume):
+            self.assertEqual(self.request(route, 'POST', {}, {**self.auth(), 'Content-Type': 'application/json'})[0], 403)
+        payload = {'submission': {'input_mode': 'yaml', 'yaml_text': 'fixture only'}, 'allow_resolve': False}
+        self.assertEqual(self.request(vpn, 'POST', payload, self.mutation_headers())[0], 200)
+        request = {'name': 'New fixture VM', 'vpn_configuration_id': '1' * 32}
+        status, result, _ = self.request(create, 'POST', request, self.mutation_headers())
+        self.assertEqual((status, result['job']['phase']), (202, 'queued'))
+        resume_data = {'job_id': '2' * 32, 'vpn_configuration_id': '1' * 32,
+                       'acknowledge_network_policy': True, 'acknowledge_guest_autoconfigure': True}
+        status, result, _ = self.request(resume, 'POST', resume_data, self.mutation_headers())
+        self.assertEqual((status, result['job']['phase']), (202, 'vpn_resume_queued'))
+        self.assertEqual(self.fake.calls, [('preinstall-capabilities',), ('preinstall-examples',),
+                                          ('validate-vpn', payload), ('create-preinstall', request),
+                                          ('resume-preinstall', resume_data)])
+
+    def test_only_vpn_validation_has_a_larger_request_limit(self):
+        payload = {'submission': {'input_mode': 'yaml', 'yaml_text': '柴' * 30000}, 'allow_resolve': False}
+        vpn = '/api/preinstall/vpn/validate'
+        create = '/api/preinstall/create'
+        self.assertEqual(self.request(vpn, 'POST', payload, self.mutation_headers())[0], 200)
+        self.assertEqual(self.request(create, 'POST', payload, self.mutation_headers())[0], 413)
+        headers = {**self.mutation_headers(), 'Content-Length': str(m.VPN_VALIDATE_MAX_WIRE + 1)}
+        self.assertEqual(self.request(vpn, 'POST', headers=headers, raw=b'{}')[0], 413)
+        self.assertEqual(self.fake.calls, [('validate-vpn', payload)])
 
     def test_native_restore_picker_route(self):
         status,result,_=self.request('/api/pick-ipsw','POST',{},self.mutation_headers())
@@ -560,7 +667,7 @@ class HTTPSecurityTests(unittest.TestCase):
         self.assertEqual(self.fake.calls,[('ipsw',{})])
 
     def test_static_assets_and_security_headers_integrate_with_frontend(self):
-        for path, content_type in (('/', 'text/html'), ('/index.html', 'text/html'), ('/app.js', 'text/javascript'), ('/style.css', 'text/css')):
+        for path, content_type in (('/', 'text/html'), ('/index.html', 'text/html'), ('/app.js', 'text/javascript'), ('/style.css', 'text/css'), ('/preinstall.js', 'text/javascript'), ('/preinstall.css', 'text/css')):
             with self.subTest(path=path):
                 status, raw, headers = self.request(path)
                 self.assertEqual(status, 200)

@@ -17,7 +17,7 @@ VM_IDS={'gold','gold-backup','gold-fresh'}
 
 
 def discard(vm):
-    if vm not in managed_registry.allowed_vm_ids() or vm == 'dsh purge测试':
+    if vm not in managed_registry.allowed_vm_ids():
         raise ValueError('Unknown VM')
     base=VM_ROOT/vm
     config=base/'config.json'

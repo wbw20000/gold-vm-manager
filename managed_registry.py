@@ -12,7 +12,7 @@ import unicodedata
 HOME = Path.home()
 STATE_DIR = HOME / 'Library/Application Support/GoldVMManager'
 REGISTRY_PATH = STATE_DIR / 'registry.json'
-LEGACY_NAMES = ('gold', 'gold-backup', 'gold-fresh', 'dsh purge测试')
+LEGACY_NAMES = ('gold', 'gold-backup', 'gold-fresh')
 
 
 def validate_name(value):
@@ -132,8 +132,9 @@ def allowed_vm_ids():
     return (set(LEGACY_NAMES) | set(d['vms'])) - set(d['retired'])
 
 
-def registered_bases(legacy):
-    d = load_registry()
+def registered_bases(legacy, *, state_dir=None):
+    state = STATE_DIR if state_dir is None else Path(state_dir)
+    d = load_registry(None if state_dir is None else state / 'registry.json')
     result = {name: base for name, base in legacy.items() if name not in d['retired']}
-    result.update({name: STATE_DIR / 'environments' / entry['environment_id'] for name, entry in d['vms'].items()})
+    result.update({name: state / 'environments' / entry['environment_id'] for name, entry in d['vms'].items()})
     return result

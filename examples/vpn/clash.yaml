@@ -1,0 +1,67 @@
+# Gold VM Manager · 新建 VM 时上传的 Clash / Mihomo 节点模板
+# 1. 下载原始 YAML，复制到仓库之外，另存为 clash.local.yaml。
+# 2. 只保留与实际节点协议相符的一组。下方已启用的是 Trojan TLS/TCP。
+#    若使用其他协议，先删除启用的 Trojan 节点（保留 proxies:），
+#    再去掉对应示例各行开头的「# 」，保留缩进。
+# 3. 按服务商资料替换测试地址、端口、凭据和 TLS 名称；不要关闭证书校验。
+#    优先填写公网 IPv4。使用节点域名时，需在界面单独同意解析。
+# 4. 打开「新建 VM 及预装软件」，填写本地 YAML 绝对路径并校验。
+#    也可勾选「先不配置 VPN」，装好系统和软件后再填路径。
+# 这里的地址和凭据全是占位符，原样校验会被拒绝。填好的文件不要提交 GitHub。
+# 这不是订阅链接或完整的 Clash 客户端配置，只提供节点；不填写 DNS、路由或 provider。
+
+proxies:
+  - type: trojan
+    server: 192.0.2.10             # 替换为节点的公网 IPv4 或域名
+    port: 443                     # 替换为节点端口（整数，不加引号）
+    password: "REPLACE_WITH_TROJAN_PASSWORD"
+    sni: vpn.example.com           # 替换为服务商指定的 TLS 名称
+    network: tcp
+    skip-cert-verify: false
+
+# TUIC
+#   - type: tuic
+#     server: 192.0.2.10
+#     port: 443
+#     uuid: "00000000-0000-0000-0000-000000000000"
+#     password: "REPLACE_WITH_TUIC_PASSWORD"
+#     sni: vpn.example.com
+#     skip-cert-verify: false
+
+# VLESS TLS / TCP
+#   - type: vless
+#     server: 192.0.2.10
+#     port: 443
+#     uuid: "00000000-0000-0000-0000-000000000000"
+#     network: tcp
+#     tls: true
+#     servername: vpn.example.com
+#     skip-cert-verify: false
+
+# VLESS Reality / TCP（flow 必须与服务商资料一致；不需要时可删除该行）
+#   - type: vless
+#     server: 192.0.2.10
+#     port: 443
+#     uuid: "00000000-0000-0000-0000-000000000000"
+#     network: tcp
+#     tls: true
+#     servername: vpn.example.com
+#     flow: xtls-rprx-vision
+#     reality-opts:
+#       public-key: "REPLACE_WITH_REALITY_PUBLIC_KEY"
+#       short-id: "REPLACE_WITH_REALITY_SHORT_ID"
+
+# Shadowsocks AEAD（按服务商指定使用 aes-128-gcm、aes-256-gcm 或 chacha20-ietf-poly1305）
+#   - type: ss
+#     server: 192.0.2.10
+#     port: 8388
+#     cipher: chacha20-ietf-poly1305
+#     password: "REPLACE_WITH_SHADOWSOCKS_PASSWORD"
+
+# Hysteria2（如服务商启用了 salamander，按配置格式说明补混淆字段）
+#   - type: hysteria2
+#     server: 192.0.2.10
+#     port: 443
+#     password: "REPLACE_WITH_HYSTERIA2_PASSWORD"
+#     sni: vpn.example.com
+#     skip-cert-verify: false

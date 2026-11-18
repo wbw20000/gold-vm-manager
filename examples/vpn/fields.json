@@ -1,0 +1,65 @@
+{
+  "input_mode": "fields",
+  "nodes": [
+    {
+      "type": "tuic",
+      "server": "192.0.2.10",
+      "port": 443,
+      "uuid": "00000000-0000-0000-0000-000000000000",
+      "password": "REPLACE_WITH_TUIC_PASSWORD",
+      "sni": "replace-with-operator.example.com",
+      "alpn": ["h3"],
+      "skip-cert-verify": false
+    },
+    {
+      "type": "vless",
+      "server": "192.0.2.11",
+      "port": 443,
+      "uuid": "00000000-0000-0000-0000-000000000000",
+      "network": "tcp",
+      "tls": true,
+      "servername": "replace-with-operator.example.com",
+      "skip-cert-verify": false
+    },
+    {
+      "type": "vless",
+      "server": "192.0.2.12",
+      "port": 443,
+      "uuid": "00000000-0000-0000-0000-000000000000",
+      "network": "tcp",
+      "tls": true,
+      "servername": "replace-with-operator.example.com",
+      "flow": "xtls-rprx-vision",
+      "client-fingerprint": "chrome",
+      "reality-opts": {
+        "public-key": "REPLACE_WITH_43_CHARACTER_BASE64URL_PUBLIC_KEY",
+        "short-id": "REPLACE_WITH_EVEN_LENGTH_HEX_ID"
+      }
+    },
+    {
+      "type": "trojan",
+      "server": "198.51.100.10",
+      "port": 443,
+      "password": "REPLACE_WITH_TROJAN_PASSWORD",
+      "sni": "replace-with-operator.example.com",
+      "network": "tcp",
+      "skip-cert-verify": false
+    },
+    {
+      "type": "ss",
+      "server": "198.51.100.11",
+      "port": 8388,
+      "cipher": "chacha20-ietf-poly1305",
+      "password": "REPLACE_WITH_SHADOWSOCKS_PASSWORD",
+      "udp": true
+    },
+    {
+      "type": "hysteria2",
+      "server": "203.0.113.10",
+      "port": 443,
+      "password": "REPLACE_WITH_HYSTERIA2_PASSWORD",
+      "sni": "replace-with-operator.example.com",
+      "skip-cert-verify": false
+    }
+  ]
+}

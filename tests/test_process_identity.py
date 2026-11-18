@@ -20,6 +20,7 @@ class ProcessIdentityTests(unittest.TestCase):
     def controller(self):
         c=object.__new__(manager.Controller)
         c._runtime=lambda _: {'tart_pid':12345}
+        c._environment=lambda _: {}
         c._run=lambda _:subprocess.CompletedProcess([],0,str(manager.TART)+' run gold other --net-fd=12','')
         return c
 

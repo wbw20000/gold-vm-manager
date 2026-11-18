@@ -12,6 +12,13 @@
 *.swiftmodule
 *.swiftdoc
 *.swiftsourceinfo
+# Source installer and host-tool owned, unique local build/verification records.
+helpers-*/
+ownership-helper-*/
+package-*/
+tart-tool-*/
+/host-tools/
+/host-artifact-cache/
 
 # Interpreter, editor, and environment caches.
 __pycache__/
@@ -44,6 +51,11 @@ Gold*Network/
 /environments/
 /build-jobs/
 /restore-images/
+/vpn-inputs/
+/host-materials/
+/application-materials/
+/ownership-helper/
+/guest-status/
 /profiles/
 /logs/
 /setup/
@@ -62,6 +74,8 @@ shares.last-start.json
 *.log
 
 # Local authentication material (examples must be deliberately reviewed).
+clash.local.yaml
+clash.local.yml
 .env
 .env.*
 *.pem

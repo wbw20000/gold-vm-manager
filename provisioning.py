@@ -21,6 +21,8 @@ HOME = Path.home()
 VM_ROOT = HOME / '.tart/vms'
 CLASH_ROOT = HOME / 'Library/Application Support/io.github.clash-verge-rev.clash-verge-rev'
 NETWORK_SOURCE = HOME / 'Applications/GoldNetwork'
+# The reviewed policy is project source, never a dependency on a private controller.
+PACKET_SOURCE = HERE / 'packet_policy.py'
 MIHOMO_SOURCE = Path('/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo')
 CCBAGA_NAME = 'CCBaga-0.2.50-macos-arm64.dmg'
 CCBAGA_SHA256 = '0df33d29d1ac2dd9c912a65fb8ec7657ec497c2c17da1ee9ae94351ab38a8e0b'
@@ -235,7 +237,7 @@ def preflight(artifact_dir=None):
     try:
         _, endpoints, warnings = _active_profile()
         _artifacts(artifact_dir)
-        _pin(NETWORK_SOURCE / 'packet_policy.py', PACKET_SHA256)
+        _pin(PACKET_SOURCE, PACKET_SHA256)
         _pin(NETWORK_SOURCE / 'gvproxy-darwin', GV_SHA256)
         for name in ('protected_launcher.py', 'runtime_shares.py', 'managed_registry.py',
                      'guest_setup/Install.command', 'guest_setup/install_guest.rb', 'guest_setup/README.txt'):
@@ -321,7 +323,7 @@ def prepare_environment(vm_name, vm_config, destination_private_base, artifact_d
         setup = base / 'setup'
         setup.mkdir(mode=0o700)
         copies = {'launcher.py': HERE / 'protected_launcher.py',
-                  'packet_policy.py': NETWORK_SOURCE / 'packet_policy.py',
+                  'packet_policy.py': PACKET_SOURCE,
                   'gvproxy-darwin': NETWORK_SOURCE / 'gvproxy-darwin',
                   'share_support.py': HERE / 'runtime_shares.py',
                   'managed_registry.py': HERE / 'managed_registry.py'}

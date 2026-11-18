@@ -2,22 +2,44 @@
 import json
 import os
 from pathlib import Path
+import platform
 import plistlib
+import stat
 import subprocess
 import tempfile
 import unittest
 
+import host_tools
+
 ROOT = Path(__file__).resolve().parents[1]
-BUILD = ROOT / "evidence" / "newbuild"
-HELPER = BUILD / "CleanVMInstaller"
-SOURCE = (ROOT / "CleanVMInstaller.swift").read_text()
+SOURCE = (ROOT / "CleanVMInstaller.swift").read_text(encoding="utf-8")
 
 
+@unittest.skipUnless((platform.system(), platform.machine(), platform.mac_ver()[0]) ==
+                     ("Darwin", "arm64", "26.6.2"), "Reviewed Apple Silicon test host required")
 class CleanVMInstallerReadOnlyTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        parent = Path(tempfile.gettempdir()).resolve(strict=True)
+        temporary = tempfile.TemporaryDirectory(prefix="gold-clean-installer-tests-", dir=parent)
+        cls.build = Path(temporary.name)
+        created = cls.build.lstat()
+
+        def cleanup():
+            current = cls.build.lstat()
+            assert cls.build.resolve(strict=True) == cls.build
+            assert cls.build.parent == parent and cls.build.name.startswith("gold-clean-installer-tests-")
+            assert stat.S_ISDIR(current.st_mode) and current.st_uid == os.getuid()
+            assert (current.st_dev, current.st_ino) == (created.st_dev, created.st_ino)
+            temporary.cleanup()
+
+        cls.addClassCleanup(cleanup)
+        cls.helper, _ = host_tools.compile_helpers(cls.build)
+
     def invoke(self, *args):
         # Positive allowlist prevents future tests accidentally running create/latest.
         self.assertIn(args[0], ("--help", "--inspect"))
-        result = subprocess.run([str(HELPER), *args], capture_output=True, text=True,
+        result = subprocess.run([str(self.helper), *args], capture_output=True, text=True,
                                 timeout=30, check=False)
         self.assertGreaterEqual(result.returncode, 0, result.stderr)
         return result
@@ -60,10 +82,10 @@ class CleanVMInstallerReadOnlyTests(unittest.TestCase):
         self.error("--inspect", "--ipsw", "/Users/../private.ipsw", code="unsafe_path")
 
     def test_invalid_media_async_and_symlink_rejections(self):
-        temporary = tempfile.TemporaryDirectory(prefix="CleanVMInstaller-tests-", dir=BUILD)
+        temporary = tempfile.TemporaryDirectory(prefix="CleanVMInstaller-tests-", dir=self.build)
         directory = Path(temporary.name)
         # Verify the absolute cleanup target before TemporaryDirectory removes test fixtures.
-        self.assertEqual(directory.resolve().parent, BUILD.resolve())
+        self.assertEqual(directory.resolve().parent, self.build)
         self.assertTrue(directory.name.startswith("CleanVMInstaller-tests-"))
         try:
             invalid = directory / "CleanVMInstaller-invalid.ipsw"
@@ -83,7 +105,7 @@ class CleanVMInstallerReadOnlyTests(unittest.TestCase):
             invalid.chmod(0o666)
             self.error("--inspect", "--ipsw", str(invalid), code="unsafe_ipsw")
         finally:
-            self.assertEqual(directory.resolve().parent, BUILD.resolve())
+            self.assertEqual(directory.resolve().parent, self.build)
             self.assertTrue(directory.name.startswith("CleanVMInstaller-tests-"))
             temporary.cleanup()
 

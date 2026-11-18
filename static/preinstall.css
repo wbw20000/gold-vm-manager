@@ -1,0 +1,77 @@
+/* Scoped to the explicit preinstall flow; no changes to existing VM panels. */
+.preinstall-modal {
+  width: min(760px, calc(100vw - 32px));
+  max-height: calc(100dvh - 40px);
+  overflow-y: auto;
+}
+.preinstall-modal .modal-heading h2 { font-size: 21px; line-height: 1.4; }
+.preinstall-modal .preinstall-section {
+  min-width: 0;
+  margin: 22px 0;
+  padding: 18px;
+  border: 1px solid var(--line, #d2d2d7);
+  border-radius: 12px;
+}
+.preinstall-modal .preinstall-section legend { padding: 0 8px; font-weight: 600; }
+.preinstall-modal .preinstall-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+.preinstall-modal .field { min-width: 0; margin-bottom: 16px; }
+.preinstall-modal .preinstall-download-settings > summary,
+.preinstall-modal .preinstall-disclosure > summary { cursor: pointer; }
+.preinstall-modal .preinstall-download-settings[open] > .field { margin: 12px 0 0; }
+.preinstall-modal .preinstall-disclosure { margin: 12px 0; }
+.preinstall-modal input:not([type=checkbox]),
+.preinstall-modal select,
+.preinstall-modal textarea {
+  width: 100%;
+  min-width: 0;
+  min-height: 40px;
+  padding: 9px 11px;
+  background: var(--paper, white);
+  border: 1px solid var(--control-line, #86868b);
+  border-radius: 8px;
+}
+.preinstall-modal textarea {
+  resize: vertical;
+  white-space: pre;
+  overflow-wrap: normal;
+  min-height: 180px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+.preinstall-modal input[type=file] { white-space: normal; }
+.preinstall-modal .checkbox-label { margin: 14px 0; align-items: flex-start; }
+.preinstall-modal .checkbox-label input { flex-shrink: 0; margin-top: 4px; }
+.preinstall-modal .preinstall-actions { display: flex; flex-wrap: wrap; gap: 12px; margin: 14px 0; }
+.preinstall-modal .preinstall-capabilities,
+.preinstall-modal .preinstall-summary {
+  padding: 14px;
+  margin: 16px 0;
+  border-radius: 10px;
+  background: var(--blue-soft, #eef5ff);
+  overflow-wrap: anywhere;
+}
+.preinstall-modal .preinstall-capabilities ul,
+.preinstall-modal .preinstall-summary ul { padding-left: 20px; margin-bottom: 0; }
+.preinstall-modal .preinstall-not-ready { color: var(--warning, #795600); }
+.preinstall-modal .form-note { line-height: 1.65; }
+.preinstall-modal .modal-footer { gap: 12px; }
+.preinstall-modal [hidden] { display: none !important; }
+#preinstall-new { white-space: nowrap; }
+.preinstall-toolbar { height: auto; min-height: 64px; padding: 12px 0; flex-wrap: wrap; }
+.preinstall-toolbar .topbar-right { flex-wrap: wrap; flex-shrink: 1; }
+.preinstall-toolbar-more { position: relative; }
+.preinstall-toolbar-more > summary { cursor: pointer; white-space: nowrap; list-style: none; }
+.preinstall-toolbar-more > summary::-webkit-details-marker { display: none; }
+.preinstall-toolbar-more > summary::after { content: '▾'; margin-left: 6px; }
+.preinstall-toolbar-panel {
+  position: absolute; right: 0; top: calc(100% + 8px); z-index: 5;
+  width: min(254px, calc(100vw - 32px)); padding: 12px;
+  border-radius: 10px; border: 1px solid var(--line, #d2d2d7); background: var(--paper, white);
+}
+.preinstall-toolbar-panel p { margin: 8px 0 0; line-height: 1.5; }
+@media (max-width: 640px) {
+  .preinstall-modal { width: calc(100vw - 16px); padding: 18px; max-height: calc(100dvh - 16px); }
+  .preinstall-modal .preinstall-grid { grid-template-columns: 1fr; gap: 0; }
+  .preinstall-modal .preinstall-section { padding: 12px; }
+  .preinstall-modal .modal-footer { flex-wrap: wrap; }
+}

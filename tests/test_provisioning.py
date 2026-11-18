@@ -134,6 +134,7 @@ class EnvironmentTests(unittest.TestCase):
         self.addCleanup(self.stack.close)
         for key, value in {
             'NETWORK_SOURCE': self.source,
+            'PACKET_SOURCE': self.source / 'packet_policy.py',
             'PACKET_SHA256': hashlib.sha256((self.source / 'packet_policy.py').read_bytes()).hexdigest(),
             'GV_SHA256': hashlib.sha256((self.source / 'gvproxy-darwin').read_bytes()).hexdigest(),
             'MIHOMO_SHA256': hashlib.sha256(self.core.read_bytes()).hexdigest(),

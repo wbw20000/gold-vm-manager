@@ -1078,12 +1078,6 @@ dialog:not([open]) {
   background: var(--danger-soft);
 }
 
-.share-tools .tool-separator {
-  width: 1px;
-  height: 16px;
-  background: var(--line);
-}
-
 .shares-empty,
 .empty-shares {
   padding: 24px 12px;
@@ -1829,10 +1823,6 @@ button:disabled,
   .pending-banner {
     margin-right: 16px;
     margin-left: 16px;
-  }
-
-  .share-tools .tool-separator {
-    display: none;
   }
 
   .activity-item {

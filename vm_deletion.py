@@ -149,11 +149,12 @@ def _journal_complete(journal, jid, vm):
             and journal.get('phase') == 'committed_old_removed')
 
 
-def _status_with_journal(current):
+def _status_with_journal(current, *, state_dir=None):
     if not current or current.get('mode') != 'delete':
         return current
     current = dict(current)
-    journal = registry.read_private(STATE / 'build-jobs' / current['id'] / 'commit.json', None)
+    state = STATE if state_dir is None else Path(state_dir)
+    journal = registry.read_private(state / 'build-jobs' / current['id'] / 'commit.json', None)
     complete = _journal_complete(journal, current['id'], current.get('source_vm'))
     if journal is not None and not complete:
         current['recovery_required'] = True
@@ -168,14 +169,15 @@ def _status_with_journal(current):
     return current
 
 
-def status():
+def status(*, state_dir=None):
     """Return the shared lifecycle job, with deletion journal reconciliation.
 
     Callers must fail closed on ValueError/OSError and block operations whenever
     recovery_required is true. Reading status never starts/retries deletion.
     """
     try:
-        return _status_with_journal(lifecycle.status())
+        current = lifecycle.status() if state_dir is None else lifecycle.status(state_dir=state_dir)
+        return _status_with_journal(current, state_dir=state_dir)
     except DeletionRejected:
         raise
     except Exception:
@@ -215,7 +217,9 @@ def start(vm, confirm_name, acknowledge_erase, known_names):
             previous = status()
             if previous and previous.get('recovery_required'):
                 _reject('上次事务需要人工恢复，未开始删除任务')
-            if previous and previous.get('phase') in lifecycle.ACTIVE:
+            if lifecycle.waiting_for_vpn(previous):
+                _reject('请先完成已暂存 VM 的 VPN 配置，未开始删除任务')
+            if lifecycle.is_active(previous):
                 _reject('已有任务正在运行，未开始删除任务')
             jid = uuid.uuid4().hex
             jobdir = STATE / 'build-jobs' / jid

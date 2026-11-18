@@ -8,6 +8,8 @@
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'">
   <title>Gold · 本地虚拟机工作空间</title>
   <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/preinstall.css">
+  <script src="/preinstall.js" defer></script>
   <script src="/app.js" defer></script>
 </head>
 <body>
@@ -22,7 +24,20 @@
       <div class="sidebar-bottom"><span id="connection-indicator" class="connection-dot"></span><span id="connection-label">正在连接本机</span><button id="connection-settings" class="icon-button" type="button" aria-label="配置访问令牌" title="配置访问令牌">⚙</button></div>
     </aside>
     <main id="main" class="main" tabindex="-1">
-      <header class="topbar"><div class="breadcrumb">工作空间 <span>/</span> 虚拟机控制台</div><div class="topbar-right"><button id="new-vm" class="button button-primary" type="button" disabled>＋ 新建 VM</button><span class="local-badge">LOCAL ONLY</span><span id="last-sync">等待同步</span><button id="refresh" class="icon-button" type="button" title="立即刷新" aria-label="立即刷新状态">↻</button></div></header>
+      <header class="topbar preinstall-toolbar">
+        <div class="breadcrumb">工作空间 <span>/</span> 虚拟机控制台</div>
+        <div class="topbar-right">
+          <button id="preinstall-new" class="button button-primary" type="button" disabled>新建 VM 及预装软件</button>
+          <details id="create-advanced" class="preinstall-toolbar-more">
+            <summary class="button button-secondary">高级选项</summary>
+            <div class="preinstall-toolbar-panel">
+              <button id="new-vm" class="button button-secondary" type="button" aria-describedby="system-only-note" disabled>仅安装 VM</button>
+              <p id="system-only-note">只把 macOS 安装到暂存盘，不预装软件、不发布或开机。</p>
+            </div>
+          </details>
+          <span class="local-badge">LOCAL ONLY</span><span id="last-sync">等待同步</span><button id="refresh" class="icon-button" type="button" title="立即刷新" aria-label="立即刷新状态">↻</button>
+        </div>
+      </header>
       <section class="page-heading"><div><h1>虚拟机</h1><p>你的本地环境，一目了然。</p></div><div class="heading-badge"><span class="tiny-dot"></span> Gold VM Manager <span id="app-version"></span></div></section>
       <section id="connection-banner" class="banner" hidden aria-live="polite"></section>
       <section class="host-overview" aria-label="本机资源"><div class="host-title"><span class="host-symbol" aria-hidden="true">⌘</span><div><strong>本机资源</strong><span>HOST MACHINE</span></div></div><div class="host-metric"><span>处理器</span><strong id="host-cpu">—</strong></div><div class="host-metric"><span>统一内存</span><strong id="host-memory">—</strong></div><div class="host-metric"><span>可用磁盘</span><strong id="host-disk">—</strong></div><div class="host-summary"><span id="running-count">—</span><small>台虚拟机运行中</small></div></section>
@@ -45,10 +60,13 @@
       <div class="field"><label for="build-disk">磁盘容量（GiB）</label><input id="build-disk" type="number" min="50" max="1024" step="1" value="50" required><small>默认 2 vCPU／4 GiB，可手动调整。镜像最低要求不满足时会拒绝，不会偷偷增加资源。2 核可能较慢或有稳定性风险。</small></div>
       <div class="field"><label for="build-image-mode">全新 macOS 来源</label><select id="build-image-mode"><option value="latest">从 Apple 下载当前宿主支持的最新恢复镜像</option><option value="local">选择已有 Apple IPSW 恢复镜像</option></select></div>
       <div id="build-image-local" class="field" hidden><label for="build-ipsw">本机 IPSW 文件</label><div class="path-input"><input id="build-ipsw" autocomplete="off" placeholder="/绝对路径/macOS.ipsw"><button id="pick-ipsw" class="button button-secondary" type="button">选择镜像…</button></div></div>
+      <div id="build-offline-notice" hidden><p class="write-warning">只安装 macOS 到新暂存盘。恢复后停止，不预装软件、不读取宿主代理，也不会创建可启动的 VM。</p><label class="checkbox-label"><input id="build-offline-ack" type="checkbox"><span>我确认只用已核验来源的本地 IPSW 安装到暂存盘，不自动下载或开机。</span></label></div>
+      <div id="build-legacy-setup">
       <div id="build-setup-profile"></div>
       <p class="form-note">从零安装：新磁盘、NVRAM、ECID 与 MAC；硬件型号受 Apple 限制，不承诺全部硬件字段不同。安装阶段无网卡，完成后仅通过专属端点防护联网。</p>
       <p class="write-warning">原型功能：创建、重建、删除和启动已在开发环境通过面板验证，不代表完整自动初始化或任意环境兼容。首次设置与软件安装仍需手动完成。失败可能保留暂存文件；请先备份重要数据。</p>
       <label class="checkbox-label"><input id="build-setup-ack" type="checkbox"><span>允许复制宿主当前 Clash 节点配置到新 VM 的只读安装材料；不复制 Claude／CCBaga 身份库、钥匙串或浏览器资料。<small>首次需要在 VM 内完成 macOS 设置并运行 setup 安装向导，授权 Clash/Mihomo 核心服务（不含 Verge 图形客户端）、安装软件、检查代理并自行登录 Claude。创建成功不代表这些步骤已完成。</small></span></label>
+      </div>
       <div id="build-erase-warning" class="write-warning" hidden><strong>不可撤销：旧 VM 内的内容将全部丢弃</strong><p>确认后会先准备镜像和新系统，再删除旧磁盘及暂停状态，不保留旧 VM 备份。宿主共享原文件不会删除，但新 VM 的共享配置会清空。远端 token 不会因此撤销，宿主备份也不会自动擦除。</p><label class="checkbox-label"><input id="build-erase-ack" type="checkbox"><span>我确认删除选中的旧 VM 全部内容</span></label><div class="field"><label id="build-confirm-label" for="build-confirm">完整输入旧 VM 名称</label><input id="build-confirm" autocomplete="off" spellcheck="false"></div></div>
       <p id="build-error" class="form-error" role="alert" hidden></p>
       <div class="modal-footer"><button class="button button-secondary dialog-close" type="button">取消</button><button id="build-submit" class="button button-primary" type="submit" disabled>开始新建</button></div>

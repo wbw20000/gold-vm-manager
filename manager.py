@@ -29,9 +29,19 @@ import lifecycle
 import process_identity
 import vm_deletion
 import setup_profile
+import oneclick
+import vpn_store
 
 APP = 'gold-vm-manager'
-VERSION = '1.2.0'
+VERSION = '1.3.0'
+VPN_VALIDATE_PATH = '/api/preinstall/vpn/validate'
+# Cover JSON escaping for the 256 KiB input limit without raising other routes' caps.
+VPN_VALIDATE_MAX_WIRE = 6 * 256 * 1024 + 16384
+PREINSTALL_PHASE_FIELDS = frozenset(('id', 'mode', 'name', 'phase', 'pid', 'progress', 'started_at',
+    'updated_at', 'message', 'source_vm', 'old_deleted', 'system_restored', 'applications_preinstalled',
+    'guest_started', 'desktop_verified', 'host_credentials_copied', 'user_vpn_configuration_supplied',
+    'vpn_configuration_staged', 'vpn_connected', 'network_independently_verified', 'published',
+    'needs_host_security_authorization', 'recovery_required', 'failure_code', 'failed_phase'))
 HOME = Path.home()
 STATE_DIR = HOME / 'Library/Application Support/GoldVMManager'
 CONFIG_PATH = STATE_DIR / 'config.json'
@@ -41,9 +51,9 @@ VM_BASES = {
     'gold': HOME / 'Applications/GoldNetwork',
     'gold-backup': HOME / 'Applications/GoldBackupNetwork',
     'gold-fresh': HOME / 'Applications/GoldFreshNetwork',
-    'dsh purge测试': HOME / 'Applications/DSHPurgeVM',
 }
-ISOLATED_VMS = frozenset({'dsh purge测试'})
+# Dedicated local test-VM bindings are not distributed with the public source.
+ISOLATED_VMS = frozenset()
 STATIC = Path(__file__).resolve().parent / 'static'
 ENV = {
     'HOME': str(HOME), 'TART_HOME': str(HOME / '.tart'),
@@ -159,19 +169,19 @@ class Controller:
 
     def bases(self):
         try:
-            return managed_registry.registered_bases(VM_BASES)
+            return managed_registry.registered_bases(VM_BASES, state_dir=STATE_DIR)
         except ValueError as e:
             raise AppError(str(e), 'invalid_registry', 500) from None
 
     def build_status(self):
         try:
-            return vm_deletion.status()
+            return vm_deletion.status(state_dir=STATE_DIR)
         except (ValueError, OSError):
             return {'phase': 'failed', 'message': '创建任务记录不可读；为避免不完整替换，所有 VM 操作已锁定，请先检查私有任务记录', 'name': None, 'recovery_required': True}
 
     def build_busy(self, vm):
         job = self.build_status()
-        return bool(job and (job.get('phase') in lifecycle.ACTIVE or job.get('recovery_required'))
+        return bool(job and (lifecycle.is_active(job) or job.get('recovery_required'))
                     and ((job.get('recovery_required') and not job.get('name'))
                          or vm in (job.get('source_vm'), job.get('name'))))
 
@@ -195,6 +205,43 @@ class Controller:
                 return lifecycle.start(payload, set(self.bases()) - set(ISOLATED_VMS))
             except (ValueError, OSError) as e:
                 raise AppError(str(e) if isinstance(e, ValueError) else '创建任务前置检查失败', 'build_rejected', 409) from None
+
+    def preinstall_capabilities(self):
+        return {'ok': True, **oneclick.capabilities()}
+
+    def preinstall_examples(self):
+        return {'ok': True, **oneclick.examples()}
+
+    def validate_vpn(self, payload):
+        from vpn_config import VPNConfigurationError
+        if type(payload) is not dict or set(payload) != {'submission', 'allow_resolve'} or type(payload['allow_resolve']) is not bool:
+            raise AppError('节点校验请求无效', 'vpn_validation_failed')
+        try:
+            stored = vpn_store.store_submission(STATE_DIR, payload['submission'], allow_resolve=payload['allow_resolve'])
+        except (VPNConfigurationError, vpn_store.VPNStoreError):
+            # No submitted value or underlying parser/OS output crosses the API boundary.
+            raise AppError('节点或 YAML 未通过校验；请检查本地文件路径、权限及模板中的协议和节点字段。', 'vpn_validation_failed') from None
+        return {'ok': True, **stored}
+
+    def create_preinstall(self, payload):
+        with self.lock:
+            if self.operations:
+                raise AppError('请先等待当前 VM 操作完成', 'busy', 409)
+            try:
+                job = oneclick.start(payload, state_dir=STATE_DIR, tart_home=VM_ROOT.parent)
+            except (ValueError, OSError, subprocess.SubprocessError):
+                raise AppError('预装请求未受理。请检查全新名称、前置条件、有效的节点校验以及是否有任务待处理。', 'preinstall_rejected', 409) from None
+            return {'ok': True, 'job': {k: v for k, v in job.items() if k in PREINSTALL_PHASE_FIELDS}}
+
+    def resume_preinstall(self, payload):
+        with self.lock:
+            if self.operations:
+                raise AppError('请先等待当前 VM 操作完成', 'busy', 409)
+            try:
+                job = oneclick.resume(payload, state_dir=STATE_DIR, tart_home=VM_ROOT.parent)
+            except (ValueError, OSError, subprocess.SubprocessError):
+                raise AppError('无法继续 VPN 配置。请确认任务仍在等待、节点已重新校验，且暂存盘未被改动。', 'vpn_resume_rejected', 409) from None
+            return {'ok': True, 'job': {k: v for k, v in job.items() if k in PREINSTALL_PHASE_FIELDS}}
 
     def pick_ipsw(self, payload):
         if payload != {}:
@@ -241,11 +288,26 @@ class Controller:
         except OSError:
             raise AppError('无法调用本机 Tart，请检查安装', 'tart_unavailable', 500) from None
 
+    def _inventory_tart(self):
+        try:
+            return lifecycle.inventory_tool(state_dir=STATE_DIR, legacy=TART)
+        except (OSError, ValueError, RuntimeError, TypeError):
+            raise AppError('受审查的 Tart 工具记录未通过核对', 'tart_unavailable', 409) from None
+
+    def _environment(self, vm):
+        meta = private_json(self._vm(vm) / 'environment.json', {})
+        if type(meta) is not dict:
+            raise AppError('启动环境记录不受支持', 'invalid_environment', 409)
+        return meta
+
     def inventory(self, fresh=False):
         with self.lock:
             if not fresh and self._cache is not None and time.monotonic() - self._cache_at < 1.0:
                 return dict(self._cache)
-            r = self._run([str(TART), 'list', '--format', 'json'])
+            tool = self._inventory_tart()
+            if tool is None:
+                return {}  # No programs run and the first-install UI is still available.
+            r = self._run([str(tool), 'list', '--format', 'json'])
             if r.returncode:
                 raise AppError('读取 VM 列表失败', 'inventory_failed', 500)
             try:
@@ -287,7 +349,13 @@ class Controller:
         r = self._run(['/bin/ps', '-p', str(pid), '-o', 'args='])
         command = r.stdout.strip()
         argv = process_identity.arguments(pid)
-        if r.returncode or len(argv) < 3 or argv[:3] != [str(TART), 'run', vm]:
+        meta = self._environment(vm)
+        if meta.get('version') == 2:
+            binding = meta.get('tart_binding')
+            tart = binding.get('path') if type(binding) is dict and meta.get('vm_name') == vm else None
+        else:
+            tart = str(TART)
+        if not tart or r.returncode or len(argv) < 3 or argv[:3] != [tart, 'run', vm]:
             raise AppError('VM 进程身份未通过核对，未发送控制信号', 'unmanaged_process', 409)
         return pid, command
 
@@ -302,9 +370,47 @@ class Controller:
         except (ValueError, OSError, RuntimeError) as error:
             raise AppError('上次共享挂载记录不可读：' + str(error)[:160], 'invalid_launch_record', 409) from None
 
+    def _preinstalled_status(self, base, runtime):
+        # Guest mailbox is untrusted evidence from one purpose-built private share.
+        # It must never elevate guest claims to a verified connection or desktop.
+        from preinstall_runtime import read_guest_status
+        result = {'configuration_staged': True, 'configuration': 'not_observed',
+                  'application': 'not_observed', 'system_authorization': 'user_action_may_be_required',
+                  'host_authorization_pending': runtime.get('state') in (None, 'awaiting_host_authorization'),
+                  'desktop_verified': False, 'vpn_connected': False, 'network_independently_verified': False}
+        try:
+            seed = private_json(base / 'vpn-seed-receipt.json', {})
+            report = read_guest_status(base, seed.get('receipt_token'))
+            if report.get('evidence') == 'guest_reported':
+                result.update(evidence='guest_reported', configuration=report['configuration'],
+                              application=report['application'], connection_check=report['connection_check'])
+        except (ValueError, OSError, RuntimeError, TypeError, AttributeError, AppError):
+            pass
+        return result
+
+    def _require_preinstall_publication(self, vm, base):
+        from preinstall_runtime import validate_environment
+        try:
+            jid = base.name
+            journal = managed_registry.read_private(STATE_DIR / 'build-jobs' / jid / 'commit.json')
+            if (not re.fullmatch(r'[0-9a-f]{32}', jid) or type(journal) is not dict
+                    or type(journal.get('version')) is not int or journal['version'] != 1
+                    or journal.get('phase') != 'committed_new_registered' or journal.get('id') != jid
+                    or journal.get('mode') != 'preinstall' or journal.get('name') != vm
+                    or journal.get('source_vm') is not None or journal.get('environment_id') != jid
+                    or journal.get('target') != str(VM_ROOT / vm)):
+                raise ValueError('uncommitted')
+            meta = validate_environment(base)
+            if meta['vm_name'] != vm or meta['vm_config'] != str(VM_ROOT / vm / 'config.json'):
+                raise ValueError('binding')
+        except (ValueError, OSError, RuntimeError, TypeError, KeyError):
+            raise AppError('预装发布记录或受保护启动文件未通过核对，不会启动或回退到普通网络。', 'preinstall_start_rejected', 409) from None
+
     def state(self):
         inventory = self.inventory()
         build = self.build_status()
+        if build and build.get('mode') == 'preinstall':
+            build = {k: v for k, v in build.items() if k in PREINSTALL_PHASE_FIELDS}
         vms = []
         with self.lock:
             for child_vm, process in list(self.children.items()):
@@ -337,15 +443,21 @@ class Controller:
                     control = {}
                     error = '网络控制配置异常，启动器会拒绝不安全配置'
                 runtime = self._runtime(vm)
-                setup_active = (base / 'environment.json').is_file()
-                environment = private_json(base / 'environment.json', {}) if setup_active else {}
+                managed_environment = (base / 'environment.json').is_file()
+                try:
+                    environment = self._environment(vm) if managed_environment else {}
+                except AppError:
+                    environment = {}
+                    error = '启动环境记录不可读；不会自动启动。'
+                preinstalled = environment.get('version') == 2
+                setup_active = managed_environment and not preinstalled
                 try:
                     profile = setup_profile.validate(environment.get('setup_profile'))
                 except (ValueError, AttributeError):
                     profile = setup_profile.validate()
                     error = '初始化模板无效，请重新选择，不自动执行'
                 recovery_mode = runtime.get('recovery_mode') is True and vm_state == 'running'
-                pause_supported = vm not in ISOLATED_VMS and not setup_active and not effective_shares(active)
+                pause_supported = vm not in ISOLATED_VMS and not managed_environment and not effective_shares(active)
                 protected_ready = (base / 'launcher.py').is_file()
                 if vm_state == 'running':
                     try:
@@ -370,8 +482,9 @@ class Controller:
                                 'management_enabled': runtime.get('management_enabled') is True and vm_state == 'running'},
                     'shares': desired, 'active_shares': active, 'shares_locked': vm in ISOLATED_VMS, 'pending_share_changes': pending,
                     'pause_supported': pause_supported, 'busy': vm in self.operations or self.build_busy(vm),
-                    'rebuild_supported': vm not in ISOLATED_VMS and settings.get('os', 'darwin') == 'darwin',
+                    'rebuild_supported': not preinstalled and vm not in ISOLATED_VMS and settings.get('os', 'darwin') == 'darwin',
                     'setup_required': setup_active, 'setup_profile': profile,
+                    'preinstalled': self._preinstalled_status(base, runtime) if preinstalled else None,
                     'recovery_supported': setup_active and vm not in ISOLATED_VMS,
                     'recovery_mode': recovery_mode,
                     'operation': self.operations.get(vm), 'last_error': error, 'last_event': latest,
@@ -386,7 +499,7 @@ class Controller:
                     'host': {'cpu_count': os.cpu_count(), 'memory_gib': memory,
                              'free_disk_gib': round(usage.f_bavail * usage.f_frsize / (1024 ** 3), 1)},
                     'vms': vms, 'events': list(self.events), 'build_job': build,
-                    'capabilities': {'native_picker': True, 'create_vm': True, 'rebuild_vm': True}}
+                    'capabilities': {'native_picker': True, 'create_vm': True, 'rebuild_vm': True, 'offline_validate': True, 'preinstall': True}}
 
     def save_shares(self, vm, payload):
         self._vm(vm)
@@ -459,7 +572,7 @@ class Controller:
 
     def action(self, vm, payload):
         self._vm(vm)
-        if not isinstance(payload, dict) or set(payload) - {'action', 'confirm_name'}:
+        if not isinstance(payload, dict) or set(payload) - {'action', 'confirm_name', 'acknowledge_reviewed_unsigned_backend'}:
             raise AppError('操作请求格式错误')
         action = payload.get('action')
         if action not in ('start', 'pause', 'shutdown', 'force-stop', 'discard-state', 'focus', 'recovery-start'):
@@ -473,7 +586,20 @@ class Controller:
             if not item:
                 raise AppError('VM 不存在', 'missing_vm', 404)
             state = item['State']
+            base = self._vm(vm)
+            preinstalled = self._environment(vm).get('version') == 2
+            launch_ack = False
+            if 'acknowledge_reviewed_unsigned_backend' in payload and (not preinstalled or action != 'start'):
+                raise AppError('此操作不接受后端授权字段', 'invalid_execution_consent')
+            if preinstalled and action == 'start' and state != 'running':
+                if (state != 'stopped' or payload.get('confirm_name') != vm
+                        or payload.get('acknowledge_reviewed_unsigned_backend') is not True):
+                    raise AppError('请确认完整 VM 名称和此台 VM 的后端执行提示；不会自动启动。', 'host_authorization_required', 409)
+                self._require_preinstall_publication(vm, base)
+                launch_ack = True
             if action == 'recovery-start':
+                if preinstalled:
+                    raise AppError('预装环境目前只支持明确授权的受保护普通启动。', 'recovery_unavailable', 409)
                 if state != 'stopped':
                     raise AppError('恢复模式仅用于已关机 VM；请先正常关机，不会自动强制停止', 'wrong_state', 409)
                 code = (self._vm(vm) / 'launcher.py').read_text()
@@ -509,21 +635,26 @@ class Controller:
                     raise AppError(str(e), 'share_preflight_failed', 409) from None
             self.operations[vm] = {'action': action, 'started_at': now()}
             self.errors.pop(vm, None)
-            worker = threading.Thread(target=self._perform, args=(vm, action), daemon=True)
+            worker = threading.Thread(target=self._perform, args=(vm, action, True) if launch_ack else (vm, action), daemon=True)
             worker.start()
             return {'ok': True, 'message': {'start': '正在启动或恢复 VM', 'pause': '正在保存暂停状态',
                     'shutdown': '已请求正常关机，请留意客机提示（macOS 可能需要确认）',
                     'force-stop': '正在强制停止 VM', 'discard-state': '正在丢弃已确认的暂停状态',
                     'focus': '正在打开 VM 窗口', 'recovery-start': '正在以受保护恢复模式启动；未抹盘或更改密码'}[action]}
 
-    def _perform(self, vm, action):
+    def _perform(self, vm, action, launch_ack=False):
         try:
             if action in ('start', 'recovery-start'):
                 logfile = STATE_DIR / 'logs' / (vm + '-' + datetime.now().strftime('%Y%m%d-%H%M%S') + '.log')
                 if logfile.is_symlink():
                     raise AppError('启动日志路径异常', 'unsafe_log', 500)
                 with logfile.open('x', encoding='utf-8') as log:
-                    proc = subprocess.Popen(['/usr/bin/python3', str(self.bases()[vm] / 'launcher.py')] + (['--recovery'] if action == 'recovery-start' else []),
+                    argv = ['/usr/bin/python3', '-B', str(self.bases()[vm] / 'launcher.py')]
+                    if action == 'recovery-start':
+                        argv.append('--recovery')
+                    if launch_ack:
+                        argv += ['--acknowledge-reviewed-unsigned-backend', '--enable-reviewed-backend-owner-execute']
+                    proc = subprocess.Popen(argv,
                         stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                         env=ENV, cwd=str(self.bases()[vm]), start_new_session=True, close_fds=True)
                 with self.lock:
@@ -531,6 +662,8 @@ class Controller:
                 deadline = time.monotonic() + 25
                 while time.monotonic() < deadline:
                     if proc.poll() is not None:
+                        if launch_ack and self._runtime(vm).get('state') == 'awaiting_host_authorization':
+                            raise AppError('后端未获得本机执行许可或启动未就绪；未启动 VM，也不会重试、移除隔离属性或改用普通网络。', 'host_authorization_required', 409)
                         raise AppError('受保护启动器提前退出；没有使用无保护网络回退。请查看应用日志。', 'launcher_exited', 500)
                     if self.inventory(fresh=True).get(vm, {}).get('State') == 'running':
                         self.event(vm, action, '恢复模式已启动，未附加宿主共享目录' if action == 'recovery-start' else 'VM 已运行，保留原网络防护')
@@ -566,7 +699,10 @@ class Controller:
                     helper = Path(__file__).resolve().parent / 'discard_state.py'
                     r = self._run(['/usr/bin/python3', str(helper), vm])
                 else:
-                    r = self._run([str(TART), 'stop', vm, '--timeout', '10'], timeout=18)
+                    tool = self._inventory_tart()
+                    if tool is None:
+                        raise AppError('Tart 工具未就绪；未发送停止请求', 'tart_unavailable', 409)
+                    r = self._run([str(tool), 'stop', vm, '--timeout', '10'], timeout=18)
                 if r.returncode:
                     raise AppError('停止/丢弃未成功或状态已变化，请刷新后重新确认', 'stop_failed', 409)
                 self.event(vm, action, 'VM 已停止（用户明确确认）' if action == 'force-stop' else '已丢弃用户确认的暂停状态；下次冷启动')
@@ -652,14 +788,18 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, {'ok': True, 'app': APP, 'version': VERSION, 'instance': self.server.instance})
             elif path == '/api/state':
                 self._json(200, self.server.controller.state())
-            elif path in ('/', '/index.html', '/app.js', '/style.css'):
+            elif path == '/api/preinstall/capabilities':
+                self._json(200, self.server.controller.preinstall_capabilities())
+            elif path == '/api/preinstall/examples':
+                self._json(200, self.server.controller.preinstall_examples())
+            elif path in ('/', '/index.html', '/app.js', '/style.css', '/preinstall.js', '/preinstall.css'):
                 name = 'index.html' if path in ('/', '/index.html') else path[1:]
                 asset = STATIC / name
                 if asset.is_symlink() or asset.resolve() != STATIC.resolve() / name:
                     raise AppError('资源不可用', 'asset_not_found', 404)
                 raw = asset.read_bytes()
-                types = {'index.html': 'text/html; charset=utf-8', 'app.js': 'text/javascript; charset=utf-8', 'style.css': 'text/css; charset=utf-8'}
-                self._headers(200, types[name], len(raw))
+                mime = {'.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css'}[asset.suffix]
+                self._headers(200, mime + '; charset=utf-8', len(raw))
                 self.wfile.write(raw)
             elif path == '/favicon.ico':
                 self._headers(204, 'image/x-icon', 0)
@@ -686,15 +826,25 @@ class Handler(BaseHTTPRequestHandler):
                 length = int(self.headers.get('Content-Length', '-1'))
             except ValueError:
                 raise AppError('请求长度错误') from None
-            if not 0 <= length <= 65536:
+            path = parsed.path
+            max_wire = VPN_VALIDATE_MAX_WIRE if path == VPN_VALIDATE_PATH else 65536
+            if not 0 <= length <= max_wire:
                 raise AppError('请求过大或没有长度', 'invalid_length', 413)
             try:
-                payload = json.loads(self.rfile.read(length).decode('utf-8'), object_pairs_hook=strict_pairs,
+                raw = self.rfile.read(length)
+                if len(raw) != length:
+                    raise ValueError('incomplete request')
+                payload = json.loads(raw.decode('utf-8'), object_pairs_hook=strict_pairs,
                                      parse_constant=lambda x: (_ for _ in ()).throw(ValueError()))
-            except (ValueError, UnicodeError):
+            except (ValueError, UnicodeError, RecursionError):
                 raise AppError('JSON 格式错误') from None
-            path = parsed.path
-            if path == '/api/build':
+            if path == VPN_VALIDATE_PATH:
+                value = self.server.controller.validate_vpn(payload)
+            elif path == '/api/preinstall/create':
+                value = self.server.controller.create_preinstall(payload)
+            elif path == '/api/preinstall/resume':
+                value = self.server.controller.resume_preinstall(payload)
+            elif path == '/api/build':
                 value = self.server.controller.create_build(payload)
             elif path == '/api/pick-ipsw':
                 value = self.server.controller.pick_ipsw(payload)
@@ -713,7 +863,7 @@ class Handler(BaseHTTPRequestHandler):
                     value = self.server.controller.action(vm, payload)
                 else:
                     value = self.server.controller.save_shares(vm, payload)
-            self._json(202 if path.endswith(('/action','/delete')) or path == '/api/build' else 200, value)
+            self._json(202 if path.endswith(('/action','/delete')) or path in ('/api/build', '/api/preinstall/create', '/api/preinstall/resume') else 200, value)
         except AppError as e:
             self.close_connection = True
             self._json(e.status, {'ok': False, 'error': str(e), 'code': e.code})

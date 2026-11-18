@@ -28,8 +28,6 @@ import uuid
 import managed_registry as registry
 import process_identity
 import setup_profile
-import process_identity
-import setup_profile
 
 HOME = registry.HOME
 STATE = registry.STATE_DIR
@@ -42,7 +40,30 @@ ENV = {'HOME': str(HOME), 'TART_HOME': str(TART_HOME), 'TART_NO_AUTO_PRUNE': '1'
        'PATH': '/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin', 'LANG': 'en_US.UTF-8',
        'PYTHONNOUSERSITE': '1', 'PYTHONDONTWRITEBYTECODE': '1'}
 ACTIVE = ('queued', 'preflight', 'downloading', 'inspecting', 'installing', 'provisioning', 'committing', 'deleting')
-TERMINAL = ('awaiting_user_setup', 'failed', 'interrupted', 'deleted')
+TERMINAL = ('awaiting_user_setup', 'awaiting_offline_preinstall', 'awaiting_first_desktop_acceptance', 'failed', 'interrupted', 'deleted')
+OFFLINE_MODE = 'offline_validate'
+PREINSTALL_MODE = 'preinstall'
+PREINSTALL_ACTIVE = ('queued', 'preflight', 'acquiring', 'inspecting', 'installing',
+                     'awaiting_offline_preinstall', 'preinstalling', 'configuring_vpn',
+                     'awaiting_system_authorization', 'verifying', 'preparing_runtime', 'publishing',
+                     'vpn_resume_queued', 'resuming_vpn')
+
+
+def is_active(job):
+    return bool(job and (job.get('phase') in (PREINSTALL_ACTIVE if job.get('mode') == PREINSTALL_MODE else ACTIVE)
+                or (job.get('mode') == PREINSTALL_MODE and job.get('phase') == 'awaiting_first_desktop_acceptance'
+                    and not job.get('published') and job.get('pid'))))
+
+
+def waiting_for_vpn(job):
+    return bool(job and job.get('mode') == PREINSTALL_MODE and job.get('phase') == 'awaiting_vpn_configuration')
+
+
+def offline_status_fields():
+    """Restoration is not application preinstallation or delivery acceptance."""
+    return {'system_restored': False, 'applications_preinstalled': False,
+            'desktop_verified': False, 'guest_started': False,
+            'credentials_copied': False, 'stage_path': None}
 
 
 def timestamp(): return datetime.now(timezone.utc).isoformat()
@@ -56,24 +77,66 @@ def fingerprint(path):
     return h.hexdigest()
 
 
+def inventory_tool(*, state_dir=None, legacy=None):
+    """Use the private, verified local Tart receipt, or the unchanged legacy path.
+
+    A clean checkout can serve its authenticated UI before Tart is acquired.
+    An invalid registered portable tool never silently falls back.
+    """
+    state = STATE if state_dir is None else Path(state_dir)
+    existing = TART if legacy is None else Path(legacy)
+    selected = registry.read_private(state / 'tart-tool.json')
+    if selected is None:
+        return existing if existing.is_file() and not existing.is_symlink() else None
+    from preinstall_runtime import _tart_binding
+    from host_artifacts import SPECS
+    if type(selected) is not dict or set(selected) != {'version', 'executable_path', 'executable_sha256', 'receipt_path'} or type(selected.get('version')) is not int or selected['version'] != 1:
+        raise ValueError('受审查的 Tart 工具记录无效')
+    path = registry.safe_path(Path(selected['executable_path']))
+    receipt_path = registry.safe_path(Path(selected['receipt_path']))
+    attempt = receipt_path.parent
+    if (attempt.parent != state / 'tools' or not re.fullmatch(r'tart-tool-[0-9a-f]{32}', attempt.name)
+            or receipt_path.name != 'tart.json' or path != attempt / 'tart.app/Contents/MacOS/tart'):
+        raise ValueError('Tart 工具路径与私有材料记录不匹配')
+    receipt = registry.read_private(receipt_path)
+    if (type(receipt) is not dict or receipt.get('executable_path') != str(path)
+            or receipt.get('executable_sha256') != selected['executable_sha256']
+            or receipt.get('notarized') is not True or receipt.get('source_kind') != 'pinned-public-archive'
+            or receipt.get('archive_sha256') != SPECS['tart'].sha256 or receipt.get('version') != SPECS['tart'].version
+            or receipt.get('team_id') != '9M2P8L4D89' or _tart_binding(path)['sha256'] != selected['executable_sha256']):
+        raise ValueError('Tart 工具与受审查记录不一致')
+    return path
+
+
 def inventory():
-    r = subprocess.run([str(TART), 'list', '--format', 'json'], env=ENV, capture_output=True, text=True, timeout=20)
+    tool = inventory_tool()
+    if tool is None:
+        return {}
+    r = subprocess.run([str(tool), 'list', '--format', 'json'], env=ENV, capture_output=True, text=True, timeout=20)
     if r.returncode: raise ValueError('无法读取当前 VM 清单，操作已取消')
     return {v['Name']: v for v in json.loads(r.stdout) if v.get('Source') == 'local'}
 
 
 def validated_request(payload, known_names, host_cpu=None, host_memory=None):
-    keys = {'mode', 'source_vm', 'name', 'cpu', 'memory_gib', 'disk_gib', 'ipsw', 'confirm_name', 'acknowledge_erase', 'acknowledge_setup', 'setup_profile'}
+    keys = {'mode', 'source_vm', 'name', 'cpu', 'memory_gib', 'disk_gib', 'ipsw', 'confirm_name', 'acknowledge_erase', 'acknowledge_setup', 'setup_profile', 'acknowledge_offline'}
     if type(payload) is not dict or set(payload) - keys: raise ValueError('新建请求格式错误')
     d = dict(payload)
-    if d.get('mode') not in ('create', 'rebuild'): raise ValueError('请选择新建或彻底重建')
+    if d.get('mode') not in ('create', 'rebuild', OFFLINE_MODE): raise ValueError('请选择新建、彻底重建或离线验证')
+    offline = d['mode'] == OFFLINE_MODE
     registry.validate_name(d.get('name'))
+    if offline:
+        if {'source_vm', 'confirm_name', 'acknowledge_erase', 'setup_profile'} & set(d):
+            raise ValueError('离线验证仅限全新名称，不能指定旧 VM、删除确认或设置资料')
+        if d.get('acknowledge_offline') is not True:
+            raise ValueError('请确认仅恢复暂存系统，不开机、不迁移凭据，软件预装与桌面验收尚未完成')
+        if any(existing.casefold() == d['name'].casefold() for existing in known_names):
+            raise ValueError('此名称已存在；离线验证只能使用全新名称')
     for key, low, high, default in [('cpu', 2, host_cpu or os.cpu_count() or 2, 2),
                                     ('memory_gib', 4, host_memory or 64, 4), ('disk_gib', 50, 1024, 50)]:
         value = d.get(key, default)
         if type(value) is not int or not low <= value <= high: raise ValueError('CPU、内存或磁盘大小超出允许范围')
         d[key] = value
-    if d.get('acknowledge_setup') is not True: raise ValueError('请确认首次 macOS 设置、客机安装及本地代理配置迁移说明')
+    if not offline and d.get('acknowledge_setup') is not True: raise ValueError('请确认首次 macOS 设置、客机安装及本地代理配置迁移说明')
     if d['mode'] == 'rebuild':
         old = d.get('source_vm')
         if type(old) is not str or old not in known_names: raise ValueError('只能重建列表中明确选中的 VM')
@@ -85,11 +148,13 @@ def validated_request(payload, known_names, host_cpu=None, host_memory=None):
     else: d['source_vm'] = None
     ipsw = d.get('ipsw', 'latest')
     if type(ipsw) is not str: raise ValueError('恢复镜像路径无效')
+    if offline and ipsw == 'latest': raise ValueError('离线验证仅接受已取得并核验的本地 IPSW，不自动下载 latest')
     if ipsw != 'latest':
         path = registry.safe_path(Path(ipsw))
         if not path.is_file() or path.suffix.lower() != '.ipsw': raise ValueError('请选择 Apple macOS IPSW 恢复镜像')
+        if offline and path.stat().st_size <= 0: raise ValueError('本地 IPSW 为空，不能进行离线验证')
     d['ipsw'] = ipsw
-    d['setup_profile'] = setup_profile.validate(d.get('setup_profile'))
+    if not offline: d['setup_profile'] = setup_profile.validate(d.get('setup_profile'))
     return d
 
 
@@ -120,34 +185,72 @@ def job_alive(job):
     pid = job.get('pid')
     if type(pid) is not int or pid <= 1: return False
     args = process_identity.arguments(pid)
-    paths = {str(HERE / 'lifecycle.py'), str(HERE / 'vm_deletion.py')}
+    entry = 'oneclick.py' if job.get('mode') == PREINSTALL_MODE else ('vm_deletion.py' if job.get('mode') == 'delete' else 'lifecycle.py')
+    paths = {str(HERE / entry)}
     if not args or not any(p in args for p in paths): return False
     return any(args[i:i+2] == ['--worker', job.get('id')] for i in range(len(args)-1))
 
 
-def status():
-    path = STATE / 'build-current.json'
+def status(*, state_dir=None):
+    state = STATE if state_dir is None else Path(state_dir)
+    path = state / 'build-current.json'
     d = registry.read_private(path, None)
     if not d: return None
     if type(d) is not dict or not re.fullmatch('[0-9a-f]{32}', str(d.get('id', ''))): raise ValueError('创建任务状态异常')
     queued_grace = False
-    if d.get('phase') == 'queued' and d.get('pid') is None:
+    if d.get('phase') in ('queued', 'vpn_resume_queued') and d.get('pid') is None:
         try:
-            queued_grace = (datetime.now(timezone.utc) - datetime.fromisoformat(d['started_at'])).total_seconds() < 10
+            stamp = d['updated_at'] if d['phase'] == 'vpn_resume_queued' else d['started_at']
+            queued_grace = (datetime.now(timezone.utc) - datetime.fromisoformat(stamp)).total_seconds() < 10
         except (KeyError, TypeError, ValueError):
             pass
-    if d.get('phase') in ACTIVE and not queued_grace and not job_alive(d):
+    persisted_recovery_required = d.get('recovery_required') is True
+    if is_active(d) and not queued_grace and not job_alive(d):
         d = dict(d, phase='interrupted', message='上次任务进程已退出；没有自动重试或再次删除。请保留任务目录并检查日志。')
-    journal = registry.read_private(STATE / 'build-jobs' / d['id'] / 'commit.json', None)
+        if d.get('mode') == PREINSTALL_MODE and d.get('stage_path'):
+            d.update(recovery_required=True, message='预装进程已退出；暂存内容需要人工核对，不自动重做或发布。')
+    preinstall = d.get('offline_preinstall')
+    if isinstance(preinstall, dict) and preinstall.get('active') is True:
+        # This opt-in operation holds the lifecycle lock across all disk access.
+        # A stale active flag must not permit a new job or an overwrite retry.
+        offline_lock_held = False
+        lock_fd = None
+        try:
+            lock_fd = os.open(str(registry.safe_path(state / 'build.lock')), os.O_RDONLY | os.O_NOFOLLOW)
+            try: fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError: offline_lock_held = True
+        except (OSError, ValueError):
+            pass
+        finally:
+            if lock_fd is not None: os.close(lock_fd)
+        if not offline_lock_held:
+            d = dict(d, phase='interrupted', recovery_required=True,
+                     offline_preinstall=dict(preinstall, active=False),
+                     message='离线预装进程已退出；暂存磁盘未发布、未启动。请检查复制及重挂验收证据，禁止自动覆盖重试。')
+    if waiting_for_vpn(d) and os.path.lexists(state / 'build-jobs' / d['id'] / 'vpn-resume.json'):
+        d = dict(d, phase='interrupted', recovery_required=True,
+                 message='VPN 续接记录已存在但未排队；保留暂存盘，需核对任务记录，不自动重试。')
+    journal = registry.read_private(state / 'build-jobs' / d['id'] / 'commit.json', None)
     complete = (type(journal) is dict and journal.get('phase') == 'committed_old_removed')
+    if d.get('mode') == PREINSTALL_MODE:
+        complete = (type(journal) is dict and type(journal.get('version')) is int and journal['version'] == 1
+                    and journal.get('phase') == 'committed_new_registered' and journal.get('id') == d['id']
+                    and journal.get('mode') == PREINSTALL_MODE and journal.get('name') == d.get('name')
+                    and journal.get('environment_id') == d['id'] and journal.get('source_vm') is None)
+        if complete and not persisted_recovery_required and d.get('published') is not True:
+            d = dict(d, phase='awaiting_first_desktop_acceptance', published=True, stage_path=None,
+                     progress=1, recovery_required=False, needs_host_security_authorization=True,
+                     message='发布完成；首次启动和桌面/VPN 验收仍需另行进行。')
+        if d.get('published') is True and not complete:
+            d = dict(d, recovery_required=True, message='缺少完整发布记录；禁止启动或覆盖该 VM。')
     if d.get('mode') == 'delete':
         complete = (complete and type(journal.get('version')) is int and journal['version'] == 1
                     and journal.get('id') == d['id'] and journal.get('mode') == 'delete'
                     and journal.get('source_vm') == d.get('source_vm'))
     if journal is not None and not complete:
         d = dict(d, recovery_required=True)
-        if d.get('phase') not in ACTIVE:
-            d['message'] = '替换事务未完整结束，已锁定相关 VM 和后续创建任务。请保留任务记录，先核对新旧目录并人工恢复，不能直接重试。'
+        if not is_active(d):
+            d['message'] = '事务未完整结束，已锁定相关 VM 和后续操作。请保留任务记录，核对目录和注册状态；不会自动重试。'
     return d
 
 
@@ -156,7 +259,7 @@ def start(payload, known_names):
     d = validated_request(payload, known_names, host_memory=int(mem.stdout) // 1024**3)
     values = inventory(); validate_destination(d, values)
     if not HELPER.is_file(): raise ValueError('离线 macOS 安装组件未就绪，未删除任何 VM')
-    if not (HERE / 'provisioning.py').is_file(): raise ValueError('网络与软件配置组件未就绪')
+    if d['mode'] != OFFLINE_MODE and not (HERE / 'provisioning.py').is_file(): raise ValueError('网络与软件配置组件未就绪')
     registry.private_dir(STATE)
     lockpath = registry.safe_path(STATE / 'build.lock', False)
     fd = os.open(str(lockpath), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
@@ -165,7 +268,8 @@ def start(payload, known_names):
         except BlockingIOError: raise ValueError('已有新建/重建任务进行中，请等待完成') from None
         old = status()
         if old and old.get('recovery_required'): raise ValueError('上次替换事务需要人工恢复，未开始新任务')
-        if old and old.get('phase') in ACTIVE: raise ValueError('已有任务正在运行')
+        if waiting_for_vpn(old): raise ValueError('请先完成已暂存 VM 的 VPN 配置')
+        if is_active(old): raise ValueError('已有任务正在运行')
         jid = uuid.uuid4().hex
         jobdir = STATE / 'build-jobs' / jid; registry.private_dir(jobdir)
         d['source_identity'] = source_identity(d['source_vm']) if d['source_vm'] else None
@@ -175,11 +279,21 @@ def start(payload, known_names):
                    'phase': 'queued', 'message': '已接收请求，先检查镜像和软件材料；尚未删除旧 VM',
                    'progress': None, 'pid': None, 'started_at': timestamp(), 'updated_at': timestamp(),
                    'old_deleted': False}
+        if d['mode'] == OFFLINE_MODE:
+            initial.update(offline_status_fields())
+            initial['message'] = '已接收离线验证请求；仅恢复全新暂存磁盘，不开机、不预装软件、不迁移凭据'
         registry.write_private(STATE / 'build-current.json', initial)
-        with (jobdir / 'worker.log').open('x') as log:
-            process = subprocess.Popen(['/usr/bin/python3', '-B', str(HERE / 'lifecycle.py'), '--worker', jid, '--lock-fd', str(fd)],
-                env=ENV, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                start_new_session=True, close_fds=True, pass_fds=(fd,))
+        registry.write_private(jobdir / 'status.json', initial)
+        try:
+            with (jobdir / 'worker.log').open('x') as log:
+                process = subprocess.Popen(['/usr/bin/python3', '-B', str(HERE / 'lifecycle.py'), '--worker', jid, '--lock-fd', str(fd)],
+                    env=ENV, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                    start_new_session=True, close_fds=True, pass_fds=(fd,))
+        except Exception:
+            initial.update(phase='failed', message='任务进程未能启动；未恢复或发布系统，请检查任务日志。', updated_at=timestamp())
+            registry.write_private(STATE / 'build-current.json', initial)
+            registry.write_private(jobdir / 'status.json', initial)
+            raise ValueError('任务进程未能启动，未修改任何 VM') from None
         # The child inherits the flock; parent only closes its descriptor.
         return {'ok': True, 'job_id': jid, 'message': '任务已开始；可关闭窗口，重新打开后查看进度'}
     finally: os.close(fd)
@@ -354,6 +468,7 @@ def check_tree(path, *, control_socket_identity=None):
 
 
 def commit(d, stage, base, update):
+    if d.get('mode') == OFFLINE_MODE: raise ValueError('离线验证只保留暂存磁盘，禁止发布或注册 VM')
     with registry.state_lock(STATE):
         return _commit_locked(d, stage, base, update)
 
@@ -436,41 +551,77 @@ def _commit_locked(d, stage, base, update):
         os.close(storage_fd)
 
 
+def revalidate_offline_request(d, current, values):
+    """Recheck the stored request, distinguishing internal nulls from API inputs."""
+    if (current.get('phase') != 'queued'
+            or any(current.get(key) != d.get(key) for key in ('id', 'mode', 'name', 'source_vm'))
+            or d.get('source_vm') is not None or d.get('source_identity') is not None):
+        raise ValueError('离线验证任务状态或源输入已变化，拒绝恢复或重试')
+    payload = dict(d)
+    for key in ('id', 'source_vm', 'source_identity'): payload.pop(key, None)
+    mem = subprocess.run(['/usr/sbin/sysctl', '-n', 'hw.memsize'], capture_output=True, text=True, check=True)
+    checked = validated_request(payload, values, host_memory=int(mem.stdout) // 1024**3)
+    return dict(checked, id=d['id'], source_identity=None)
+
+
 def worker(jid, lock_fd):
     if not re.fullmatch('[0-9a-f]{32}', jid): raise ValueError('任务标识无效')
     # Validate inherited lock descriptor (a private regular file), keep alive to exit.
     s = os.fstat(lock_fd)
-    expected_lock = (STATE / 'build.lock').stat()
-    if (s.st_dev, s.st_ino) != (expected_lock.st_dev, expected_lock.st_ino) or not stat.S_ISREG(s.st_mode) or s.st_uid != os.getuid() or s.st_mode & 0o077: raise ValueError('任务锁无效')
+    expected_lock = registry.safe_path(STATE / 'build.lock').stat()
+    if (s.st_dev, s.st_ino) != (expected_lock.st_dev, expected_lock.st_ino) or not stat.S_ISREG(s.st_mode) or s.st_uid != os.getuid() or s.st_mode & 0o077 or s.st_nlink != 1: raise ValueError('任务锁无效')
     fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     os.umask(0o077)
     jobdir = registry.safe_path(STATE / 'build-jobs' / jid)
-    d = registry.read_private(jobdir / 'request.json')
     current = registry.read_private(STATE / 'build-current.json')
-    if current.get('id') != jid or d.get('id') != jid: raise ValueError('任务状态冲突')
+    if type(current) is not dict or current.get('id') != jid: raise ValueError('任务状态冲突')
+    offline = current.get('mode') == OFFLINE_MODE
+    if offline:
+        if current.get('phase') != 'queued': raise ValueError('离线验证不能自动恢复或重复执行已有任务')
+        current.update(offline_status_fields())
+        current['old_deleted'] = False
     current['pid'] = os.getpid()
     def update(phase, message, progress=None):
         current.update(phase=phase, message=message, progress=progress, updated_at=timestamp())
         registry.write_private(STATE / 'build-current.json', current)
         registry.write_private(jobdir / 'status.json', current)
     try:
-        update('preflight', '检查软件材料、磁盘空间和旧 VM 状态；尚未删除任何 VM')
-        values = inventory(); validate_destination(d, values)
+        d = registry.read_private(jobdir / 'request.json')
+        if type(d) is not dict or d.get('id') != jid: raise ValueError('任务请求无效或状态冲突')
+        if current.get('mode', d.get('mode')) != d.get('mode'): raise ValueError('任务模式已变化，拒绝执行')
+        offline = d.get('mode') == OFFLINE_MODE
+        values = inventory()
+        if offline:
+            d = revalidate_offline_request(d, current, values)
+        update('preflight', '检查本地镜像、暂存空间和全新名称；不准备软件或迁移凭据' if offline else '检查软件材料、磁盘空间和旧 VM 状态；尚未删除任何 VM')
+        validate_destination(d, values)
         if d['source_vm'] and source_identity(d['source_vm']) != d['source_identity']: raise ValueError('旧 VM 身份已变化，操作取消')
         free = shutil.disk_usage(str(TART_HOME)).free
         if free < (d['disk_gib'] + 20) * 1024**3: raise ValueError('可用空间不足以安全暂存新系统与恢复镜像；未删除旧 VM')
-        import provisioning
-        provisioning.preflight()
-        image = offline_image(d, update)
+        if offline:
+            # No downloader, provisioning import, host credentials or environment setup.
+            image = registry.safe_path(Path(d['ipsw']))
+            image_stat = image.stat()
+        else:
+            import provisioning
+            provisioning.preflight()
+            image = offline_image(d, update)
         update('inspecting', '检查 Apple 镜像兼容性及所选 CPU／内存；不自动调高配置')
         info = helper_json(['--inspect', '--ipsw', str(image)])
         registry.write_private(jobdir / 'image-inspection.json', info)
-        if info.get('supported') is not True or type(info.get('minimumCPUCount')) is not int or type(info.get('minimumMemorySize')) is not int:
+        if (type(info) is not dict or info.get('supported') is not True
+                or any(type(info.get(k)) is not int or info[k] <= 0 for k in ('minimumCPUCount', 'minimumMemorySize'))):
             raise ValueError('此 Apple 恢复镜像不支持当前宿主，旧环境未删除')
         if d['cpu'] < info['minimumCPUCount'] or d['memory_gib'] * 1024**3 < info['minimumMemorySize']:
             raise ValueError('所选 CPU 或内存低于此 macOS 镜像要求；请手动调整后重试')
+        if offline:
+            # Compatibility inspection is not provenance/signature verification.
+            now = registry.safe_path(image).stat()
+            if any(getattr(now, key) != getattr(image_stat, key) for key in ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns')):
+                raise ValueError('本地 IPSW 在兼容性检查期间已变化，拒绝恢复')
         stage_parent = TART_HOME / '.gold-manager-staging' / jid; registry.private_dir(stage_parent)
-        stage = stage_parent / 'new-environment'; stage.mkdir(mode=0o700)
+        stage = registry.safe_path(stage_parent / 'new-environment', False); stage.mkdir(mode=0o700)
+        if offline: current['stage_path'] = str(stage)
         base = STATE / 'environments' / jid
         update('installing', '离线安装全新 macOS：无网卡、无共享、独立磁盘和机器身份', 0)
         command = [str(HELPER), '--create', '--directory', str(stage), '--ipsw', str(image), '--cpu', str(d['cpu']), '--memory-gib', str(d['memory_gib']), '--disk-gib', str(d['disk_gib'])]
@@ -480,7 +631,8 @@ def worker(jid, lock_fd):
             for line in proc.stdout:
                 try: event = json.loads(line)
                 except ValueError: continue
-                if event.get('event') == 'complete' and event.get('schemaVersion') == 1:
+                if type(event) is not dict: continue
+                if event.get('event') == 'complete' and type(event.get('schemaVersion')) is int and event['schemaVersion'] == 1:
                     saw_complete = True
                 percent = event.get('percent')
                 progress = percent / 100 if type(percent) in (int, float) else None
@@ -492,6 +644,12 @@ def worker(jid, lock_fd):
         verify_install_output(stage, d)
         new = new_identity_check(stage)
         if new.get('cpuCount') != d['cpu'] or new.get('memorySize') != d['memory_gib'] * 1024**3: raise ValueError('安装后资源设置不匹配，未发布 VM')
+        if offline:
+            # Recheck concurrent name use, but never move, register, share or boot.
+            validate_destination(d, inventory())
+            current['system_restored'] = True
+            update('awaiting_offline_preinstall', '仅全新系统恢复及隔离输出验证完成；磁盘留在暂存区。尚未预装应用、未开机、未验收桌面、未复制凭据；这不是交付。', 1)
+            return
         update('provisioning', '准备专属网络防护和只读安装材料，不导入旧身份库')
         registry.private_dir(base.parent)
         prepared = provisioning.prepare_environment(d['name'], stage / 'config.json', base, None)
@@ -510,6 +668,10 @@ def worker(jid, lock_fd):
         current['old_deleted'] = bool(d['source_vm'])
         update('awaiting_user_setup', '新 VM 已创建。请启动，完成 macOS 初始设置，再运行只读 setup 目录中的安装向导。软件/代理验收尚未完成。', 1)
     except Exception as error:
+        if offline:
+            current.update({key: value for key, value in offline_status_fields().items() if key != 'stage_path'})
+            current.setdefault('stage_path', None)
+            current['old_deleted'] = False
         # Only controlled ValueErrors may be rendered; subprocess output/credentials never pass through.
         message = str(error) if isinstance(error, ValueError) else '任务失败（' + type(error).__name__ + '）；没有自动重试。请检查任务日志和提交记录。'
         update('failed', message[:450])

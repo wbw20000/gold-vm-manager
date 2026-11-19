@@ -135,7 +135,8 @@
 - **做法**（只改 Python，[offline_vpn.py](<offline_vpn.py>)）：写配置仍用 owners off 的可写挂载（新证据目录 `seed-write-session`，因为宿主用户要写进 root 所有的客机目录）；写完卸载，再以 owners **on** 重新可写挂载到原来的 `write-session`（助手要求的固定路径），在这里收集并哈希文件、生成票据、请求 root 改属主。之后的只读核对和复核不变。
 - **新增检查**：重新挂载后收集到的文件必须与刚写入的完全一致（inode、权限、大小、哈希），否则在弹出授权前就失败，代码 `seed-changed-before-ownership-apply`，失败步骤 `owners-on-reattach`（界面显示「以启用所有权方式重新挂载」）。Python 仍不在 owners on 的挂载上读取私有配置做快照。
 - **客机实测的前提**：在同版本 macOS（26.6.2 / 25G83）的客机上，用普通用户在 owners off 下创建的文件，换成 owners on 挂载后仍显示为该用户所有并可读，所以宿主用户能在 owners on 的挂载上收集文件。
-- **仍需宿主实测**：root 在 owners on 的可写挂载上改属主后，重新挂载是否保留——这是修复成立的关键，只能用真实预装或 `build/guest-tools/ownership-persistence-check.sh` 确认。没有改 Swift 助手。
+- **后续宿主实测（独立空白 APFS，不是 VM）**：以真实管理员身份在 owners-off、owners-on 两种挂载上改属主。前者调用成功但只读重挂后不保留，后者确实保留。另一个差异是：owners-off 上由普通用户创建的文件在 owners-on 重挂后，普通进程看到自身身份，而 root 看见 `99:99`。这能复现写入前旧数值比较的误拒，不能追溯断言旧任务的通用退出码只可能是这一个原因。
+- **修复**：票据 v2 加入每项的 ctime；授权助手仅在写入前区分锁持有进程的凭据视图和真实属主，不把 99 当通配符。在执行修改前仍须精确匹配第一次 root 校验时的真实身份，并在修改后以及独立只读重挂时按最终目标数字严格核验。老票据不迁移、不重放，失败盘保留。详见 [GUEST_OWNERSHIP.md](<GUEST_OWNERSHIP.md>)。
 
 ## 验证
 

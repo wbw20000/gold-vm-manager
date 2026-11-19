@@ -6,9 +6,9 @@ import CryptoKit
 // all native discovery and all chown operations; never deploy that build.
 enum GuestOwnership {
     #if GOLD_OWNERSHIP_FIXTURE
-    static let buildContract = "GOLD_OWNERSHIP_FIXTURE_SIMULATION_ONLY_V1"
+    static let buildContract = "GOLD_OWNERSHIP_FIXTURE_SIMULATION_ONLY_V2"
     #else
-    static let buildContract = "GOLD_OWNERSHIP_PRODUCTION_ROOT_ONLY_V1"
+    static let buildContract = "GOLD_OWNERSHIP_PRODUCTION_ROOT_ONLY_V2"
     #endif
     static let apps = ["CCBaga-A.app", "CCBaga-B.app", "Clash Verge.app", "Claude.app"]
     static let base = "Library/Application Support/GoldVMManager"
@@ -49,6 +49,7 @@ enum GuestOwnership {
         let mode: UInt32
         let observed_uid: UInt32
         let observed_gid: UInt32
+        let ctime_ns: Int64
         let sha256: String
         let link_target: String
     }
@@ -78,16 +79,42 @@ enum GuestOwnership {
         init(_ value: Int32) throws { try need(value >= 0); self.value = value }
         deinit { close(value) }
     }
+    struct Owner: Equatable {
+        let uid: uid_t
+        let gid: gid_t
+    }
+    struct RawStamp: Equatable {
+        let owner: Owner
+        let ctime_ns: Int64
+    }
+    struct LockHolder: Equatable {
+        let owner: Owner
+        let startSeconds: UInt64
+        let startMicroseconds: UInt64
+    }
+    // Only the APPLY precondition admits APFS's credential-dependent view of
+    // the *pair* 99:99. Never project one component, a supplemental group, or
+    // a policy-derived guest target. Exact observations need no projection.
+    static func applyObservationMatches(_ raw: RawStamp, observed: Owner, ctime_ns: Int64, caller: Owner) -> Bool {
+        guard ctime_ns > 0, raw.ctime_ns == ctime_ns else { return false }
+        if raw.owner == observed { return true }
+        return raw.owner == Owner(uid: 99, gid: 99) && observed == caller &&
+            caller.uid >= 501 && caller.uid <= UID_MAX && caller.gid > 0 && caller.gid != 99 && caller.gid <= GID_MAX
+    }
+    static func rawStampMatches(_ raw: RawStamp, prevalidated: RawStamp) -> Bool { raw == prevalidated }
+    static func finalOwnerMatches(_ raw: Owner, desired: Owner) -> Bool { raw == desired }
+
     struct Context {
         let ticket: Ticket
         let bytes: Data
         let digest: String
-        let caller: uid_t
-        let callerGroup: gid_t
+        let lockHolder: LockHolder
+        var caller: uid_t { lockHolder.owner.uid }
         let directory: FD
         let stage: FD
         let image: FD
-        let metadataFiles: [FD]
+        let metadataFiles: [String: FD]
+        var lockedConfig: FD { metadataFiles["config"]! } // mandatory private binding in load()
     }
     struct Attribution: Equatable {
         let device: String
@@ -289,12 +316,13 @@ enum GuestOwnership {
         try need(Data(try canonicalJSON(document).utf8) == bytes)
         guard let rawEntries = document["entries"] as? [[String: Any]], rawEntries.count <= maxEntries else { throw Failure.rejected }
         for entry in rawEntries {
-            try need(Set(entry.keys) == ["path", "kind", "device", "inode", "size", "mode", "observed_uid", "observed_gid", "sha256", "link_target"])
+            try need(Set(entry.keys) == ["path", "kind", "device", "inode", "size", "mode", "observed_uid", "observed_gid", "ctime_ns", "sha256", "link_target"])
+            try need((integer(entry["ctime_ns"]) ?? 0) > 0)
         }
         let ticket: Ticket
         do { ticket = try JSONDecoder().decode(Ticket.self, from: bytes) }
         catch is DecodingError { throw Failure.ticket }
-        try need(ticket.schema == 1 && hexadecimal(ticket.job_id, 32) && hexadecimal(ticket.operation_id, 32))
+        try need(ticket.schema == 2 && hexadecimal(ticket.job_id, 32) && hexadecimal(ticket.operation_id, 32))
         try need(ticket.operationDirectory + "/ticket.json" == ticketPath && ticket.caller_pid > 1)
         try need(validName(ticket.name))
         try need(UUID(uuidString: ticket.data_uuid) != nil && UUID(uuidString: ticket.group_uuid) != nil)
@@ -318,7 +346,7 @@ enum GuestOwnership {
         let bindings = ["request": ticket.state_dir + "/build-jobs/" + ticket.job_id + "/request.json",
                         "restore": ticket.stage + "/.clean-vm-installer.complete.json", "applications": ticket.stage + "/.offline-preinstall.complete.json",
                         "config": ticket.stage + "/config.json", "nvram": ticket.stage + "/nvram.bin", "root_helper": ticket.helper]
-        var metadataFiles = [FD]()
+        var metadataFiles = [String: FD]()
         for key in bindings.keys.sorted() {
             let path = bindings[key]!, names = try parts(path, absolute: true)
             let parent = try directory("/" + names.dropLast().joined(separator: "/"))
@@ -326,32 +354,48 @@ enum GuestOwnership {
             let identity = ticket.metadata[key]!
             try need(identity.sha256 != nil && identity.mode == (key == "root_helper" ? 0o755 : 0o600))
             try checkIdentity(fd, identity, caller: caller)
-            metadataFiles.append(fd)
+            metadataFiles[key] = fd
         }
         #if !GOLD_OWNERSHIP_FIXTURE
         try need(CommandLine.arguments[0] == ticket.helper)
         #endif
         // Parent's exact config POSIX write lock must remain held while this
         // synchronous system-authorization operation runs. Do not reacquire it.
-        try checkParentLock(stage, ticket.caller_pid)
-        let context = Context(ticket: ticket, bytes: bytes, digest: hash(bytes), caller: caller,
-                              callerGroup: fileInfo.st_gid, directory: operationDirectory, stage: stage,
-                              image: image, metadataFiles: metadataFiles)
+        let holder = try lockHolder(metadataFiles["config"]!, ticket.caller_pid, ticketOwner: caller)
+        let context = Context(ticket: ticket, bytes: bytes, digest: hash(bytes), lockHolder: holder,
+                              directory: operationDirectory, stage: stage, image: image, metadataFiles: metadataFiles)
         try stageState(context)
         return context
     }
 
-    static func checkParentLock(_ stage: FD, _ callerPID: Int32) throws {
+    // Query the exact, pinned config descriptor on either side of proc_pidinfo.
+    // The ticket PID and file owner are constraints, not credential sources.
+    static func lockHolder(_ config: FD, _ callerPID: Int32, ticketOwner: uid_t) throws -> LockHolder {
         try Failure.parentLock.checking {
-            let config = try openChild(stage, "config.json")
-            var lock = flock(l_start: 0, l_len: 0, l_pid: 0, l_type: Int16(F_WRLCK), l_whence: Int16(SEEK_SET))
-            try need(fcntl(config.value, F_GETLK, &lock) == 0 && lock.l_type == F_WRLCK && lock.l_pid == callerPID)
+            func requireLock() throws {
+                var lock = flock(l_start: 0, l_len: 0, l_pid: 0, l_type: Int16(F_WRLCK), l_whence: Int16(SEEK_SET))
+                try need(fcntl(config.value, F_GETLK, &lock) == 0 && lock.l_type == F_WRLCK &&
+                         lock.l_pid == callerPID && lock.l_whence == SEEK_SET && lock.l_start == 0 && lock.l_len == 0)
+            }
+            try requireLock()
+            var bsd = proc_bsdinfo()
+            let length = Int32(MemoryLayout<proc_bsdinfo>.size)
+            try need(proc_pidinfo(callerPID, PROC_PIDTBSDINFO, 0, &bsd, length) == length && bsd.pbi_pid == UInt32(callerPID))
+            try need(bsd.pbi_uid >= 501 && bsd.pbi_uid == ticketOwner && bsd.pbi_ruid == bsd.pbi_uid && bsd.pbi_svuid == bsd.pbi_uid)
+            try need(bsd.pbi_rgid == bsd.pbi_gid && bsd.pbi_svgid == bsd.pbi_gid && bsd.pbi_start_tvsec > 0)
+            try requireLock()
+            return LockHolder(owner: Owner(uid: bsd.pbi_uid, gid: bsd.pbi_gid),
+                              startSeconds: bsd.pbi_start_tvsec, startMicroseconds: bsd.pbi_start_tvusec)
         }
+    }
+
+    static func recheckLockHolder(_ context: Context) throws {
+        try need(try lockHolder(context.lockedConfig, context.ticket.caller_pid, ticketOwner: context.caller) == context.lockHolder, .parentLock)
     }
 
     static func stageState(_ context: Context) throws {
         try Failure.ticket.checking { try checkIdentity(context.image, context.ticket.image, caller: context.caller) }
-        try checkParentLock(context.stage, context.ticket.caller_pid)
+        try recheckLockHolder(context)
         try Failure.stageState.checking { try checkStageAndRequest(context) }
         try Failure.ticket.checking { try recheckImmutableBindings(context) }
     }
@@ -507,9 +551,9 @@ enum GuestOwnership {
         try need(errno == 0)
         return result
     }
-    static func linkTarget(_ parent: FD, _ name: String) throws -> String {
+    static func linkTarget(_ link: FD) throws -> String {
         var buffer = [CChar](repeating: 0, count: 4097)
-        let count = readlinkat(parent.value, name, &buffer, 4096)
+        let count = freadlink(link.value, &buffer, 4096)
         try need(count > 0 && count < 4096)
         guard let value = String(bytes: buffer.prefix(count).map { UInt8(bitPattern: $0) }, encoding: .utf8) else { throw Failure.rejected }
         return value
@@ -532,32 +576,57 @@ enum GuestOwnership {
         }
         return result
     }
-    static func checkEntry(_ entry: Entry, root: FD, device: UInt64, verify: Bool, simulate: Bool) throws -> (FD, String, FD?) {
+    static func rawOwner(_ value: stat) -> Owner { Owner(uid: value.st_uid, gid: value.st_gid) }
+    static func rawStamp(_ value: stat) throws -> RawStamp {
+        let sec = Int64(value.st_ctimespec.tv_sec), nsec = Int64(value.st_ctimespec.tv_nsec)
+        try need(sec >= 0 && (0..<1_000_000_000).contains(nsec) && sec <= (Int64.max - nsec) / 1_000_000_000, .ownership)
+        return RawStamp(owner: rawOwner(value), ctime_ns: sec * 1_000_000_000 + nsec)
+    }
+    static func checkShape(_ value: stat, entry: Entry, device: UInt64) throws {
+        let expectedKind = entry.kind == "directory" ? S_IFDIR : entry.kind == "file" ? S_IFREG : S_IFLNK
+        try need(deviceID(value.st_dev) == device && value.st_ino == entry.inode && UInt32(value.st_mode & 0o7777) == entry.mode, .entry)
+        try need(value.st_mode & S_IFMT == expectedKind && (entry.kind == "directory" || value.st_nlink == 1), .entry)
+    }
+    static func applyMatchesTicket(_ stamp: RawStamp, _ entry: Entry, caller: Owner) -> Bool {
+        applyObservationMatches(stamp, observed: Owner(uid: entry.observed_uid, gid: entry.observed_gid),
+                                ctime_ns: entry.ctime_ns, caller: caller)
+    }
+    static func checkEntry(_ entry: Entry, root: FD, device: UInt64, verify: Bool) throws -> (FD, RawStamp) {
         try Failure.entry.checking {
             let target = try desired(entry)
             let (parent, name) = try parentAt(root, entry.path, device: device)
             var value = stat(); try need(fstatat(parent.value, name, &value, AT_SYMLINK_NOFOLLOW) == 0)
-            try need(deviceID(value.st_dev) == device && value.st_ino == entry.inode && UInt32(value.st_mode & 0o7777) == entry.mode)
-            try need(entry.kind == "directory" || value.st_nlink == 1)
-            let expectedKind = entry.kind == "directory" ? S_IFDIR : entry.kind == "file" ? S_IFREG : S_IFLNK
-            try need(value.st_mode & S_IFMT == expectedKind)
-            if verify && !simulate { try need(value.st_uid == target.0 && value.st_gid == target.1, .ownership) }
-            if !verify { try need(value.st_uid == entry.observed_uid && value.st_gid == entry.observed_gid, .ownership) }
-            if entry.kind == "symlink" {
-                try Failure.bundles.checking { try need(try linkTarget(parent, name) == entry.link_target) }
-                return (parent, name, nil)
-            }
-            let fd = try openChild(parent, name, directory: entry.kind == "directory")
-            let actual = try info(fd.value)
-            try need(actual.st_ino == value.st_ino && deviceID(actual.st_dev) == device)
+            try checkShape(value, entry: entry, device: device)
+            // Darwin open(2): O_SYMLINK opens the link itself; adding O_NOFOLLOW
+            // would reject it with ELOOP. Never reopen or mutate it by name.
+            let fd = entry.kind == "symlink" ? try FD(openat(parent.value, name, O_RDONLY | O_SYMLINK | O_NONBLOCK | O_CLOEXEC)) :
+                try openChild(parent, name, directory: entry.kind == "directory")
+            let before = try info(fd.value)
+            try checkShape(before, entry: entry, device: device)
             try noACL(fd.value)
-            if entry.kind == "file" {
+            if entry.kind == "symlink" {
+                try Failure.bundles.checking { try need(try linkTarget(fd) == entry.link_target) }
+            } else if entry.kind == "file" {
                 try Failure.content.checking {
-                    try need(actual.st_size == entry.size && hexadecimal(entry.sha256, 64))
+                    try need(before.st_size == entry.size && hexadecimal(entry.sha256, 64))
                     try need(try hashFile(fd, size: entry.size) == entry.sha256)
                 }
             }
-            return (parent, name, fd)
+            let after = try info(fd.value)
+            try checkShape(after, entry: entry, device: device)
+            let stamp = try rawStamp(after)
+            // Keep more specific content/link/ACL diagnostics above metadata drift.
+            try need(try rawStamp(value) == stamp && rawStamp(before) == stamp, .ownership)
+            if verify {
+                #if !GOLD_OWNERSHIP_FIXTURE
+                // A fresh, independent owners-on readonly mount must expose the
+                // policy owners literally. Chown changes ctime: no ticket ctime here.
+                try need(finalOwnerMatches(stamp.owner, desired: Owner(uid: target.0, gid: target.1)), .ownership)
+                #else
+                _ = target // Simulation never chowns; it cannot attest final ownership.
+                #endif
+            }
+            return (fd, stamp)
         }
     }
 
@@ -678,11 +747,10 @@ enum GuestOwnership {
             return try directory(mount)
         }
         let attribution = try Failure.disk.checking { try nativeMetadata(context, root: root, verify: verify) }
-        let simulate: Bool
         #if GOLD_OWNERSHIP_FIXTURE
-        simulate = true
+        let simulate = true, authorization = "fixture_no_authorization"
         #else
-        simulate = false
+        let simulate = false, authorization = "macos_system_administrator"
         #endif
         let keys = Set(ticket.entries.map(\.path))
         try need(ticket.entries.count >= 9 && ticket.entries.count <= maxEntries && keys.count == ticket.entries.count, .paths)
@@ -698,10 +766,19 @@ enum GuestOwnership {
             try validateLinks(ticket.entries)
         }
         var bytes: Int64 = 0
+        var prevalidated = [UInt64: RawStamp]() // entry inode uniqueness already established above
+        var observationsMatch = true
         for entry in ticket.entries {
-            _ = try checkEntry(entry, root: root, device: attribution.filesystemDevice, verify: verify, simulate: simulate)
+            let (_, stamp) = try checkEntry(entry, root: root, device: attribution.filesystemDevice, verify: verify)
+            if !verify {
+                prevalidated[entry.inode] = stamp
+                // A changed directory ctime must not mask the more specific
+                // identity, ACL or content rejection of a child in this pass.
+                if !applyMatchesTicket(stamp, entry, caller: context.lockHolder.owner) { observationsMatch = false }
+            }
             if entry.kind == "file" { bytes += entry.size; try need(bytes <= maxTree, .content) }
         }
+        try need(observationsMatch, .ownership)
         // Fresh user accounts or Setup Assistant completion disqualify the stage.
         try Failure.stageState.checking {
             let users = try parentAt(root, "Users/Shared", device: attribution.filesystemDevice).0
@@ -732,13 +809,24 @@ enum GuestOwnership {
         try Failure.disk.checking { try need(try nativeMetadata(context, root: root, verify: verify) == attribution) }
         if !verify {
             for entry in ticket.entries.sorted(by: { $0.path.count > $1.path.count }) {
-                let (parent, name, fd) = try checkEntry(entry, root: root, device: attribution.filesystemDevice, verify: false, simulate: simulate)
-                let desired = try desired(entry)
+                let (fd, checked) = try checkEntry(entry, root: root, device: attribution.filesystemDevice, verify: false)
+                try need(applyMatchesTicket(checked, entry, caller: context.lockHolder.owner), .ownership)
+                let target = try desired(entry)
+                guard let original = prevalidated[entry.inode] else { throw Failure.entry }
+                try need(rawStampMatches(checked, prevalidated: original), .ownership)
+                try recheckLockHolder(context)
+                // No name-based mutation (including symlinks). Re-stat this very
+                // descriptor after the second hash/readlink and just before use.
+                let latest = try Failure.entry.checking { try info(fd.value) }
+                try checkShape(latest, entry: entry, device: attribution.filesystemDevice)
+                try need(try rawStampMatches(rawStamp(latest), prevalidated: original), .ownership)
                 #if !GOLD_OWNERSHIP_FIXTURE
-                if let fd { try need(fchown(fd.value, desired.0, desired.1) == 0, .mutation) }
-                else { try need(fchownat(parent.value, name, desired.0, desired.1, AT_SYMLINK_NOFOLLOW) == 0, .mutation) }
+                try Failure.mutation.checking {
+                    try need(fchown(fd.value, target.0, target.1) == 0)
+                    try need(try finalOwnerMatches(rawOwner(info(fd.value)), desired: Owner(uid: target.0, gid: target.1)))
+                }
                 #else
-                _ = (parent, name, fd, desired) // Simulation: never changes owner.
+                _ = target // Simulation: no chown symbol; no mutation/verification claim.
                 #endif
             }
         }
@@ -751,13 +839,16 @@ enum GuestOwnership {
             "fixture_only": simulate, "metadata_applied": !verify && !simulate,
             "persistent_ownership_verified": verify && !simulate,
             "readonly_owners_on": verify, "guest_started": false, "published": false, "helper_contract": buildContract,
-            "authorization": simulate ? "fixture_no_authorization" : "macos_system_administrator"]
+            "authorization": authorization]
         try Failure.receipt.checking {
-            try writePrivate(context.directory, operation + ".receipt.json", bytes: receiptBytes(receipt), owner: context.caller, group: context.callerGroup)
+            try writePrivate(context.directory, operation + ".receipt.json", bytes: receiptBytes(receipt), owner: context.caller, group: context.lockHolder.owner.gid)
         }
     }
 }
 
+// A separate test main can exercise pure rules without a root invocation or
+// providing pretend credentials to this executable. Production always has Main.
+#if !(GOLD_OWNERSHIP_FIXTURE && GOLD_OWNERSHIP_PREDICATE_TEST)
 @main struct Main {
     static func main() {
         umask(0o077)
@@ -782,3 +873,4 @@ enum GuestOwnership {
         }
     }
 }
+#endif

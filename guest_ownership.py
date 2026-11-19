@@ -28,6 +28,7 @@ SEED_RULES = {
     BASE + '/FirstLogin/seed.json': ('file', 501, 20, 0o600),
     'Library/LaunchAgents/org.goldvmmanager.first-login.plist': ('file', 0, 0, 0o644),
 }
+TICKET_SCHEMA = 2
 MAX_ENTRIES = 200000
 MAX_TICKET_BYTES = 64 * 1024 * 1024
 MAX_TREE_BYTES = 16 * 1024 ** 3
@@ -50,6 +51,7 @@ class OwnershipEntry:
     mode: int
     observed_uid: int
     observed_gid: int
+    ctime_ns: int
     sha256: str = ''
     link_target: str = ''
 
@@ -177,7 +179,10 @@ def _identity(path, owner, *, digest=False, executable=False):
         result = {'device': info.st_dev, 'inode': info.st_ino, 'size': info.st_size,
                   'mode': stat.S_IMODE(info.st_mode), 'uid': info.st_uid, 'gid': info.st_gid}
         if digest:
-            result['sha256'] = _file_hash(fd, info.st_size)
+            # A previously deployed helper may predate this ticket schema. Bind
+            # the bytes carrying the production contract to the very same hash.
+            result['sha256'] = (hashlib.sha256(_read_production_helper(fd, info)).hexdigest()
+                                if executable else _file_hash(fd, info.st_size))
         return result
     finally:
         os.close(fd)
@@ -220,13 +225,18 @@ def _private_json(path, owner, *, limit=1024 * 1024):
     return value, identity
 
 
+def _valid_ctime_ns(value):
+    return type(value) is int and 0 < value < 2 ** 63
+
+
 def desired_ownership(entry):
     """Whitelist-derived uid/gid; no caller-specified destination identities."""
     _need(type(entry) is OwnershipEntry and type(entry.path) is str and type(entry.kind) is str)
     _need(all(type(getattr(entry, key)) is int and 0 <= getattr(entry, key) < 2 ** 63
               for key in ('device', 'inode', 'size', 'mode', 'observed_uid', 'observed_gid')))
     _need(entry.device > 0 and entry.inode > 0 and entry.mode <= 0o7777 and entry.size <= MAX_TREE_BYTES
-          and entry.observed_uid <= 0xffffffff and entry.observed_gid <= 0xffffffff)
+          and entry.observed_uid <= 0xffffffff and entry.observed_gid <= 0xffffffff
+          and _valid_ctime_ns(entry.ctime_ns))
     _need((type(entry.sha256) is str and HEX64.fullmatch(entry.sha256)) if entry.kind == 'file' else entry.sha256 == '')
     _need(type(entry.link_target) is str and (entry.kind == 'symlink' or entry.link_target == ''))
     parts = PurePosixPath(entry.path).parts
@@ -302,6 +312,10 @@ def collect_entries(data_root):
         result = []
         total = 0
 
+        def observation(info):
+            return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_size,
+                    info.st_uid, info.st_gid, info.st_ctime_ns, info.st_mtime_ns)
+
         def visit(parent_fd, name, relative):
             nonlocal total
             _need(len(result) < MAX_ENTRIES)
@@ -315,8 +329,9 @@ def collect_entries(data_root):
                 fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
                 try:
                     actual = os.fstat(fd)
-                    _need((actual.st_dev, actual.st_ino) == (info.st_dev, info.st_ino))
+                    _need(observation(actual) == observation(info))
                     digest = _file_hash(fd, info.st_size)
+                    _need(observation(os.fstat(fd)) == observation(info))
                 finally:
                     os.close(fd)
                 total += info.st_size
@@ -324,17 +339,19 @@ def collect_entries(data_root):
             elif kind == 'symlink':
                 target = os.readlink(name, dir_fd=parent_fd)
             entry = OwnershipEntry(relative, kind, info.st_dev, info.st_ino, info.st_size, mode,
-                                   info.st_uid, info.st_gid, digest, target)
+                                   info.st_uid, info.st_gid, info.st_ctime_ns, digest, target)
             desired_ownership(entry)
             result.append(entry)
             if kind == 'directory':
                 fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
                 try:
-                    _need(os.fstat(fd).st_ino == info.st_ino)
+                    _need(observation(os.fstat(fd)) == observation(info))
                     for child in sorted(os.listdir(fd)):
                         visit(fd, child, relative + '/' + child)
+                    _need(observation(os.fstat(fd)) == observation(info))
                 finally:
                     os.close(fd)
+            _need(observation(os.stat(name, dir_fd=parent_fd, follow_symlinks=False)) == observation(info))
 
         try:
             roots = [BASE, 'Library/LaunchAgents/org.goldvmmanager.first-login.plist']
@@ -466,7 +483,7 @@ def prepare_ticket(*, state_dir, tart_home, job_id, name, operation_id, apply_mo
             'root_helper': _identity(helper, caller, digest=True, executable=True),
         }
         _need(metadata['root_helper']['sha256'] == helper_sha256)
-        value = {'schema': 1, 'operation_id': operation_id, 'job_id': job_id, 'name': name,
+        value = {'schema': TICKET_SCHEMA, 'operation_id': operation_id, 'job_id': job_id, 'name': name,
                  'state_dir': str(state), 'tart_home': str(tart), 'caller_pid': os.getpid(),
                  'image': image_id, 'metadata': metadata, 'data_uuid': data_uuid.upper(),
                  'group_uuid': group_uuid.upper(), 'apply_mount': str(apply_mount),
@@ -490,8 +507,9 @@ def prepare_ticket(*, state_dir, tart_home, job_id, name, operation_id, apply_mo
         _need(False)
 
 
-PRODUCTION_CONTRACT = 'GOLD_OWNERSHIP_PRODUCTION_ROOT_ONLY_V1'
-FIXTURE_CONTRACT = 'GOLD_OWNERSHIP_FIXTURE_SIMULATION_ONLY_V1'
+PRODUCTION_CONTRACT = 'GOLD_OWNERSHIP_PRODUCTION_ROOT_ONLY_V2'
+_FIXTURE_CONTRACT_PREFIX = 'GOLD_OWNERSHIP_FIXTURE_SIMULATION_ONLY_'
+FIXTURE_CONTRACT = _FIXTURE_CONTRACT_PREFIX + 'V2'
 
 
 def _private_directory(path, owner, *, create=False):
@@ -503,6 +521,21 @@ def _private_directory(path, owner, *, create=False):
     info = path.stat()
     _need(stat.S_ISDIR(info.st_mode) and info.st_uid == owner and stat.S_IMODE(info.st_mode) == 0o700)
     return path
+
+
+def _read_production_helper(fd, before):
+    _need(0 < before.st_size <= 64 * 1024 * 1024)
+    data = bytearray()
+    while len(data) <= before.st_size:
+        block = os.read(fd, min(1024 * 1024, before.st_size - len(data) + 1))
+        if not block:
+            break
+        data.extend(block)
+    after = os.fstat(fd)
+    _need(len(data) == before.st_size and (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+          == (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns))
+    _need(PRODUCTION_CONTRACT.encode() in data and _FIXTURE_CONTRACT_PREFIX.encode() not in data)
+    return data
 
 
 def deploy_helper(state_dir, binary_path):
@@ -526,20 +559,10 @@ def deploy_helper(state_dir, binary_path):
         try:
             before = os.fstat(fd)
             _need(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and before.st_uid in (0, owner)
-                  and stat.S_IMODE(before.st_mode) & 0o7022 == 0 and before.st_mode & 0o100
-                  and 0 < before.st_size <= 64 * 1024 * 1024)
-            data = bytearray()
-            while len(data) <= before.st_size:
-                block = os.read(fd, min(1024 * 1024, before.st_size - len(data) + 1))
-                if not block:
-                    break
-                data.extend(block)
-            after = os.fstat(fd)
-            _need(len(data) == before.st_size and (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
-                  == (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns))
+                  and stat.S_IMODE(before.st_mode) & 0o7022 == 0 and before.st_mode & 0o100)
+            data = _read_production_helper(fd, before)
         finally:
             os.close(fd)
-        _need(PRODUCTION_CONTRACT.encode() in data and FIXTURE_CONTRACT.encode() not in data)
         digest = hashlib.sha256(data).hexdigest()
         attributes = quarantine_policy._run([str(source)]).decode('utf-8', errors='strict').splitlines()
         quarantined = quarantine_policy.NAME in attributes
@@ -584,12 +607,20 @@ def deploy_helper(state_dir, binary_path):
         _need(False)
 
 
+def _ticket_document(ticket):
+    value, identity = _private_json(ticket.path, ticket.caller_uid, limit=MAX_TICKET_BYTES)
+    _need(identity['sha256'] == ticket.digest and type(value.get('schema')) is int and value['schema'] == TICKET_SCHEMA)
+    entries = value.get('entries')
+    _need(type(entries) is list and 9 <= len(entries) <= MAX_ENTRIES
+          and all(type(entry) is dict and _valid_ctime_ns(entry.get('ctime_ns')) for entry in entries))
+    return value
+
+
 def verify_receipt(ticket, operation):
     """Validate root helper's exact private receipt; fixture receipts never pass."""
     try:
         _need(type(ticket) is OwnershipTicket and operation in ('apply', 'verify'))
-        value, identity = _private_json(ticket.path, ticket.caller_uid, limit=MAX_TICKET_BYTES)
-        _need(identity['sha256'] == ticket.digest)
+        value = _ticket_document(ticket)
         path = ticket.path.parent / (operation + '.receipt.json')
         receipt, _ = _private_json(path, ticket.caller_uid)
         expected_keys = {'schema', 'operation_id', 'ticket_sha256', 'operation', 'attachment_generation',
@@ -635,8 +666,8 @@ def request_authorization(ticket, operation, *, acknowledge_authorization=False,
     if acknowledge_authorization is not True:
         return AuthorizationResult('awaiting_system_authorization', operation, False)
     try:
-        value, identity = _private_json(ticket.path, ticket.caller_uid, limit=MAX_TICKET_BYTES)
-        _need(identity['sha256'] == ticket.digest and os.getuid() == ticket.caller_uid)
+        value = _ticket_document(ticket)
+        _need(os.getuid() == ticket.caller_uid)
         expected_paths = operation_paths(value['tart_home'], value['job_id'], value['operation_id'], state_dir=value['state_dir'])
         helper_hash = value['metadata']['root_helper']['sha256']
         _need(type(helper_hash) is str and HEX64.fullmatch(helper_hash)

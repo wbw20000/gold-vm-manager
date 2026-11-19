@@ -206,8 +206,10 @@ class PythonOwnershipTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(ticket.path.stat().st_mode), 0o600)
         self.assertEqual(ticket.path.stat().st_nlink, 1)
         self.assertEqual(ticket.digest, hashlib.sha256(ticket.path.read_bytes()).hexdigest())
-        for entry in f.entries:
-            self.assertNotIn('target_uid', value['entries'][0])
+        self.assertEqual(value['schema'], 2)
+        for entry, encoded in zip(f.entries, value['entries']):
+            self.assertNotIn('target_uid', encoded)
+            self.assertEqual(encoded['ctime_ns'], (f.mount / entry.path).lstat().st_ctime_ns)
             self.assertIn(ownership.desired_ownership(entry), ((0, 0), (501, 20)))
 
     def test_prepare_preserves_config_posix_lock_and_offset(self):
@@ -464,7 +466,34 @@ class SwiftOwnershipFixtureTests(unittest.TestCase):
             result = subprocess.run(common + flags + ['-o', str(binary)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
             if result.returncode:
                 raise AssertionError('Swift compile failed:\n' + result.stderr.decode(errors='replace'))
-        # Only fixture_binary is executed. The production root gate is never invoked.
+        # Standalone no-I/O test main. It invokes the same compiled pure rules as
+        # production, not the helper CLI and never a pretend-root mutation path.
+        driver = cls.build / 'Predicates.swift'
+        driver.write_text('''
+import Darwin
+@main struct Predicates {
+    static func main() {
+        typealias G = GuestOwnership
+        let a = CommandLine.arguments
+        func owner(_ i: Int) -> G.Owner { G.Owner(uid: UInt32(a[i])!, gid: UInt32(a[i+1])!) }
+        func stamp(_ i: Int) -> G.RawStamp { G.RawStamp(owner: owner(i), ctime_ns: Int64(a[i+2])!) }
+        let ok: Bool
+        switch a[1] {
+        case "apply": ok = G.applyObservationMatches(stamp(2), observed: owner(5), ctime_ns: Int64(a[7])!, caller: owner(8))
+        case "raw": ok = G.rawStampMatches(stamp(2), prevalidated: stamp(5))
+        case "final": ok = G.finalOwnerMatches(owner(2), desired: owner(4))
+        default: exit(2)
+        }
+        exit(ok ? 0 : 1)
+    }
+}
+''')
+        cls.predicates = cls.build / 'predicates'
+        result = subprocess.run(common + ['-D', 'GOLD_OWNERSHIP_FIXTURE', '-D', 'GOLD_OWNERSHIP_PREDICATE_TEST',
+                                str(driver), '-o', str(cls.predicates)], capture_output=True, timeout=180)
+        if result.returncode:
+            raise AssertionError('Swift predicate compile failed:\n' + result.stderr.decode(errors='replace'))
+        # Only fixture_binary and this pure driver are executed, never production.
 
     def setUp(self):
         self.root = new_root()
@@ -492,18 +521,83 @@ class SwiftOwnershipFixtureTests(unittest.TestCase):
         change(value)
         write(path, value)
 
+    def predicate(self, mode, fields, accepted):
+        result = subprocess.run([str(self.predicates), mode, *map(str, fields)], capture_output=True, timeout=5)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0 if accepted else 1, b'', b''))
+
+    def test_compiled_apply_comparison_is_not_a_wildcard(self):
+        ts, unknown, interactive = 1795100000000000987, (99, 99), (501, 20)
+        # (raw root view, ticket ordinary view, verified lock-holder principal).
+        for raw, observed, caller, accepted in (
+            (unknown, interactive, interactive, True),       # actual root-probe sample
+            (unknown, (504, 42), (504, 42), True),          # not derived from guest target
+            ((0, 0), (0, 0), interactive, True),            # exact path remains first
+            (unknown, unknown, interactive, True),
+            ((99, 42), (99, 42), interactive, True),
+            ((501, 99), interactive, interactive, False),    # neither partial match is enough
+            ((99, 20), interactive, interactive, False),
+            ((502, 21), interactive, interactive, False),    # wrong known pair
+            (unknown, interactive, (504, 20), False),        # unverified UID/GID/guest target
+            (unknown, interactive, (501, 80), False),
+            (unknown, (0, 0), interactive, False),
+            (unknown, (99, 20), (99, 20), False),
+            (unknown, (501, 99), (501, 99), False),
+            (unknown, (501, 0), (501, 0), False),
+            (unknown, (501, 2**32-1), (501, 2**32-1), False),
+            (unknown, (2**32-1, 20), (2**32-1, 20), False),
+        ):
+            with self.subTest(raw=raw, observed=observed, caller=caller):
+                self.predicate('apply', (*raw, ts, *observed, ts, *caller), accepted)
+        for raw in (unknown, interactive):  # projected AND exact require the ticket ctime
+            self.predicate('apply', (*raw, ts, *interactive, ts+1, *interactive), False)
+
+    def test_compiled_second_pass_requires_unchanged_raw_stamp(self):
+        original = (99, 99, 1795100000000000987)
+        self.predicate('raw', original + original, True)
+        for current in ((501, 20, original[2]), (99, 20, original[2]),
+                        (501, 99, original[2]), (99, 99, original[2]+1)):
+            # A projected->exact change could pass both ticket comparisons but
+            # must NOT pass the second, raw-to-raw pre-mutation comparison.
+            self.predicate('raw', current + original, False)
+
+    def test_compiled_post_chown_and_readonly_compare_are_exact(self):
+        for desired in ((0, 0), (501, 20)):
+            self.predicate('final', desired + desired, True)
+            for raw in ((99, 99), (99, desired[1]), (desired[0], 99), (502, 20)):
+                self.predicate('final', raw + desired, False)
+
+    def test_build_contracts_and_no_mutation_calls_in_fixture(self):
+        prod, fixture = self.production_binary.read_bytes(), self.fixture_binary.read_bytes()
+        self.assertTrue(ownership.PRODUCTION_CONTRACT.encode() in prod)
+        self.assertFalse(ownership.FIXTURE_CONTRACT.encode() in prod)
+        self.assertTrue(ownership.FIXTURE_CONTRACT.encode() in fixture)
+        self.assertFalse(ownership.PRODUCTION_CONTRACT.encode() in fixture)
+        # Mach-O external symbol names; unlike an owner-only before/after test,
+        # this also rules out a successful same-IDs chown in the fixture helper.
+        self.assertTrue(b'_fchown' in prod)
+        for call in (b'_chown', b'_lchown', b'_fchown', b'_fchownat'):
+            self.assertFalse(call in fixture)
+
     def test_apply_and_fresh_verify_only_simulate_metadata(self):
         f = self.fixture
-        def observed_owners():
-            return [(s.st_uid, s.st_gid) for s in ((f.mount / e.path).lstat() for e in f.entries)]
-        owners = observed_owners()
+        def raw_stamps():
+            return [(s.st_uid, s.st_gid, s.st_ctime_ns) for s in ((f.mount / e.path).lstat() for e in f.entries)]
+        original = raw_stamps()
         self.run_helper()
         apply = json.loads((f.paths['directory'] / 'apply.receipt.json').read_bytes())
         self.assertTrue(apply['fixture_only'])
         self.assertFalse(apply['metadata_applied'])
         self.assertFalse(apply['persistent_ownership_verified'])
-        self.assertEqual(owners, observed_owners())
+        self.assertEqual(original, raw_stamps())
+        self.assertEqual(set(apply), set(receipt(f, 'apply')))  # no entry/owner/path diagnostics
         f.simulate_remount()
+        # A real apply changes ctime. Change only metadata in this owned dummy
+        # file to prove the fresh verification does not require pre-apply ctime.
+        entry = next(e for e in f.entries if e.kind == 'file')
+        path = f.paths['verify_mount'] / entry.path
+        st = path.lstat()
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns - 1), follow_symlinks=False)
+        self.assertNotEqual(path.lstat().st_ctime_ns, entry.ctime_ns)
         self.run_helper('verify')
         result = json.loads((f.paths['directory'] / 'verify.receipt.json').read_bytes())
         self.assertFalse(result['persistent_ownership_verified'])
@@ -528,6 +622,35 @@ class SwiftOwnershipFixtureTests(unittest.TestCase):
         write(path, value)
         self.run_helper(expected=28)
         self.assertFalse((self.fixture.paths['directory'] / 'apply.started').exists())
+
+    def test_stale_ctime_on_each_entry_kind_fails_before_marker(self):
+        path = self.fixture.ticket.path
+        original = path.read_bytes()
+        for kind in ('file', 'symlink', 'directory'):
+            with self.subTest(kind=kind):
+                ticket = json.loads(original)
+                entry = next(e for e in ticket['entries'] if e['kind'] == kind)
+                entry['ctime_ns'] -= 1   # one nanosecond, with identical owner/identity/content
+                write(path, ticket)
+                self.run_helper(expected=28)
+                self.assertFalse((path.parent / 'apply.started').exists())
+                self.assertFalse((path.parent / 'apply.receipt.json').exists())
+
+    def test_schema2_requires_positive_int64_ctime_on_every_entry(self):
+        path = self.fixture.ticket.path
+        original = path.read_bytes()
+        for schema, ctime in ((1, None), (1, 'keep'), (2, None), (2, False), (2, -1),
+                              (2, 0), (2, 2**63), (2, 'not-an-integer')):
+            with self.subTest(schema=schema, ctime=ctime):
+                ticket = json.loads(original)
+                ticket['schema'] = schema
+                if ctime is None:
+                    del ticket['entries'][-1]['ctime_ns']
+                elif ctime != 'keep':
+                    ticket['entries'][-1]['ctime_ns'] = ctime
+                write(path, ticket)
+                self.run_helper(expected=21)
+                self.assertFalse((path.parent / 'apply.started').exists())
 
     def test_extended_acl_on_private_target_is_refused_not_removed(self):
         seed = self.fixture.mount / ownership.BASE / 'FirstLogin' / 'seed.json'
@@ -646,7 +769,7 @@ class SwiftOwnershipFixtureTests(unittest.TestCase):
         link_path.symlink_to('Cycle')
         st = link_path.lstat()
         entry = ownership.OwnershipEntry('Applications/' + ownership.APP_NAMES[0] + '/Cycle', 'symlink',
-                st.st_dev, st.st_ino, st.st_size, stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid, '', 'Cycle')
+                st.st_dev, st.st_ino, st.st_size, stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid, st.st_ctime_ns, '', 'Cycle')
         entries = f.entries + (entry,)
         for app in f.apps['applications']:
             app['bundle_tree_sha256'], app['bundle_bytes'] = ownership._app_tree(entries, app['name'])

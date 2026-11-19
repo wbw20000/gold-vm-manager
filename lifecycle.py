@@ -59,6 +59,31 @@ def waiting_for_vpn(job):
     return bool(job and job.get('mode') == PREINSTALL_MODE and job.get('phase') == 'awaiting_vpn_configuration')
 
 
+AUTHORIZATION_RETRY_KEYS = frozenset(('operation', 'reason', 'attempt', 'max_attempts', 'expires_at'))
+_RETRY_REASON = re.compile(r'system-authorization-[a-z0-9]+(?:-[a-z0-9]+)*\Z')
+
+
+def public_authorization_retry(value):
+    """Return a copy of a paused-authorization record, or None if malformed.
+
+    Written by offline_vpn while a refused macOS prompt waits for the user's
+    explicit retry/abandon; holds only fixed tokens, small integers and a time.
+    """
+    if not (type(value) is dict and set(value) == AUTHORIZATION_RETRY_KEYS
+            and value['operation'] in ('apply', 'verify')
+            and type(value['reason']) is str and len(value['reason']) <= 100 and _RETRY_REASON.match(value['reason'])
+            and type(value['attempt']) is int and type(value['max_attempts']) is int
+            and 1 <= value['attempt'] < value['max_attempts'] <= 10
+            and type(value['expires_at']) is str and len(value['expires_at']) <= 40):
+        return None
+    try:
+        if datetime.fromisoformat(value['expires_at']).tzinfo is None:
+            return None
+    except ValueError:
+        return None
+    return dict(value)
+
+
 def offline_status_fields():
     """Restoration is not application preinstallation or delivery acceptance."""
     return {'system_restored': False, 'applications_preinstalled': False,

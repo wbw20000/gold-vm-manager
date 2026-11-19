@@ -5,7 +5,7 @@ paths, impersonates root, or treats noowners as persistent ownership evidence.
 Native authorization and all disk operations must be explicitly caller-approved.
 """
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
@@ -13,6 +13,7 @@ from pathlib import Path, PurePosixPath
 import re
 import stat
 import struct
+import time
 import uuid
 
 import error_codes
@@ -20,6 +21,7 @@ import guest_app_artifacts as artifacts
 from guest_app_pins import reviewed_manifests
 import guest_ownership as ownership
 import guest_vpn_seed as seed_builder
+import lifecycle
 import managed_registry as registry
 from offline_disk import StageTarget, DiskSession, signature, private_regular
 from offline_writable import WritableDiskSession
@@ -33,6 +35,19 @@ _PARENTS = ('Library', 'Library/Application Support', 'Library/LaunchAgents')
 _COMPLETE = '.offline-vpn.complete.json'
 _HEX32 = re.compile(r'[0-9a-f]{32}\Z')
 _HEX64 = re.compile(r'[0-9a-f]{64}\Z')
+# A cancelled, denied or non-interactive macOS prompt never ran the root
+# helper: the shell behind it did not start. Only then may the user re-request
+# the prompt, explicitly, in the same still-mounted session. Anything else
+# (timeout, helper exit, unknown, local preflight) stays a retained failure.
+RETRYABLE_AUTHORIZATION = frozenset(('user-cancelled', 'authorization-denied', 'interaction-not-allowed'))
+AUTHORIZATION_ATTEMPTS = 3
+AUTHORIZATION_DECISION_SECONDS = 15 * 60
+AUTHORIZATION_POLL_SECONDS = 1
+DECISION_NAME = 'authorization-decision.json'
+_DECISION_KEYS = frozenset(('operation_id', 'operation', 'attempt', 'decision'))
+_DECISIONS = ('retry', 'abandon')
+_sleep = time.sleep
+_monotonic = time.monotonic
 
 
 class OfflineVPNError(ValueError):
@@ -191,7 +206,7 @@ def load_completed_stage(state_dir, tart_home, job_id, name):
 
 
 def _state(target, operation_id, operation_phase, *, failed=False, complete=False, authorization=False,
-           created_parent_paths=(), failed_step=None, failure_code=None):
+           created_parent_paths=(), failed_step=None, failure_code=None, retry=None):
     current = _safe_record(target.state_dir / 'build-current.json')
     _need(current.get('id') == target.job_id and current.get('mode') == 'preinstall'
           and current.get('name') == target.name and current.get('source_vm') is None
@@ -202,6 +217,12 @@ def _state(target, operation_id, operation_phase, *, failed=False, complete=Fals
     _need(prior is None or type(prior) is dict and prior.get('operation_id') == operation_id,
           'another-vpn-operation-present')
     current = dict(current)
+    current.pop('authorization_retry', None)
+    if retry is not None:
+        # Public, fixed-token record of a paused, refused prompt; see _await_decision.
+        _need(authorization and not (failed or complete) and lifecycle.public_authorization_retry(retry) == retry,
+              'invalid-authorization-retry-state')
+        current['authorization_retry'] = dict(retry)
     current.update({'host_credentials_copied': False, 'credentials_copied': False, 'vpn_connected': False,
                     'vpn_configuration_staged': complete,
                     'phase': 'failed' if failed else 'awaiting_first_desktop_acceptance' if complete else
@@ -219,6 +240,8 @@ def _state(target, operation_id, operation_phase, *, failed=False, complete=Fals
     elif complete:
         current.pop('recovery_required', None)
         current['message'] = '原始完整应用与私有首次登录配置已独立只读核验，持久属主经系统管理员授权核验。尚未发布或启动，VPN 未连接，需真人首次登录与授权。'
+    elif retry is not None:
+        current['message'] = '管理员授权未完成，root 助手没有运行；磁盘保持当前挂载，等待你选择重新请求授权或放弃。不会自动再弹窗。'
     elif authorization:
         current['message'] = '等待你在 macOS 标准管理员对话框中确认客机文件属主操作；拒绝后会保留失败暂存盘，不绕过权限。'
     else:
@@ -401,6 +424,105 @@ def _authorization_code(result):
     return code
 
 
+def _retryable(result, ticket, operation, attempt):
+    """True only if this refusal provably never ran the root helper.
+
+    The helper writes its root-owned one-shot `<operation>.started` marker
+    before any change and refuses a ticket that already has one, so a marker
+    or receipt here means it may have run: never prompt again for it.
+    """
+    return (type(result) is ownership.AuthorizationResult and result.authorized_helper_completed is False
+            and result.operation == operation and result.failure_reason in RETRYABLE_AUTHORIZATION
+            and type(attempt) is int and attempt < AUTHORIZATION_ATTEMPTS
+            and not any(os.path.lexists(str(ticket.path.parent / (operation + suffix)))
+                        for suffix in ('.started', '.receipt.json')))
+
+
+def _discard_decision(path):
+    if os.path.lexists(str(path)):
+        private_regular(path)
+        os.unlink(str(path))
+        registry.sync_directory(path.parent)
+
+
+def _await_decision(target, operation_id, evidence, operation, attempt, phase, created_parents, reason):
+    """Publish the paused state, then wait for the user's explicit choice.
+
+    The mounted session and both lifecycle locks stay held, exactly as while
+    the macOS prompt itself is showing. Returns 'retry', 'abandon' or 'expired'.
+    """
+    path = evidence / DECISION_NAME
+    _discard_decision(path)  # Never honour a choice written before this wait.
+    deadline = _monotonic() + AUTHORIZATION_DECISION_SECONDS
+    expires = (datetime.now(timezone.utc) + timedelta(seconds=AUTHORIZATION_DECISION_SECONDS)).isoformat()
+    _state(target, operation_id, phase, authorization=True, created_parent_paths=created_parents,
+           retry={'operation': operation, 'reason': reason, 'attempt': attempt,
+                  'max_attempts': AUTHORIZATION_ATTEMPTS, 'expires_at': expires})
+    while True:
+        if os.path.lexists(str(path)):
+            value = _safe_record(path)
+            _discard_decision(path)
+            if (set(value) == _DECISION_KEYS and value['operation_id'] == operation_id
+                    and value['operation'] == operation and type(value['attempt']) is int
+                    and value['attempt'] == attempt and value['decision'] in _DECISIONS):
+                return value['decision']
+        if _monotonic() >= deadline:
+            return 'expired'
+        _sleep(AUTHORIZATION_POLL_SECONDS)
+
+
+def _authorize(target, operation_id, evidence, ticket, operation, phase, created_parents, recheck):
+    """Request authorization; after a refusal that never ran the root helper,
+    pause for an explicit user retry. Never re-prompts on its own."""
+    attempt = 1
+    while True:
+        result = ownership.request_authorization(ticket, operation, acknowledge_authorization=True)
+        if not _retryable(result, ticket, operation, attempt):
+            return result
+        decision = _await_decision(target, operation_id, evidence, operation, attempt, phase,
+                                   created_parents, _authorization_code(result))
+        if decision != 'retry':
+            return result  # Abandoned or unanswered: the original refusal stands.
+        recheck()
+        attempt += 1
+        _state(target, operation_id, phase, authorization=True, created_parent_paths=created_parents)
+
+
+def submit_authorization_decision(state_dir, job_id, attempt, decision):
+    """Record the user's explicit choice for the current paused prompt.
+
+    The worker polls for the file, so it must appear complete: write a private
+    temporary file, then rename it into place. One choice per wait: an existing
+    choice is never replaced (the manager serialises callers under its lock).
+    Returns only fixed tokens. Callers check that the worker is alive.
+    """
+    _need(type(job_id) is str and _HEX32.fullmatch(job_id) and type(attempt) is int
+          and type(decision) is str and decision in _DECISIONS, 'invalid-authorization-decision')
+    state = Path(state_dir)
+    current = _safe_record(state / 'build-current.json')
+    vpn = current.get('vpn_configuration')
+    retry = lifecycle.public_authorization_retry(current.get('authorization_retry'))
+    _need(current.get('id') == job_id and current.get('mode') == 'preinstall'
+          and current.get('phase') == 'awaiting_system_authorization'
+          and type(vpn) is dict and vpn.get('active') is True
+          and type(vpn.get('operation_id')) is str and _HEX32.fullmatch(vpn['operation_id'])
+          and retry is not None and retry['attempt'] == attempt, 'no-authorization-retry-pending')
+    evidence = state / 'build-jobs' / job_id / ('offline-vpn-' + vpn['operation_id'])
+    final = evidence / DECISION_NAME
+    _need(not os.path.lexists(str(final)), 'authorization-decision-already-recorded')
+    temporary = evidence / ('.' + DECISION_NAME + '.' + uuid.uuid4().hex + '.tmp')
+    _new_private(temporary, {'operation_id': vpn['operation_id'], 'operation': retry['operation'],
+                             'attempt': attempt, 'decision': decision})
+    try:
+        _need(not os.path.lexists(str(final)), 'authorization-decision-already-recorded')
+        os.rename(str(temporary), str(final))
+    finally:
+        if os.path.lexists(str(temporary)):
+            os.unlink(str(temporary))
+    registry.sync_directory(evidence)
+    return {'operation': retry['operation'], 'attempt': attempt, 'decision': decision}
+
+
 def _ownership_receipt(ticket, operation, result, generation, count):
     _need(type(result) is ownership.AuthorizationResult and result.authorized_helper_completed is True,
           _authorization_code(result))
@@ -534,7 +656,11 @@ def configure_preinstalled_stage(*, state_dir, tart_home, job_id, name, private_
                     data_uuid=baseline.data_uuid, group_uuid=baseline.volume_group_uuid,
                     entries=entries, helper_sha256=helper_sha256, config_lock_fd=config_lock_fd)
                 phase = 'authorized-ownership-apply'
-                result = ownership.request_authorization(ticket, 'apply', acknowledge_authorization=True)
+                def recheck_apply():
+                    writable.check_mounted_writable()
+                    identities()
+                result = _authorize(target, operation_id, evidence, ticket, 'apply', 'awaiting_owner_apply',
+                                    created_parents, recheck_apply)
                 apply_receipt = _ownership_receipt(ticket, 'apply', result, apply_generation, len(entries))
                 writable.check_mounted_writable()
                 identities()
@@ -566,7 +692,11 @@ def configure_preinstalled_stage(*, state_dir, tart_home, job_id, name, private_
                 _need(owner_session.mountpoint == paths['verify_mount'], 'wrong-ownership-verify-mount')
                 # Do NOT read UID501's private files as the host account here.
                 # Root's independent owners-on verifier must inspect actual uid/gid.
-                result = ownership.request_authorization(ticket, 'verify', acknowledge_authorization=True)
+                def recheck_verify():
+                    owner_session.check_mounted_readonly()
+                    identities()
+                result = _authorize(target, operation_id, evidence, ticket, 'verify', 'awaiting_owner_verify',
+                                    created_parents, recheck_verify)
                 verify_receipt = _ownership_receipt(ticket, 'verify', result, verify_generation, len(entries))
                 _need(verify_receipt['attachment_generation'] != apply_receipt['attachment_generation'],
                       'independent-owner-attachment-required')

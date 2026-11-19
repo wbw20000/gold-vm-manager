@@ -21,6 +21,7 @@
   let confirmContext = null;
   let dialogBusy = false;
   let confirmBusy = false;
+  let authorizationBusy = false;
   let lastActionError = '';
   let nativePickerBusy = false;
   let deleteContext = null;
@@ -638,6 +639,10 @@
       if (context.type === 'action') {
         const done = await runAction(context.id, context.action, context.typed ? $('confirm-name').value : undefined, context.backend === true);
         if (!done) { showError('confirm-error', lastActionError || '操作未完成，请刷新状态后核对；不要重复执行危险操作。'); return; }
+      } else if (context.type === 'abandon-authorization') {
+        await api('/api/preinstall/authorization', { method: 'POST', body: { job_id: context.jobId, attempt: context.attempt, decision: 'abandon' } });
+        toast('已放弃本次授权；任务将按失败处理，暂存盘保留。');
+        await refresh(true);
       } else if (context.type === 'archive-job') {
         await api('/api/preinstall/archive', { method: 'POST', body: { job_id: context.jobId, confirm_name: $('confirm-name').value } });
         toast('已归档失败任务；暂存盘仍保留，可以用新名称重新预装。');
@@ -757,6 +762,44 @@
     return preinstallUI?.openResume(id);
   }
 
+  // A refused macOS prompt that never ran the root helper pauses the job with
+  // the disk still mounted; only the user's explicit choice continues it.
+  function pausedAuthorization(job) {
+    const retry = job && job.mode === 'preinstall' && job.phase === 'awaiting_system_authorization' ? job.authorization_retry : null;
+    if (!retry || typeof retry !== 'object' || !['apply', 'verify'].includes(retry.operation) || typeof retry.reason !== 'string'
+      || !Number.isInteger(retry.attempt) || !Number.isInteger(retry.max_attempts) || typeof job.id !== 'string') return null;
+    return retry;
+  }
+
+  async function decideAuthorization(job, decision) {
+    // Abandon goes only through the confirmation dialog (submitConfirm).
+    const retry = pausedAuthorization(job);
+    if (decision !== 'retry' || !retry || !connected || authorizationBusy) return;
+    authorizationBusy = true;
+    try {
+      await api('/api/preinstall/authorization', { method: 'POST', body: { job_id: job.id, attempt: retry.attempt, decision: 'retry' } });
+      toast('已重新请求管理员授权，请留意 macOS 弹出的授权窗口。');
+    } catch (error) { toast(error.message, true); }
+    finally { authorizationBusy = false; }
+    await refresh(true);
+  }
+
+  function openAbandonAuthorization(job) {
+    const retry = pausedAuthorization(job);
+    if (!retry || !connected) return;
+    confirmContext = { type: 'abandon-authorization', id: job.name, jobId: job.id, attempt: retry.attempt, typed: false };
+    $('confirm-title').textContent = `放弃 ${job.name} 的管理员授权？`;
+    $('confirm-description').textContent = '任务会按失败处理：暂存盘和已写入的私有配置原样保留，之后不能续接，只能归档后用新名称重新预装。如果只是误点了取消，请关闭此窗口，改点「重新请求管理员授权」。';
+    $('confirm-input-group').hidden = true;
+    $('confirm-name').value = '';
+    $('confirm-name').required = false;
+    $('confirm-submit').textContent = '放弃并保留现场';
+    $('confirm-submit').className = 'button button-danger';
+    $('confirm-submit').disabled = false;
+    $('confirm-error').hidden = true;
+    $('confirm-dialog').showModal();
+  }
+
   function renderBuildJob() {
     const job = state?.build_job;
     const region = $('build-job');
@@ -791,6 +834,18 @@
       if (waitingVpnJob()) region.append(button('继续配置 VPN', 'text-button', () => openWaitingVpnConfiguration(job.id, job.name),
         !connected || preinstallBusy || !preinstallUI, 'continue-preinstall-vpn'));
     } else if (job.mode === 'preinstall' && !materialFailure) region.append(el('span', '', '发布或写入配置不代表 VPN 已连通。首次开机、系统与服务授权、账号登录及桌面实测仍需你亲自确认。'));
+    const paused = job.phase === 'awaiting_system_authorization' && job.authorization_retry ? pausedAuthorization(job) : null;
+    if (paused) {
+      const refusals = { 'system-authorization-user-cancelled': '管理员授权窗口被取消。',
+        'system-authorization-authorization-denied': '管理员授权未通过（用户名或密码不正确）。',
+        'system-authorization-interaction-not-allowed': '系统没能显示管理员授权窗口（当前不允许交互），请确认屏幕已解锁、管理器在前台。' };
+      const until = Date.parse(paused.expires_at);
+      const deadline = Number.isFinite(until) ? `；${new Date(until).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })} 前未选择将按失败处理并保留现场` : '；超时未选择将按失败处理并保留现场';
+      region.append(el('span', 'build-job-failure', `${paused.operation === 'verify' ? '复核属主' : '写入属主'}的管理员授权未完成：${refusals[paused.reason] || paused.reason}`));
+      region.append(el('span', '', `root 助手没有运行，磁盘保持原样等待你的选择，不会自动再弹窗。已请求第 ${paused.attempt} 次（最多 ${paused.max_attempts} 次）${deadline}。`));
+      region.append(button('重新请求管理员授权', 'text-button', () => decideAuthorization(job, 'retry'), !connected || authorizationBusy));
+      region.append(button('放弃（保留现场）', 'text-button', () => openAbandonAuthorization(job), !connected || authorizationBusy));
+    }
     if (job.mode === 'preinstall' && job.phase === 'failed' && !materialFailure) {
       // Fixed codes only; the backend never forwards native output, paths or node data.
       const steps = { preflight: '前置检查', 'readonly-app-baseline': '只读核对已装应用', 'writing-private-seed': '写入私有 VPN 首次登录配置',

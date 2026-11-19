@@ -897,6 +897,29 @@ def archive_failed(payload, *, state_dir=None, tart_home=None):
         os.close(fd)
 
 
+AUTHORIZATION_DECISION_KEYS = frozenset(('job_id', 'attempt', 'decision'))
+
+
+def authorization_decision(payload, *, state_dir=None):
+    """Pass the user's explicit retry/abandon choice to a paused, live worker.
+
+    Only a preinstall job whose worker is alive and paused on a refused macOS
+    prompt (phase awaiting_system_authorization, checked by lifecycle.status)
+    can receive it. Writes one private decision file; nothing else changes.
+    """
+    state = Path(state_dir) if state_dir is not None else registry.STATE_DIR
+    _need(type(payload) is dict and set(payload) == AUTHORIZATION_DECISION_KEYS
+          and type(payload['job_id']) is str and ID.fullmatch(payload['job_id'])
+          and type(payload['attempt']) is int and type(payload['decision']) is str
+          and payload['decision'] in ('retry', 'abandon'), 'invalid-authorization-decision')
+    job = lifecycle.status(state_dir=state)
+    _need(type(job) is dict and job.get('id') == payload['job_id'] and job.get('mode') == MODE
+          and job.get('phase') == 'awaiting_system_authorization', 'authorization-decision-not-pending')
+    from offline_vpn import submit_authorization_decision
+    result = submit_authorization_decision(state, payload['job_id'], payload['attempt'], payload['decision'])
+    return dict(result, ok=True, job_id=payload['job_id'])
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--worker', required=True)

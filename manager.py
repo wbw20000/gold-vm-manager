@@ -42,7 +42,7 @@ PREINSTALL_PHASE_FIELDS = frozenset(('id', 'mode', 'name', 'phase', 'pid', 'prog
     'guest_started', 'desktop_verified', 'host_credentials_copied', 'user_vpn_configuration_supplied',
     'vpn_configuration_staged', 'vpn_connected', 'network_independently_verified', 'published',
     'needs_host_security_authorization', 'recovery_required', 'failure_code', 'failed_phase',
-    'failed_step', 'failure_reason'))
+    'failed_step', 'failure_reason', 'authorization_retry'))
 HOME = Path.home()
 STATE_DIR = HOME / 'Library/Application Support/GoldVMManager'
 CONFIG_PATH = STATE_DIR / 'config.json'
@@ -254,6 +254,15 @@ class Controller:
                 raise AppError('未归档。只能归档已结束、未发布、未挂载且名称完全一致的失败预装任务；暂存盘未改动。',
                                'archive_rejected', 409) from None
 
+    def decide_preinstall_authorization(self, payload):
+        # No "busy" check: a preinstall worker is running by definition.
+        with self.lock:
+            try:
+                return oneclick.authorization_decision(payload, state_dir=STATE_DIR)
+            except (ValueError, OSError, subprocess.SubprocessError):
+                raise AppError('未提交。只能在授权暂停、等待你选择时提交一次；请刷新状态后再试。',
+                               'authorization_decision_rejected', 409) from None
+
     def pick_ipsw(self, payload):
         if payload != {}:
             raise AppError('镜像选择请求格式错误')
@@ -422,6 +431,9 @@ class Controller:
         build = self.build_status()
         if build and build.get('mode') == 'preinstall':
             build = {k: v for k, v in build.items() if k in PREINSTALL_PHASE_FIELDS}
+            retry = lifecycle.public_authorization_retry(build.pop('authorization_retry', None))
+            if retry is not None and build.get('phase') == 'awaiting_system_authorization':
+                build['authorization_retry'] = retry
         vms = []
         with self.lock:
             for child_vm, process in list(self.children.items()):
@@ -857,6 +869,8 @@ class Handler(BaseHTTPRequestHandler):
                 value = self.server.controller.resume_preinstall(payload)
             elif path == '/api/preinstall/archive':
                 value = self.server.controller.archive_preinstall(payload)
+            elif path == '/api/preinstall/authorization':
+                value = self.server.controller.decide_preinstall_authorization(payload)
             elif path == '/api/build':
                 value = self.server.controller.create_build(payload)
             elif path == '/api/pick-ipsw':

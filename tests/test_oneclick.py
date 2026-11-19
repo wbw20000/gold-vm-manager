@@ -879,6 +879,33 @@ class WorkerTests(Fixture):
         self.assertFalse(archived_path.exists())
         self.assertTrue((self.context.stage / 'disk.img').is_file())
 
+    def test_authorization_decision_needs_a_live_paused_job_and_an_exact_payload(self):
+        job_id = 'a' * 32
+        paused = {'id': job_id, 'mode': 'preinstall', 'name': NAME, 'phase': 'awaiting_system_authorization'}
+        patchers = (mock.patch.object(lifecycle, 'status', return_value=paused),
+                    mock.patch.object(offline_vpn, 'submit_authorization_decision', create=True,
+                                      return_value={'operation': 'apply', 'attempt': 1, 'decision': 'retry'}))
+        status, submit = (p.start() for p in patchers)
+        for p in patchers:
+            self.addCleanup(p.stop)
+        value = {'job_id': job_id, 'attempt': 1, 'decision': 'retry'}
+        self.assertEqual(oneclick.authorization_decision(value, state_dir=self.state),
+                         {'ok': True, 'job_id': job_id, 'operation': 'apply', 'attempt': 1, 'decision': 'retry'})
+        submit.assert_called_once_with(self.state, job_id, 1, 'retry')
+        status.assert_called_with(state_dir=self.state)
+        submit.reset_mock()
+        for bad in (None, [], {'job_id': job_id, 'attempt': 1}, dict(value, force=True), dict(value, attempt=True),
+                    dict(value, attempt='1'), dict(value, decision='continue'), dict(value, job_id='../' + job_id)):
+            with self.subTest(payload=bad), self.assertRaises(oneclick.OneClickError):
+                oneclick.authorization_decision(bad, state_dir=self.state)
+        for job in (None, dict(paused, phase='failed'), dict(paused, phase='interrupted'),
+                    dict(paused, phase='configuring_vpn'), dict(paused, id='b' * 32), dict(paused, mode='create')):
+            with self.subTest(job=job):
+                status.return_value = job
+                with self.assertRaises(oneclick.OneClickError):
+                    oneclick.authorization_decision(value, state_dir=self.state)
+        submit.assert_not_called()
+
     def test_archive_requires_the_lifecycle_lock(self):
         self.vpn.side_effect = self.vpn_retained_failure()
         self.execute()  # The fixture worker still holds build.lock.

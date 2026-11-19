@@ -59,7 +59,7 @@
 | `system-authorization-preflight-rejected` | 本地校验未通过，**从未弹窗** | 核对 helper 构建产物与票据 metadata 的摘要、权限和本地签名（`_identity`、`host_tools.verify_local_signature`）。 |
 | `system-authorization-launch-failed` | 无法启动 `/usr/bin/osascript` | 检查控制器进程的运行环境。 |
 | `system-authorization-interaction-not-allowed` | 系统不允许当前进程弹出交互窗口（-60007） | 在已登录的前台桌面会话里打开管理器。长期方案是由原生 App 发起授权，与下文 B2 一起做。 |
-| `system-authorization-user-cancelled` / `-authorization-denied` | 弹窗出现过，但被取消或密码错误 | 弹窗标题显示为「osascript」，容易被忽略。改由原生 App 发起。 |
+| `system-authorization-user-cancelled` / `-authorization-denied` | 弹窗出现过，但被取消或密码错误。现在任务会先暂停、等你选择重试（见下文「授权被拒后原地重试」）；只有放弃、超时或第 3 次仍被拒才会以这个代码失败 | 弹窗标题显示为「osascript」，容易被忽略。改由原生 App 发起。 |
 | `system-authorization-helper-exit-2` | 已授权，helper 以 root 运行后拒绝执行 | helper 对**所有**错误都 `exit(2)`（[GuestOwnershipHelper.swift:734](<GuestOwnershipHelper.swift:734>)），目前无法细分。下一步需要给 helper 加固定的失败类别。重点检查：[argv[0] 与票据路径比较](<GuestOwnershipHelper.swift:316>)、票据与属主检查、`config.json` 写锁必须仍由父进程持有。 |
 | `system-authorization-helper-exit-126` / `-127` | shell 无法执行 helper | 检查 helper 的路径、权限和所在卷。 |
 | `system-authorization-helper-exit-N`（N≥128） | helper 被信号终止 | — |
@@ -101,6 +101,23 @@
 
   有其他操作正在运行时返回 409 `busy`；其余情况统一返回 409 `archive_rejected`，提示文字是固定的，不回显内部原因。
 - **暂存盘不会被删除、续接或发布**，仍在 `~/.tart/.gold-manager-staging/<id>/`，会继续占用磁盘，需要人工核对后再处理。
+
+### 授权被拒后原地重试（追加）
+
+- **起因**：实测时取消了管理员弹窗，任务直接失败，只能归档后从头预装。
+- **做法**：取消、密码错误或系统不允许弹窗时，root 助手并没有运行。工作流不再直接失败，而是保持同一个已挂载的会话和两把锁，停下来等你选择（[`_authorize`](<offline_vpn.py>)）。
+  - 卡片显示原因和两个按钮：「重新请求管理员授权」「放弃（保留现场）」。放弃需要确认。
+  - 接口 `POST /api/preinstall/authorization`，请求体恰好是 `{job_id, attempt, decision}`。后端写一个私有、一次性的决定文件，由正在等待的进程读取后删除。
+  - 选择重试后，先重新核对挂载和所有暂存身份，再用同一张票据请求授权。
+  - 最多请求 3 次，每次最多等 15 分钟。放弃、超时或第 3 次仍被拒时，按原来的失败流程处理，失败代码保持原始原因。
+- **安全依据**：
+  - 只有票据目录里**没有** `<操作>.started` 和回执时才允许重试。helper 在任何改动前都会写这个一次性标记，并拒绝已有标记的票据，所以即使判断有误，helper 也会自己拒绝。
+  - 等待期间磁盘保持挂载，和现在等待授权弹窗时（最长 30 分钟）的状态一样。
+  - 任务阶段保持 `awaiting_system_authorization`，操作仍是 active，正好满足 helper 对任务状态的检查，所以**没有改 Swift**。
+- **不重试的情况**：超时（osascript 被强杀后 helper 可能仍在运行）、helper 退出码、原因未知、授权前的本地校验失败。
+- **已知限制**：
+  - 已经失败的任务仍然只能归档。
+  - 如果在等待期间关机或进程被杀，任务会变成「中断」，并且内层操作仍标为 active，归档会拒绝。这与以前在授权过程中崩溃的情况相同，需要人工核对。
 
 ## 验证
 

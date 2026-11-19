@@ -525,10 +525,11 @@ function jobRegion() {
 function renderFailedJob(job, extra = {}) {
   const region = jobRegion();
   const buttons = [];
-  const sandbox = Object.assign({ state: { build_job: job }, selectedVM: '', connected: true, $: () => region,
+  const sandbox = Object.assign({ state: { build_job: job }, selectedVM: '', connected: true, authorizationBusy: false, $: () => region,
     el: (tag, cls, text) => ({ tag, cls, text }),
     button: (text, cls, click, disabled) => { const item = { text, click, disabled }; buttons.push(item); return item; } }, extra);
-  vm.createContext(sandbox); vm.runInContext(declaration('renderBuildJob'), sandbox);
+  vm.createContext(sandbox);
+  for (const name of ['pausedAuthorization', 'renderBuildJob']) vm.runInContext(declaration(name), sandbox);
   sandbox.renderBuildJob();
   return { text: region.children.map(n => n.text).filter(Boolean).join('\n'), buttons: buttons.map(b => ({ text: b.text, disabled: b.disabled })) };
 }
@@ -603,4 +604,82 @@ test('archiving a failed job needs the exact VM name and sends only the job id a
   node('confirm-name').value = 'gold';
   assert.equal(sandbox.confirmSubmitDisabled(), true, 'other dangerous actions stay blocked while a job is locked');
   assert.match(appSource, /addEventListener\('input', \(\) => \{ if \(confirmContext\?\.typed\) \$\('confirm-submit'\)\.disabled = confirmSubmitDisabled\(\); \}\)/);
+});
+
+const PAUSED_RETRY = { operation: 'apply', reason: 'system-authorization-user-cancelled', attempt: 1, max_attempts: 3,
+  expires_at: '2026-11-18T23:30:00+00:00' };
+const pausedJob = (changes = {}) => Object.assign({ id: JOB_ID, mode: 'preinstall', name: 'backup1',
+  phase: 'awaiting_system_authorization', authorization_retry: PAUSED_RETRY, message: '等待你的选择' }, changes);
+const retryButtons = (view) => view.buttons.filter(b => ['重新请求管理员授权', '放弃（保留现场）'].includes(b.text));
+
+test('a refused administrator prompt pauses with an explicit retry or abandon choice', () => {
+  let view = renderFailedJob(pausedJob());
+  assert.match(view.text, /写入属主的管理员授权未完成：管理员授权窗口被取消/);
+  assert.match(view.text, /root 助手没有运行/);
+  assert.match(view.text, /第 1 次（最多 3 次）/);
+  assert.match(view.text, /按失败处理并保留现场/);
+  assert.equal(JSON.stringify(retryButtons(view)),
+    JSON.stringify([{ text: '重新请求管理员授权', disabled: false }, { text: '放弃（保留现场）', disabled: false }]));
+  view = renderFailedJob(pausedJob({ authorization_retry: Object.assign({}, PAUSED_RETRY,
+    { operation: 'verify', reason: 'system-authorization-authorization-denied', attempt: 2 }) }));
+  assert.match(view.text, /复核属主的管理员授权未完成：.*用户名或密码不正确/);
+  assert.match(view.text, /第 2 次（最多 3 次）/);
+  view = renderFailedJob(pausedJob({ authorization_retry: Object.assign({}, PAUSED_RETRY, { reason: 'system-authorization-unheard-of' }) }));
+  assert.match(view.text, /system-authorization-unheard-of/, 'an unmapped reason still shows its fixed code');
+  view = renderFailedJob(pausedJob(), { connected: false });
+  assert.deepEqual(retryButtons(view).map(b => b.disabled), [true, true]);
+  view = renderFailedJob(pausedJob(), { authorizationBusy: true });
+  assert.deepEqual(retryButtons(view).map(b => b.disabled), [true, true]);
+  for (const changes of [{ phase: 'interrupted' }, { phase: 'failed', recovery_required: true }, { authorization_retry: undefined },
+    { authorization_retry: Object.assign({}, PAUSED_RETRY, { attempt: '1' }) },
+    { authorization_retry: Object.assign({}, PAUSED_RETRY, { operation: 'chown' }) }, { mode: 'create' }]) {
+    assert.equal(retryButtons(renderFailedJob(pausedJob(changes))).length, 0, JSON.stringify(changes));
+  }
+});
+
+test('retry posts the exact decision once; abandon asks for confirmation before failing the job', async () => {
+  const nodes = new Map();
+  const node = (id) => {
+    if (!nodes.has(id)) nodes.set(id, { id, value: '', hidden: false, disabled: false, textContent: '', className: '', required: false,
+      open: false, showModal() { this.open = true; }, close() { this.open = false; }, focus() {}, querySelectorAll() { return []; } });
+    return nodes.get(id);
+  };
+  const calls = [];
+  let release;
+  const sandbox = { $: node, connected: true, confirmContext: null, confirmBusy: false, authorizationBusy: false, buildActive: () => true,
+    api: async (route, options) => { calls.push([route, options.method, options.body]); if (release) await new Promise((r) => { release = r; }); return { ok: true, decision: options.body.decision }; },
+    refresh: async () => { calls.push(['refresh']); }, toast: () => {}, showError: (id, message) => { throw new Error(message); } };
+  vm.createContext(sandbox);
+  for (const name of ['pausedAuthorization', 'decideAuthorization', 'openAbandonAuthorization', 'confirmSubmitDisabled', 'submitConfirm']) {
+    vm.runInContext(declaration(name), sandbox);
+  }
+  await sandbox.decideAuthorization(pausedJob(), 'retry');
+  assert.equal(JSON.stringify(calls), JSON.stringify([['/api/preinstall/authorization', 'POST',
+    { job_id: JOB_ID, attempt: 1, decision: 'retry' }], ['refresh']]));
+  assert.equal(sandbox.authorizationBusy, false);
+  calls.length = 0;
+  release = () => {};
+  const pending = sandbox.decideAuthorization(pausedJob(), 'retry');
+  await sandbox.decideAuthorization(pausedJob(), 'retry');
+  assert.equal(calls.length, 1, 'a second click while the first is in flight sends nothing');
+  release(); await pending; release = null;
+  calls.length = 0;
+  for (const job of [pausedJob({ phase: 'failed' }), pausedJob({ authorization_retry: undefined })]) {
+    await sandbox.decideAuthorization(job, 'retry');
+    sandbox.openAbandonAuthorization(job);
+  }
+  await sandbox.decideAuthorization(pausedJob(), 'abandon');
+  assert.equal(calls.length, 0, 'abandon is never sent without the confirmation dialog');
+  assert.equal(node('confirm-dialog').open, false);
+  sandbox.openAbandonAuthorization(pausedJob());
+  assert.equal(node('confirm-dialog').open, true);
+  assert.equal(node('confirm-input-group').hidden, true);
+  assert.match(node('confirm-description').textContent, /按失败处理/);
+  assert.match(node('confirm-description').textContent, /归档/);
+  assert.equal(sandbox.confirmSubmitDisabled(), false, 'the paused job itself must not block its own choice');
+  await sandbox.submitConfirm({ preventDefault() {} });
+  assert.equal(JSON.stringify(calls[0]), JSON.stringify(['/api/preinstall/authorization', 'POST',
+    { job_id: JOB_ID, attempt: 1, decision: 'abandon' }]));
+  assert.equal(node('confirm-dialog').open, false);
+  assert.doesNotMatch(appSource.slice(appSource.indexOf('function pausedAuthorization'), appSource.indexOf('function openBuild')), /innerHTML/);
 });

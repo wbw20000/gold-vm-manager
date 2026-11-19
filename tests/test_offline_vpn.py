@@ -92,6 +92,10 @@ class OfflineVPNTests(unittest.TestCase):
         self.entry_snapshots = None
         self.hooks = {}
         self.receipt_mutation = lambda operation, receipt: None
+        # A paused authorization waits on a fake clock: no real sleeping.
+        self.clock, self.waits = [0.0], []
+        self.patch(patch.object(vpn, '_monotonic', side_effect=lambda: self.clock[0], create=True))
+        self.patch(patch.object(vpn, '_sleep', side_effect=self.fake_sleep, create=True))
         self.patch(patch.object(vpn, 'GIB', 1024))
         self.patch(patch.object(vpn, 'DiskSession', side_effect=self.readonly_session))
         self.patch(patch.object(vpn, 'WritableDiskSession', side_effect=self.writable_session))
@@ -556,6 +560,189 @@ class OfflineVPNTests(unittest.TestCase):
         serial = json.dumps([current, failed])
         self.assertNotIn('PRIVATE-node-password', serial)
         self.assertNotIn('/Users/private/path', serial)
+
+    # --- A refused prompt that never ran the root helper may be re-requested. ---
+
+    def fake_sleep(self, seconds):
+        self.waits.append(seconds)
+        self.hooks.get('wait', lambda: None)()
+        self.clock[0] += seconds
+
+    def refuse(self, reason, count=1, operation='apply', before_return=None):
+        refused = []
+        def side_effect(ticket, op, *, acknowledge_authorization):
+            if op == operation and len(refused) < count:
+                refused.append(op)
+                self.auth_calls.append(op)
+                if before_return:
+                    before_return(ticket)
+                return ownership.AuthorizationResult('authorization_or_helper_failed_retained', op, False,
+                                                     failure_reason=reason)
+            return self.authorize(ticket, op, acknowledge_authorization=acknowledge_authorization)
+        self.authorization.side_effect = side_effect
+
+    def waiting_record(self):
+        return registry.read_private(self.state / 'build-current.json')
+
+    def decide_once(self, decision):
+        retry = self.waiting_record().get('authorization_retry')
+        if retry and not list(self.jobdir.glob('offline-vpn-*/' + vpn.DECISION_NAME)):
+            vpn.submit_authorization_decision(self.state, self.job_id, retry['attempt'], decision)
+
+    def test_cancelled_prompt_waits_in_the_same_session_and_retry_completes(self):
+        self.refuse('user-cancelled')
+        seen = []
+        def wait():
+            # Hooks run inside the workflow's catch-all: record, assert afterwards.
+            if not seen:
+                seen.append((self.waiting_record(), self.active_session.directory.name, self.active_session.writable))
+            self.decide_once('retry')
+        self.hooks['wait'] = wait
+        result = self.run_configure()
+        self.assertTrue(result['persistent_ownership_verified'])
+        self.assertEqual(self.auth_calls, ['apply', 'apply', 'verify'])
+        self.assertEqual([s.directory.name for s in self.sessions],
+                         ['baseline-readonly', 'write-session', 'bytes-readonly', 'owner-readonly'])
+        waiting, session_name, writable = seen[0]
+        # Still the one writable session, still mounted: nothing was detached or redone.
+        self.assertEqual((session_name, writable), ('write-session', True))
+        self.assertEqual(waiting['phase'], 'awaiting_system_authorization')
+        self.assertEqual(waiting['vpn_configuration']['phase'], 'awaiting_owner_apply')
+        self.assertIs(waiting['vpn_configuration']['active'], True)
+        retry = dict(waiting['authorization_retry'])
+        self.assertIsInstance(retry.pop('expires_at'), str)
+        self.assertEqual(retry, {'operation': 'apply', 'reason': 'system-authorization-user-cancelled',
+                                 'attempt': 1, 'max_attempts': 3})
+        final = self.waiting_record()
+        self.assertEqual(final['phase'], 'awaiting_first_desktop_acceptance')
+        self.assertNotIn('authorization_retry', final)
+        self.assertEqual(list(self.jobdir.glob('offline-vpn-*/' + vpn.DECISION_NAME)), [])
+
+    def test_cancelled_verify_prompt_can_be_retried_too(self):
+        self.refuse('authorization-denied', operation='verify')
+        self.hooks['wait'] = lambda: self.decide_once('retry')
+        result = self.run_configure()
+        self.assertTrue(result['persistent_ownership_verified'])
+        self.assertEqual(self.auth_calls, ['apply', 'verify', 'verify'])
+
+    def test_abandoning_the_retry_fails_with_the_original_reason(self):
+        self.refuse('user-cancelled')
+        self.hooks['wait'] = lambda: self.decide_once('abandon')
+        self.assert_retained()
+        current, failed = self.failure_records()
+        for record in (current['vpn_configuration'], failed):
+            self.assertEqual((record['failed_step'], record['failure_code']),
+                             ('authorized-ownership-apply', 'system-authorization-user-cancelled'))
+        self.assertNotIn('authorization_retry', current)
+        self.assertEqual(self.auth_calls, ['apply'])
+        self.assertTrue((self.storage / guest_vpn_seed.SEED_PATH).exists())
+
+    def test_unanswered_retry_expires_after_the_fixed_wait(self):
+        self.refuse('interaction-not-allowed')
+        self.assert_retained()
+        self.assertGreaterEqual(sum(self.waits), vpn.AUTHORIZATION_DECISION_SECONDS)
+        self.assertLessEqual(sum(self.waits), vpn.AUTHORIZATION_DECISION_SECONDS + vpn.AUTHORIZATION_POLL_SECONDS)
+        self.assertEqual(self.auth_calls, ['apply'])
+        self.assertNotIn('authorization_retry', self.waiting_record())
+
+    def test_retries_are_capped_at_three_prompts(self):
+        self.refuse('user-cancelled', count=99)
+        self.hooks['wait'] = lambda: self.decide_once('retry')
+        self.assert_retained()
+        self.assertEqual(self.auth_calls, ['apply'] * vpn.AUTHORIZATION_ATTEMPTS)
+        self.assertEqual(vpn.AUTHORIZATION_ATTEMPTS, 3)
+        _, failed = self.failure_records()
+        self.assertEqual(failed['failure_code'], 'system-authorization-user-cancelled')
+
+    def test_stage_is_rechecked_before_prompting_again(self):
+        self.refuse('user-cancelled')
+        def wait():
+            (self.stage / 'nvram.bin').write_bytes(b'changed NVRAM while waiting')
+            self.decide_once('retry')
+        self.hooks['wait'] = wait
+        self.assert_retained()
+        self.assertEqual(self.auth_calls, ['apply'])
+        _, failed = self.failure_records()
+        self.assertEqual(failed['failure_code'], 'vm-config-nvram-or-source-receipt-changed')
+
+    def test_helper_timeout_is_never_retried(self):
+        self.refuse('timeout')
+        self.assert_retained()
+        self.assertEqual((self.auth_calls, self.waits), (['apply'], []))
+
+    def test_retry_is_offered_only_when_the_helper_provably_never_ran(self):
+        ticket = ownership.OwnershipTicket(self.mkdir(self.root / 'ticket-dir') / 'ticket.json', '0' * 64,
+                                           '2' * 32, self.root / 'helper', os.getuid())
+        def result(reason='user-cancelled', operation='apply', completed=False):
+            return ownership.AuthorizationResult('authorization_or_helper_failed_retained', operation, completed,
+                                                 failure_reason=reason)
+        self.assertTrue(vpn._retryable(result(), ticket, 'apply', 1))
+        self.assertTrue(vpn._retryable(result('authorization-denied'), ticket, 'apply', 2))
+        self.assertTrue(vpn._retryable(result('interaction-not-allowed', 'verify'), ticket, 'verify', 1))
+        for reason in (None, 'helper-exit', 'timeout', 'unknown-failure', 'preflight-rejected', 'launch-failed',
+                       'authorization-error'):
+            with self.subTest(reason=reason):
+                self.assertFalse(vpn._retryable(result(reason), ticket, 'apply', 1))
+        self.assertFalse(vpn._retryable(result(), ticket, 'apply', vpn.AUTHORIZATION_ATTEMPTS))
+        self.assertFalse(vpn._retryable(result(completed=True), ticket, 'apply', 1))
+        self.assertFalse(vpn._retryable(result(operation='verify'), ticket, 'apply', 1))
+        self.assertFalse(vpn._retryable(None, ticket, 'apply', 1))
+        for marker in ('apply.started', 'apply.receipt.json'):
+            with self.subTest(marker=marker):
+                path = self.file(ticket.path.parent / marker, b'{}')
+                self.assertFalse(vpn._retryable(result(), ticket, 'apply', 1))
+                self.assertTrue(vpn._retryable(result(operation='verify'), ticket, 'verify', 1))
+                path.unlink()
+
+    def test_decisions_are_accepted_only_for_the_current_wait(self):
+        self.refuse('user-cancelled')
+        bad = ((self.job_id, 2, 'retry'), (self.job_id, True, 'retry'), (self.job_id, 1, 'retry '),
+               (self.job_id, 1, 'RETRY'), (self.job_id, 1, None), (self.job_id, 1, ['retry']),
+               ('2' * 32, 1, 'retry'), ('../' + self.job_id, 1, 'retry'))
+        outcomes = []
+        def submit(*args):
+            try:
+                return vpn.submit_authorization_decision(self.state, *args)
+            except vpn.OfflineVPNError:
+                return 'rejected'
+        def wait():
+            if not outcomes:
+                outcomes.extend(submit(*args) for args in bad)
+                outcomes.append(submit(self.job_id, 1, 'abandon'))
+                outcomes.append(submit(self.job_id, 1, 'retry'))  # One choice per wait.
+        self.hooks['wait'] = wait
+        self.assert_retained()
+        self.assertEqual(outcomes, ['rejected'] * len(bad)
+                         + [{'operation': 'apply', 'attempt': 1, 'decision': 'abandon'}, 'rejected'])
+        self.assertEqual(self.auth_calls, ['apply'])  # The first choice, abandon, won.
+        self.assertEqual(submit(self.job_id, 1, 'retry'), 'rejected')  # Nothing pending once failed.
+        evidence = next(self.jobdir.glob('offline-vpn-*'))
+        self.assertEqual([p.name for p in evidence.iterdir() if 'decision' in p.name], [])  # No temporary leftovers.
+
+    def test_the_worker_only_ever_sees_a_complete_decision_file(self):
+        self.refuse('user-cancelled')
+        renames = []
+        real_rename = os.rename
+        def rename(source, target):
+            # The JSON is already complete and private before it gets its final name.
+            if Path(target).name == vpn.DECISION_NAME:
+                renames.append((Path(target).name, registry.read_private(Path(source))['decision'],
+                                stat.S_IMODE(os.stat(source).st_mode)))
+            return real_rename(source, target)
+        self.patch(patch.object(vpn.os, 'rename', side_effect=rename))
+        self.hooks['wait'] = lambda: self.decide_once('retry')
+        self.assertTrue(self.run_configure()['persistent_ownership_verified'])
+        self.assertEqual(renames, [(vpn.DECISION_NAME, 'retry', 0o600)])
+
+    def test_a_decision_left_before_the_wait_is_never_honoured(self):
+        def plant(ticket):
+            evidence = next(self.jobdir.glob('offline-vpn-*'))
+            self.record(evidence / vpn.DECISION_NAME, {'operation_id': ticket.operation_id, 'operation': 'apply',
+                                                       'attempt': 1, 'decision': 'retry'})
+        self.refuse('user-cancelled', before_return=plant)
+        self.assert_retained()
+        self.assertEqual(self.auth_calls, ['apply'])
+        self.assertEqual(list(self.jobdir.glob('offline-vpn-*/' + vpn.DECISION_NAME)), [])
 
     def test_helper_success_without_private_receipt_is_not_acceptance(self):
         self.authorization.side_effect = lambda *a, **k: ownership.AuthorizationResult('completed', 'apply', True)

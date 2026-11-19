@@ -57,8 +57,7 @@ class WritableDiskSession(disk.DiskSession):
         self.command(['/usr/sbin/diskutil','mount','nobrowse']+options+['-mountPoint',str(self.mountpoint),
                       disk.node(self.data_device)],'mount-writable-data')
         raw = self._check_mounted_write_metadata()
-        if self.ownership_mode is not None and disk.decode(raw).get('GlobalPermissionsEnabled') is not (self.ownership_mode == 'on'):
-            raise disk.OfflineDiskError('Explicit writable ownership mode not applied by macOS')
+        self._check_ownership_mode(raw)
         self.summary['writable_mount_metadata_captured']=True
         return self.mountpoint
 
@@ -98,8 +97,15 @@ class WritableDiskSession(disk.DiskSession):
         self.mount_identity=identity;self.mounted_info=raw
         return raw
 
+    def _check_ownership_mode(self, raw):
+        if self.ownership_mode is not None and disk.decode(raw).get('GlobalPermissionsEnabled') is not (self.ownership_mode == 'on'):
+            raise disk.OfflineDiskError('Explicit writable ownership mode not applied by macOS')
+
     def check_mounted_writable(self):
         raw=self._check_mounted_write_metadata()
+        # Validate the current observation, not just the one made at mount time.
+        # Cleanup still attributes the exact attachment without authorizing writes.
+        self._check_ownership_mode(raw)
         validator=getattr(volume,'validate_mounted_writable',None)
         if validator is None:
             raise disk.OfflineDiskError('Mounted-write contract not integrated; application writes forbidden')

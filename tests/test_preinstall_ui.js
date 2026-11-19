@@ -571,6 +571,23 @@ test('failure details fall back to phase labels, keep helper exit numbers and ne
   assert.doesNotMatch(appSource.slice(appSource.indexOf('function renderBuildJob'), appSource.indexOf('function openBuild')), /innerHTML/);
 });
 
+test('native ownership failures render exact public categories; generic, unknown and prefix collisions stay unclassified', () => {
+  const reason = n => renderFailedJob({ id: JOB_ID, mode: 'preinstall', name: 'fixture', phase: 'failed',
+    failed_step: 'authorized-ownership-apply', failure_code: 'offline-vpn-failed-retained',
+    failure_reason: `system-authorization-helper-exit-${n}`, recovery_required: true, published: false });
+  for (const [n, expected] of [[20,'调用参数'],[21,'授权票据'],[22,'独占写锁'],[23,'客机初始状态'],[24,'APFS 数据卷'],
+    [25,'目标路径集合'],[26,'符号链接'],[27,'权限模式'],[28,'属主或属组'],[29,'访问控制项'],[30,'哈希'],[31,'一次性操作标记'],[32,'部分变更']]) {
+    const view = reason(n);
+    assert.ok(view.text.includes(expected));
+    assert.ok(view.text.includes(`代码：offline-vpn-failed-retained / system-authorization-helper-exit-${n}`));
+    assert.equal(view.buttons.length, 1);
+    assert.match(view.buttons[0].text, /归档/);
+  }
+  assert.match(reason(2).text, /无法从这次记录确定具体检查/);
+  assert.match(reason(280).text, /属主助手拒绝执行/);
+  assert.doesNotMatch(reason(280).text, /目标文件的属主或属组/);
+});
+
 test('archiving a failed job needs the exact VM name and sends only the job id and name', async () => {
   const nodes = new Map();
   const node = (id) => {

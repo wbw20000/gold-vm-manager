@@ -13,6 +13,22 @@ import managed_registry as r
 import offline_disk as d
 
 
+class WritableOwnershipRecheckTests(unittest.TestCase):
+    def test_requested_mode_must_still_match_on_each_check(self):
+        from offline_writable import WritableDiskSession
+        for mode, expected in [('on', True), ('off', False)]:
+            with self.subTest(mode=mode):
+                session = object.__new__(WritableDiskSession)
+                session.mountpoint, session.attribution, session.ownership_mode = '/dummy', object(), mode
+                for changed in ({'GlobalPermissionsEnabled': not expected}, {}, {'GlobalPermissionsEnabled': int(expected)}):
+                    records = [plistlib.dumps({'GlobalPermissionsEnabled': expected}), plistlib.dumps(changed)]
+                    with patch.object(session, '_check_mounted_write_metadata', side_effect=records), patch('offline_writable.volume.validate_mounted_writable') as verify:
+                        session.check_mounted_writable()
+                        with self.assertRaises(d.OfflineDiskError):
+                            session.check_mounted_writable()
+                        verify.assert_called_once()
+
+
 class StageTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory(prefix='offline-stage-test-')

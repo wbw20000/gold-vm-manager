@@ -889,12 +889,32 @@
         'guest-ownership-validation-failed': '属主校验未通过，已停止，未继续写入。',
         'internal-error': '内部检查出现意外错误；已保留现场。',
       };
+      // Helper exit status is an exact, versioned numeric category, not an NSError or a path.
+      // An older helper only returned 2; never infer which specific check failed in that job.
+      const helperReasons = {
+        '2': '助手只记录了通用退出码 2，无法从这次记录确定具体检查。请保留暂存盘。',
+        '20': '助手的调用参数或管理员运行身份不符合要求。',
+        '21': '授权票据或其绑定的暂存文件身份未通过校验。',
+        '22': '未能确认原预装进程仍持有同一份配置文件的独占写锁。',
+        '23': '暂存任务、恢复记录或客机初始状态不符合写入或复核条件。',
+        '24': '未能确认挂载的是这块客机的 APFS 数据卷，或其所有权、读写状态不符。',
+        '25': '无法核对完整的目标路径集合，或实际文件清单与票据不符。',
+        '26': '应用校验回执或符号链接关系未通过校验。',
+        '27': '目标文件身份、类型、大小或权限模式未通过校验。',
+        '28': '目标文件的属主或属组与本次操作的预期不符。',
+        '29': '无法确认文件或目录没有额外的访问控制项（ACL）。',
+        '30': '文件内容读取、长度或哈希校验失败。',
+        '31': '一次性操作标记或授权回执检查、写入失败；不要重放此票据。',
+        '32': '系统未能完成属主修改；不能假定磁盘没有发生部分变更。',
+      };
       const stepKey = job.failed_step || job.failed_phase;
       const stepLabel = steps[job.failed_step] || (job.failed_step ? '' : labels[job.failed_phase]) || '';
       region.append(el('span', 'build-job-failure', `失败步骤：${stepKey ? (stepLabel ? `${stepLabel}（${stepKey}）` : stepKey) : '未记录'}`));
       const reasonCode = job.failure_reason || job.failure_code || '';
       const reasonKey = Object.keys(reasons).find((key) => reasonCode === key || reasonCode.startsWith(`${key}-`));
-      region.append(el('span', 'build-job-failure', `原因：${reasonKey ? reasons[reasonKey] : '未归类，请按下方代码排查；不会自动重试。'}`));
+      const helperExit = /^system-authorization-helper-exit-([1-9][0-9]*)$/.exec(reasonCode);
+      const detail = helperExit && helperReasons[helperExit[1]];
+      region.append(el('span', 'build-job-failure', `原因：${detail || (reasonKey ? reasons[reasonKey] : '未归类，请按下方代码排查；不会自动重试。')}`));
       region.append(el('span', 'build-job-failure', `代码：${[job.failure_code, job.failure_reason].filter(Boolean).join(' / ') || '未记录'}`));
       if (job.recovery_required === true && job.published !== true) {
         region.append(button('归档此失败任务（保留暂存盘）', 'text-button', () => openArchiveJob(job), !connected));

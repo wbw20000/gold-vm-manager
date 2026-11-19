@@ -156,7 +156,7 @@ class Fixture:
                     'APFSPhysicalStores': [{'APFSPhysicalStore': 'disk76s2'}],
                     'MountPoint': str(mount), 'FilesystemType': 'apfs', 'BusProtocol': 'Disk Image',
                     'VolumeUUID': DATA_UUID, 'DiskUUID': DATA_UUID, 'APFSVolumeGroupID': GROUP_UUID,
-                    'GlobalPermissionsEnabled': readonly, 'ReadOnly': readonly}
+                    'GlobalPermissionsEnabled': True, 'ReadOnly': readonly}
             disk.update({key: False for key in ('WholeDisk', 'Internal', 'OSInternalMedia', 'APFSSnapshot',
                         'Encryption', 'EncryptionThisVolumeProper', 'FileVault', 'Locked')})
             disk.update({key: not readonly for key in ('Writable', 'WritableMedia', 'WritableVolume')})
@@ -474,13 +474,15 @@ class SwiftOwnershipFixtureTests(unittest.TestCase):
         self.fixture.prepare()
         self.fixture.native_documents()
 
-    def run_helper(self, operation='apply', success=True):
+    def run_helper(self, operation='apply', expected=0):
         result = subprocess.run([str(self.fixture_binary), str(self.fixture.ticket.path), '--' + operation],
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
-        self.assertEqual(result.returncode, 0 if success else 2, result.stderr.decode(errors='replace'))
-        self.assertEqual(result.stderr, b'')
-        self.assertNotIn(SECRET.encode(), result.stdout)
-        if success:
+        # All failure channels are numeric only, including native/decoding errors.
+        self.assertEqual(len(result.stderr), 0)
+        self.assertEqual(result.returncode, expected)
+        if expected:
+            self.assertEqual(len(result.stdout), 0)
+        else:
             self.assertEqual(result.stdout, b'fixture_metadata_simulation_completed\n')
         return result
 
@@ -492,13 +494,15 @@ class SwiftOwnershipFixtureTests(unittest.TestCase):
 
     def test_apply_and_fresh_verify_only_simulate_metadata(self):
         f = self.fixture
-        owners = [(f.mount / entry.path).lstat().st_uid for entry in f.entries]
+        def observed_owners():
+            return [(s.st_uid, s.st_gid) for s in ((f.mount / e.path).lstat() for e in f.entries)]
+        owners = observed_owners()
         self.run_helper()
         apply = json.loads((f.paths['directory'] / 'apply.receipt.json').read_bytes())
         self.assertTrue(apply['fixture_only'])
         self.assertFalse(apply['metadata_applied'])
         self.assertFalse(apply['persistent_ownership_verified'])
-        self.assertEqual(owners, [(f.mount / entry.path).lstat().st_uid for entry in f.entries])
+        self.assertEqual(owners, observed_owners())
         f.simulate_remount()
         self.run_helper('verify')
         result = json.loads((f.paths['directory'] / 'verify.receipt.json').read_bytes())
@@ -512,24 +516,18 @@ class SwiftOwnershipFixtureTests(unittest.TestCase):
         (self.fixture.tart / 'vms').chmod(0o755)
         self.run_helper()
 
-    def test_owners_off_display_is_not_persistent_ownership(self):
-        path = self.fixture.ticket.path
-        value = json.loads(path.read_bytes())
-        for entry in value['entries']:
-            entry['observed_uid'] = 502
-            entry['observed_gid'] = 99
-        write(path, value)
-        self.run_helper()  # Native-metadata simulation explicitly says owners-off.
-        result = json.loads((path.parent / 'apply.receipt.json').read_bytes())
-        self.assertFalse(result['persistent_ownership_verified'])
+    def test_owners_off_apply_refused_even_with_matching_observed_ids(self):
+        self.edit_document('fixture-disk-apply.json', lambda v: v.update(GlobalPermissionsEnabled=False))
+        self.run_helper(expected=24)
+        self.assertFalse((self.fixture.paths['directory'] / 'apply.started').exists())
 
     def test_owners_on_apply_rejects_observed_owner_change(self):
         path = self.fixture.ticket.path
         value = json.loads(path.read_bytes())
         value['entries'][0]['observed_uid'] = os.getuid() + 1
         write(path, value)
-        self.edit_document('fixture-disk-apply.json', lambda v: v.update(GlobalPermissionsEnabled=True))
-        self.run_helper(success=False)
+        self.run_helper(expected=28)
+        self.assertFalse((self.fixture.paths['directory'] / 'apply.started').exists())
 
     def test_extended_acl_on_private_target_is_refused_not_removed(self):
         seed = self.fixture.mount / ownership.BASE / 'FirstLogin' / 'seed.json'
@@ -537,26 +535,75 @@ class SwiftOwnershipFixtureTests(unittest.TestCase):
         result = subprocess.run(['/bin/chmod', '+a', 'everyone allow read', str(seed)],
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr.decode(errors='replace'))
-        self.run_helper(success=False)
+        self.run_helper(expected=29)
         self.assertEqual(seed.read_bytes(), SECRET.encode())
+
+    def test_invalid_invocation_and_malformed_ticket_have_no_text_output(self):
+        # Both the caller's argument and an undecodable private document must be
+        # discarded; run_helper asserts byte-empty stdout and stderr on failure.
+        self.run_helper(operation=SECRET, expected=20)
+        write(self.fixture.ticket.path, ('{"unclosed":"' + SECRET).encode())
+        self.run_helper(expected=21)
+        self.assertFalse((self.fixture.paths['directory'] / 'apply.started').exists())
+
+    def test_lock_checked_before_stage_state_or_mount(self):
+        f = self.fixture
+        f.close()  # Drop the real POSIX lock only on this fixture's dummy config.
+        write(f.state / 'build-current.json', dict(f.current, guest_started=True))
+        self.edit_document('fixture-disk-apply.json', lambda v: v.update(GlobalPermissionsEnabled=False))
+        self.run_helper(expected=22)
+        self.assertFalse((f.paths['directory'] / 'apply.started').exists())
+        self.assertFalse((f.paths['directory'] / 'apply.receipt.json').exists())
+
+    def test_immutable_input_hash_precedes_interpreted_receipt(self):
+        f = self.fixture
+        path = f.stage / '.offline-preinstall.complete.json'
+        # Keep size, inode and mode. A bound receipt edited in place fails 21,
+        # not the later bundle-manifest comparison (26).
+        record = f.apps['applications'][0]
+        record['bundle_tree_sha256'] = '0' * 64
+        write(path, f.apps)
+        self.run_helper(expected=21)
+        self.assertFalse((f.paths['directory'] / 'apply.started').exists())
+
+    def test_bundle_tree_receipt_precedes_bad_guest_bytes(self):
+        f = self.fixture
+        path = f.stage / '.offline-preinstall.complete.json'
+        f.apps['applications'][0]['bundle_tree_sha256'] = '0' * 64
+        write(path, f.apps)
+        self.edit_document('ticket.json', lambda v: v['metadata'].update(
+            applications=ownership._identity(path, os.getuid(), digest=True)))
+        write(f.mount / ownership.BASE / 'FirstLogin/seed.json', b'x' * len(SECRET))
+        self.run_helper(expected=26)
+        self.assertFalse((f.paths['directory'] / 'apply.started').exists())
+
+    def test_bad_guest_digest_precedes_one_shot_marker(self):
+        f = self.fixture
+        marker = f.paths['directory'] / 'apply.started'
+        write(marker, b'dummy-existing-marker')
+        # Same inode, mode, owner and bytes count. Only the digest is wrong.
+        write(f.mount / ownership.BASE / 'FirstLogin/seed.json', b'x' * len(SECRET))
+        self.run_helper(expected=30)
+        self.assertEqual(marker.read_bytes(), b'dummy-existing-marker')
+        self.assertFalse((f.paths['directory'] / 'apply.receipt.json').exists())
 
     def test_replay_apply_refused(self):
         self.run_helper()
-        self.run_helper(success=False)
+        self.run_helper(expected=31)
 
     def test_readonly_noowners_rejected(self):
         self.run_helper()
         self.fixture.simulate_remount()
         self.edit_document('fixture-disk-verify.json', lambda v: v.update(GlobalPermissionsEnabled=False))
-        self.run_helper('verify', success=False)
+        self.run_helper('verify', expected=24)
 
     def test_readwrite_verify_and_same_generation_rejected(self):
         self.run_helper()
         self.fixture.simulate_remount()
         self.edit_document('fixture-hdi-verify.json', lambda v: v['images'][0].update({'hdid-pid': 111}))
-        self.run_helper('verify', success=False)
+        self.run_helper('verify', expected=31)
         self.edit_document('fixture-hdi-verify.json', lambda v: v['images'][0].update({'hdid-pid': 222, 'writeable': True}))
-        self.run_helper('verify', success=False)
+        self.run_helper('verify', expected=24)
 
     def test_wrong_image_owner_uuid_and_role_rejected(self):
         f = self.fixture
@@ -569,28 +616,28 @@ class SwiftOwnershipFixtureTests(unittest.TestCase):
             with self.subTest(name=name):
                 f.native_documents()
                 self.edit_document(name, change)
-                self.run_helper(success=False)
+                self.run_helper(expected=24)
         self.assertFalse((f.paths['directory'] / 'apply.started').exists())
 
     def test_payload_hash_extra_file_and_hardlink_refused(self):
         f = self.fixture
         seed = f.mount / ownership.BASE / 'FirstLogin' / 'seed.json'
         write(seed, b'tampered-payload')
-        self.run_helper(success=False)
+        self.run_helper(expected=30)
         write(seed, SECRET.encode())
         extra = f.mount / ownership.BASE / 'FirstLogin' / 'unexpected'
         write(extra, b'dummy')
-        self.run_helper(success=False)
+        self.run_helper(expected=25)
         # Do not delete evidence to retry; separate hardlink fixture is covered
         # by adding a link, which independently violates both nlink and inventory.
         os.link(seed, f.root / 'hardlinked-seed')
-        self.run_helper(success=False)
+        self.run_helper(expected=25)
 
     def test_hardlinked_payload_rejected_without_inventory_change(self):
         f = self.fixture
         seed = f.mount / ownership.BASE / 'FirstLogin' / 'seed.json'
         os.link(seed, f.root / 'outside-inventory-dummy-link')
-        self.run_helper(success=False)
+        self.run_helper(expected=27)
         self.assertFalse((f.paths['directory'] / 'apply.started').exists())
 
     def test_cyclic_link_rejected_even_with_consistent_fixture_receipt(self):
@@ -610,7 +657,7 @@ class SwiftOwnershipFixtureTests(unittest.TestCase):
         ticket['entries'].sort(key=lambda value: value['path'])
         ticket['metadata']['applications'] = ownership._identity(app_path, os.getuid(), digest=True)
         write(f.ticket.path, ticket)
-        self.run_helper(success=False)
+        self.run_helper(expected=26)
         self.assertFalse((f.paths['directory'] / 'apply.started').exists())
 
     def test_stage_state_and_published_vm_guards(self):
@@ -619,17 +666,17 @@ class SwiftOwnershipFixtureTests(unittest.TestCase):
                             {'vpn_configuration': {'operation_id': OP, 'active': False}}):
             value = dict(f.current, **patch_value)
             write(f.state / 'build-current.json', value)
-            self.run_helper(success=False)
+            self.run_helper(expected=23)
         write(f.state / 'build-current.json', f.current)
         mkdir(f.tart / 'vms' / f.name)
-        self.run_helper(success=False)
+        self.run_helper(expected=23)
 
     def test_existing_user_or_setup_complete_refused(self):
         f = self.fixture
         mkdir(f.mount / 'Users' / 'existing-user')
-        self.run_helper(success=False)
+        self.run_helper(expected=23)
         write(f.mount / 'private' / 'var' / 'db' / '.AppleSetupDone', b'dummy')
-        self.run_helper(success=False)
+        self.run_helper(expected=23)
 
     def test_seed_symlink_to_outside_is_not_followed(self):
         f = self.fixture
@@ -638,32 +685,32 @@ class SwiftOwnershipFixtureTests(unittest.TestCase):
         assert seed.resolve() == seed and not held.exists() and held.parent.resolve() == f.root
         seed.rename(held)
         seed.symlink_to(held)
-        self.run_helper(success=False)
+        self.run_helper(expected=27)
         self.assertEqual(held.read_bytes(), SECRET.encode())
 
     def test_ticket_modes_unknown_keys_and_duplicate_keys_rejected(self):
         f = self.fixture
         f.ticket.path.chmod(0o644)
-        self.run_helper(success=False)
+        self.run_helper(expected=21)
         f.ticket.path.chmod(0o600)
         original = f.ticket.path.read_bytes()
         value = json.loads(original)
         value['entries'][0]['size'] = 2**63 - 1
         write(f.ticket.path, value)
-        self.run_helper(success=False)
+        self.run_helper(expected=30)
         value = json.loads(original)
         value['entries'][0]['target_uid'] = 0
         write(f.ticket.path, value)
-        self.run_helper(success=False)
+        self.run_helper(expected=21)
         write(f.ticket.path, b'{"schema":1,' + original[1:])
-        self.run_helper(success=False)
+        self.run_helper(expected=21)
 
     def test_second_operation_directory_and_writable_tart_refused(self):
         self.fixture.tart.chmod(0o775)
-        self.run_helper(success=False)
+        self.run_helper(expected=21)
         self.fixture.tart.chmod(0o700)
         mkdir(self.fixture.paths['directory'].parent / ('c' * 32))
-        self.run_helper(success=False)
+        self.run_helper(expected=21)
 
 
 if __name__ == '__main__':

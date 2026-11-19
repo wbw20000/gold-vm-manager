@@ -16,8 +16,20 @@ enum GuestOwnership {
     static let maxTicket = 64 * 1024 * 1024
     static let maxEntries = 200_000
     static let maxTree: Int64 = 16 * 1024 * 1024 * 1024
-    enum Failure: Error { case rejected }
-    static func need(_ value: Bool) throws { if !value { throw Failure.rejected } }
+    // Stable numeric ABI. Shared POSIX/decoding helpers reject without recording
+    // paths or errno; only the semantic caller assigns their category. A nested
+    // specific failure (e.g. ACL) always survives its enclosing validation.
+    enum Failure: Int32, Error {
+        case rejected = 2
+        case invocation = 20, ticket = 21, parentLock = 22, stageState = 23
+        case disk = 24, paths = 25, bundles = 26, entry = 27, ownership = 28
+        case acl = 29, content = 30, receipt = 31, mutation = 32
+
+        func checking<T>(_ body: () throws -> T) throws -> T {
+            do { return try body() } catch Failure.rejected { throw self }
+        }
+    }
+    static func need(_ value: Bool, _ failure: Failure = .rejected) throws { if !value { throw failure } }
 
     struct Identity: Codable, Equatable {
         let device: UInt64
@@ -85,7 +97,6 @@ enum GuestOwnership {
         let filesystemDevice: UInt64
         let rootInode: UInt64
         let readOnly: Bool
-        let ownersEnabled: Bool
     }
 
     static func hexadecimal(_ value: String, _ length: Int) -> Bool {
@@ -107,11 +118,11 @@ enum GuestOwnership {
     static func deviceID(_ value: dev_t) -> UInt64 { UInt64(UInt32(bitPattern: value)) }
     static func noACL(_ fd: Int32) throws {
         errno = 0
-        guard let acl = acl_get_fd_np(fd, ACL_TYPE_EXTENDED) else { try need(errno == ENOENT); return }
+        guard let acl = acl_get_fd_np(fd, ACL_TYPE_EXTENDED) else { try need(errno == ENOENT, .acl); return }
         defer { acl_free(UnsafeMutableRawPointer(acl)) }
         var entry: acl_entry_t?; errno = 0
         let result = acl_get_entry(acl, Int32(ACL_FIRST_ENTRY.rawValue), &entry)
-        try need(result == -1 && errno == EINVAL)
+        try need(result == -1 && errno == EINVAL, .acl)
     }
     static func directory(_ path: String, owner: uid_t? = nil, privateMode: Bool = false) throws -> FD {
         var current = try FD(open("/", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC))
@@ -192,7 +203,7 @@ enum GuestOwnership {
         if let digest = expected.sha256 { try need(hexadecimal(digest, 64) && hashFile(fd, size: expected.size) == digest) }
     }
     static func object(_ bytes: Data) throws -> [String: Any] {
-        guard let value = try JSONSerialization.jsonObject(with: bytes) as? [String: Any] else { throw Failure.rejected }
+        guard let value = (try? JSONSerialization.jsonObject(with: bytes)) as? [String: Any] else { throw Failure.rejected }
         return value
     }
     static func bool(_ value: Any?, _ expected: Bool) -> Bool {
@@ -214,29 +225,32 @@ enum GuestOwnership {
     }
 
     static func desired(_ entry: Entry) throws -> (uid_t, gid_t) {
-        let names = try parts(entry.path, absolute: false)
-        try need(entry.device > 0 && entry.inode > 0 && entry.size >= 0 && entry.mode <= 0o7777)
-        try need(entry.kind == "file" ? hexadecimal(entry.sha256, 64) : entry.sha256.isEmpty)
-        try need(entry.kind == "symlink" || entry.link_target.isEmpty)
+        let names = try Failure.paths.checking { try parts(entry.path, absolute: false) }
+        try need(entry.device > 0 && entry.inode > 0, .entry)
+        try need(entry.size >= 0, .content)
+        try need(entry.mode <= 0o7777, .entry)
+        try need(entry.kind == "file" ? hexadecimal(entry.sha256, 64) : entry.sha256.isEmpty, .content)
+        try need(entry.kind == "symlink" || entry.link_target.isEmpty, .bundles)
         let fixed: [String: (String, UInt32, UInt32, UInt32)] = [
             base: ("directory", 0, 0, 0o755), base + "/FirstLogin": ("directory", 501, 20, 0o700),
             base + "/FirstLogin/GuestVPNBootstrap": ("file", 0, 0, 0o755),
             base + "/FirstLogin/seed.json": ("file", 501, 20, 0o600), agent: ("file", 0, 0, 0o644)]
         if let rule = fixed[entry.path] {
-            try need(entry.kind == rule.0 && entry.mode == rule.3)
+            try need(entry.kind == rule.0 && entry.mode == rule.3, .entry)
             return (rule.1, rule.2)
         }
-        try need(names.count >= 2 && names[0] == "Applications" && apps.contains(names[1]))
-        try need(["directory", "file", "symlink"].contains(entry.kind))
-        if names.count == 2 { try need(entry.kind == "directory" && entry.mode == 0o755); return (0, 0) }
+        try need(names.count >= 2 && names[0] == "Applications" && apps.contains(names[1]), .paths)
+        try need(["directory", "file", "symlink"].contains(entry.kind), .entry)
+        if names.count == 2 { try need(entry.kind == "directory" && entry.mode == 0o755, .entry); return (0, 0) }
         if entry.kind == "symlink" {
-            try need(entry.mode <= 0o777 && safeText(entry.link_target) && !entry.link_target.hasPrefix("/") && !entry.link_target.contains("\\"))
+            try need(entry.mode <= 0o777, .entry)
+            try need(safeText(entry.link_target) && !entry.link_target.hasPrefix("/") && !entry.link_target.contains("\\"), .bundles)
             var stack = Array(names.dropLast())
             for part in entry.link_target.split(separator: "/", omittingEmptySubsequences: false).map(String.init) {
                 if part == "." || part == "" { continue }
-                if part == ".." { try need(stack.count > 2); stack.removeLast() } else { stack.append(part) }
+                if part == ".." { try need(stack.count > 2, .bundles); stack.removeLast() } else { stack.append(part) }
             }
-        } else { try need(entry.mode & 0o7022 == 0) }
+        } else { try need(entry.mode & 0o7022 == 0, .entry) }
         return (501, 20)
     }
 
@@ -277,7 +291,9 @@ enum GuestOwnership {
         for entry in rawEntries {
             try need(Set(entry.keys) == ["path", "kind", "device", "inode", "size", "mode", "observed_uid", "observed_gid", "sha256", "link_target"])
         }
-        let ticket = try JSONDecoder().decode(Ticket.self, from: bytes)
+        let ticket: Ticket
+        do { ticket = try JSONDecoder().decode(Ticket.self, from: bytes) }
+        catch is DecodingError { throw Failure.ticket }
         try need(ticket.schema == 1 && hexadecimal(ticket.job_id, 32) && hexadecimal(ticket.operation_id, 32))
         try need(ticket.operationDirectory + "/ticket.json" == ticketPath && ticket.caller_pid > 1)
         try need(validName(ticket.name))
@@ -314,12 +330,10 @@ enum GuestOwnership {
         }
         #if !GOLD_OWNERSHIP_FIXTURE
         try need(CommandLine.arguments[0] == ticket.helper)
+        #endif
         // Parent's exact config POSIX write lock must remain held while this
         // synchronous system-authorization operation runs. Do not reacquire it.
-        let configFD = try openChild(stage, "config.json")
-        var lock = flock(l_start: 0, l_len: 0, l_pid: 0, l_type: Int16(F_WRLCK), l_whence: Int16(SEEK_SET))
-        try need(fcntl(configFD.value, F_GETLK, &lock) == 0 && lock.l_type == F_WRLCK && lock.l_pid == ticket.caller_pid)
-        #endif
+        try checkParentLock(stage, ticket.caller_pid)
         let context = Context(ticket: ticket, bytes: bytes, digest: hash(bytes), caller: caller,
                               callerGroup: fileInfo.st_gid, directory: operationDirectory, stage: stage,
                               image: image, metadataFiles: metadataFiles)
@@ -327,14 +341,23 @@ enum GuestOwnership {
         return context
     }
 
+    static func checkParentLock(_ stage: FD, _ callerPID: Int32) throws {
+        try Failure.parentLock.checking {
+            let config = try openChild(stage, "config.json")
+            var lock = flock(l_start: 0, l_len: 0, l_pid: 0, l_type: Int16(F_WRLCK), l_whence: Int16(SEEK_SET))
+            try need(fcntl(config.value, F_GETLK, &lock) == 0 && lock.l_type == F_WRLCK && lock.l_pid == callerPID)
+        }
+    }
+
     static func stageState(_ context: Context) throws {
+        try Failure.ticket.checking { try checkIdentity(context.image, context.ticket.image, caller: context.caller) }
+        try checkParentLock(context.stage, context.ticket.caller_pid)
+        try Failure.stageState.checking { try checkStageAndRequest(context) }
+        try Failure.ticket.checking { try recheckImmutableBindings(context) }
+    }
+
+    static func checkStageAndRequest(_ context: Context) throws {
         let ticket = context.ticket
-        try checkIdentity(context.image, ticket.image, caller: context.caller)
-        #if !GOLD_OWNERSHIP_FIXTURE
-        let lockedConfig = try openChild(context.stage, "config.json")
-        var lock = flock(l_start: 0, l_len: 0, l_pid: 0, l_type: Int16(F_WRLCK), l_whence: Int16(SEEK_SET))
-        try need(fcntl(lockedConfig.value, F_GETLK, &lock) == 0 && lock.l_type == F_WRLCK && lock.l_pid == ticket.caller_pid)
-        #endif
         let vms = try directory(ticket.tart_home + "/vms", owner: context.caller)
         try need([0o700, 0o755].contains(try info(vms.value).st_mode & 0o7777))
         try absent(vms, ticket.name)
@@ -359,6 +382,10 @@ enum GuestOwnership {
         for key in ["applications_preinstalled", "readonly_remount_verified", "final_detach_confirmed"] { try need(bool(apps[key], true)) }
         for key in ["guest_started", "published", "credentials_copied", "desktop_verified"] { try need(bool(apps[key], false)) }
         try need((apps["data_uuid"] as? String)?.uppercased() == ticket.data_uuid && (apps["volume_group_uuid"] as? String)?.uppercased() == ticket.group_uuid)
+    }
+
+    static func recheckImmutableBindings(_ context: Context) throws {
+        let ticket = context.ticket
         // Recheck immutable receipt/request/config identities, not merely their
         // interpreted success fields. An atomic replacement also fails inode pin.
         for (key, path) in ["request": ticket.state_dir + "/build-jobs/" + ticket.job_id + "/request.json", "restore": ticket.stage + "/.clean-vm-installer.complete.json", "applications": ticket.stage + "/.offline-preinstall.complete.json", "config": ticket.stage + "/config.json", "nvram": ticket.stage + "/nvram.bin"] {
@@ -377,7 +404,7 @@ enum GuestOwnership {
         process.currentDirectoryURL = URL(fileURLWithPath: "/")
         process.standardInput = FileHandle.nullDevice; process.standardError = FileHandle.nullDevice
         process.standardOutput = pipe
-        try process.run()
+        do { try process.run() } catch { throw Failure.disk }
         let timer = DispatchSource.makeTimerSource(queue: .global())
         timer.schedule(deadline: .now() + 30)
         timer.setEventHandler { if process.isRunning { process.terminate() } }
@@ -395,7 +422,7 @@ enum GuestOwnership {
     }
     #endif
     static func plist(_ bytes: Data) throws -> [String: Any] {
-        guard let value = try PropertyListSerialization.propertyList(from: bytes, options: [], format: nil) as? [String: Any] else { throw Failure.rejected }
+        guard let value = (try? PropertyListSerialization.propertyList(from: bytes, options: [], format: nil)) as? [String: Any] else { throw Failure.rejected }
         return value
     }
     static func nativeMetadata(_ context: Context, root: FD, verify: Bool) throws -> Attribution {
@@ -436,9 +463,9 @@ enum GuestOwnership {
         try need((disk["VolumeUUID"] as? String)?.uppercased() == ticket.data_uuid && (disk["DiskUUID"] as? String)?.uppercased() == ticket.data_uuid && (disk["APFSVolumeGroupID"] as? String)?.uppercased() == ticket.group_uuid)
         for key in ["WholeDisk", "Internal", "OSInternalMedia", "APFSSnapshot", "Encryption", "EncryptionThisVolumeProper", "FileVault", "Locked"] { try need(bool(disk[key], false)) }
         for key in ["Writable", "WritableMedia", "WritableVolume"] { try need(bool(disk[key], !verify)) }
-        try need(bool(disk["GlobalPermissionsEnabled"], true) || bool(disk["GlobalPermissionsEnabled"], false))
-        let ownersEnabled = bool(disk["GlobalPermissionsEnabled"], true)
-        if verify { try need(ownersEnabled) }
+        // Apply needs real observed IDs too: owners-off can synthesize different
+        // ownership for the caller and root. Never chown from such a display.
+        try need(bool(disk["GlobalPermissionsEnabled"], true))
         if let readOnly = disk["ReadOnly"] { try need(bool(readOnly, verify)) }
         guard let containers = apfs["Containers"] as? [[String: Any]] else { throw Failure.rejected }
         let volumes = containers.flatMap { item -> [[String: Any]] in
@@ -458,11 +485,11 @@ enum GuestOwnership {
         let onto = withUnsafePointer(to: &filesystem.f_mntonname) { $0.withMemoryRebound(to: CChar.self, capacity: 1024) { String(cString: $0) } }
         try need(type == "apfs" && from == "/dev/" + device && onto == mount)
         try need((filesystem.f_flags & UInt32(MNT_RDONLY) != 0) == verify)
-        try need((filesystem.f_flags & UInt32(MNT_IGNORE_OWNERSHIP) == 0) == ownersEnabled)
+        try need(filesystem.f_flags & UInt32(MNT_IGNORE_OWNERSHIP) == 0)
         try need(deviceID(rootInfo.st_dev) != deviceID(try info(context.stage.value).st_dev))
         #endif
         if !verify { try need(deviceID(rootInfo.st_dev) == ticket.apply_device && rootInfo.st_ino == ticket.apply_root_inode) }
-        return Attribution(device: device, container: container, store: store, generation: Int(generation), filesystemDevice: deviceID(rootInfo.st_dev), rootInode: rootInfo.st_ino, readOnly: verify, ownersEnabled: ownersEnabled)
+        return Attribution(device: device, container: container, store: store, generation: Int(generation), filesystemDevice: deviceID(rootInfo.st_dev), rootInode: rootInfo.st_ino, readOnly: verify)
     }
 
     static func names(_ fd: FD) throws -> [String] {
@@ -505,31 +532,33 @@ enum GuestOwnership {
         }
         return result
     }
-    static func checkEntry(_ entry: Entry, root: FD, device: UInt64, verify: Bool, simulate: Bool, ownersEnabled: Bool) throws -> (FD, String, FD?) {
-        let target = try desired(entry)
-        let (parent, name) = try parentAt(root, entry.path, device: device)
-        var value = stat(); try need(fstatat(parent.value, name, &value, AT_SYMLINK_NOFOLLOW) == 0)
-        try need(deviceID(value.st_dev) == device && value.st_ino == entry.inode && UInt32(value.st_mode & 0o7777) == entry.mode)
-        try need(entry.kind == "directory" || value.st_nlink == 1)
-        let expectedKind = entry.kind == "directory" ? S_IFDIR : entry.kind == "file" ? S_IFREG : S_IFLNK
-        try need(value.st_mode & S_IFMT == expectedKind)
-        if verify && !simulate { try need(value.st_uid == target.0 && value.st_gid == target.1) }
-        // owners-off stat can map ownership to the accessing UID. Never mistake
-        // its display (host caller vs root) for persisted ownership evidence.
-        if !verify && ownersEnabled { try need(value.st_uid == entry.observed_uid && value.st_gid == entry.observed_gid) }
-        if entry.kind == "symlink" {
-            try need(try linkTarget(parent, name) == entry.link_target)
-            return (parent, name, nil)
+    static func checkEntry(_ entry: Entry, root: FD, device: UInt64, verify: Bool, simulate: Bool) throws -> (FD, String, FD?) {
+        try Failure.entry.checking {
+            let target = try desired(entry)
+            let (parent, name) = try parentAt(root, entry.path, device: device)
+            var value = stat(); try need(fstatat(parent.value, name, &value, AT_SYMLINK_NOFOLLOW) == 0)
+            try need(deviceID(value.st_dev) == device && value.st_ino == entry.inode && UInt32(value.st_mode & 0o7777) == entry.mode)
+            try need(entry.kind == "directory" || value.st_nlink == 1)
+            let expectedKind = entry.kind == "directory" ? S_IFDIR : entry.kind == "file" ? S_IFREG : S_IFLNK
+            try need(value.st_mode & S_IFMT == expectedKind)
+            if verify && !simulate { try need(value.st_uid == target.0 && value.st_gid == target.1, .ownership) }
+            if !verify { try need(value.st_uid == entry.observed_uid && value.st_gid == entry.observed_gid, .ownership) }
+            if entry.kind == "symlink" {
+                try Failure.bundles.checking { try need(try linkTarget(parent, name) == entry.link_target) }
+                return (parent, name, nil)
+            }
+            let fd = try openChild(parent, name, directory: entry.kind == "directory")
+            let actual = try info(fd.value)
+            try need(actual.st_ino == value.st_ino && deviceID(actual.st_dev) == device)
+            try noACL(fd.value)
+            if entry.kind == "file" {
+                try Failure.content.checking {
+                    try need(actual.st_size == entry.size && hexadecimal(entry.sha256, 64))
+                    try need(try hashFile(fd, size: entry.size) == entry.sha256)
+                }
+            }
+            return (parent, name, fd)
         }
-        let fd = try openChild(parent, name, directory: entry.kind == "directory")
-        let actual = try info(fd.value)
-        try need(actual.st_ino == value.st_ino && deviceID(actual.st_dev) == device)
-        try noACL(fd.value)
-        if entry.kind == "file" {
-            try need(actual.st_size == entry.size && hexadecimal(entry.sha256, 64))
-            try need(try hashFile(fd, size: entry.size) == entry.sha256)
-        }
-        return (parent, name, fd)
     }
 
     // Match Python ensure_ascii=True compact JSON used by the existing signed
@@ -636,14 +665,19 @@ enum GuestOwnership {
         #endif
         try need(fsync(fd.value) == 0 && fsync(parent.value) == 0)
     }
-    static func receiptBytes(_ value: [String: Any]) throws -> Data { try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]) }
+    static func receiptBytes(_ value: [String: Any]) throws -> Data {
+        do { return try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]) }
+        catch { throw Failure.receipt }
+    }
 
     static func execute(_ context: Context, verify: Bool) throws {
         let ticket = context.ticket
         let mount = verify ? ticket.verify_mount : ticket.apply_mount
-        _ = try directory(String(mount.dropLast("/data-mount".count)), owner: context.caller, privateMode: true)
-        let root = try directory(mount)
-        let attribution = try nativeMetadata(context, root: root, verify: verify)
+        let root = try Failure.disk.checking {
+            _ = try directory(String(mount.dropLast("/data-mount".count)), owner: context.caller, privateMode: true)
+            return try directory(mount)
+        }
+        let attribution = try Failure.disk.checking { try nativeMetadata(context, root: root, verify: verify) }
         let simulate: Bool
         #if GOLD_OWNERSHIP_FIXTURE
         simulate = true
@@ -651,57 +685,66 @@ enum GuestOwnership {
         simulate = false
         #endif
         let keys = Set(ticket.entries.map(\.path))
-        try need(ticket.entries.count >= 9 && ticket.entries.count <= maxEntries && keys.count == ticket.entries.count)
-        try need(Set([base, base + "/FirstLogin", base + "/FirstLogin/seed.json", base + "/FirstLogin/GuestVPNBootstrap", agent] + apps.map { "Applications/" + $0 }).isSubset(of: keys))
-        try need(Set(ticket.entries.map(\.inode)).count == ticket.entries.count)
-        try need(ticket.entries.allSatisfy { $0.device == ticket.apply_device && $0.inode > 0 && $0.size >= 0 && $0.size <= maxTree })
-        try need(try collectPaths(root, device: attribution.filesystemDevice) == keys)
-        try verifyAppReceipts(context)
-        try validateLinks(ticket.entries)
+        try need(ticket.entries.count >= 9 && ticket.entries.count <= maxEntries && keys.count == ticket.entries.count, .paths)
+        try need(Set([base, base + "/FirstLogin", base + "/FirstLogin/seed.json", base + "/FirstLogin/GuestVPNBootstrap", agent] + apps.map { "Applications/" + $0 }).isSubset(of: keys), .paths)
+        try need(Set(ticket.entries.map(\.inode)).count == ticket.entries.count, .entry)
+        for entry in ticket.entries {
+            try need(entry.device == ticket.apply_device && entry.inode > 0, .entry)
+            try need(entry.size >= 0 && entry.size <= maxTree, .content)
+        }
+        try Failure.paths.checking { try need(try collectPaths(root, device: attribution.filesystemDevice) == keys) }
+        try Failure.bundles.checking {
+            try verifyAppReceipts(context)
+            try validateLinks(ticket.entries)
+        }
         var bytes: Int64 = 0
         for entry in ticket.entries {
-            _ = try checkEntry(entry, root: root, device: attribution.filesystemDevice, verify: verify, simulate: simulate, ownersEnabled: attribution.ownersEnabled)
-            if entry.kind == "file" { bytes += entry.size; try need(bytes <= maxTree) }
+            _ = try checkEntry(entry, root: root, device: attribution.filesystemDevice, verify: verify, simulate: simulate)
+            if entry.kind == "file" { bytes += entry.size; try need(bytes <= maxTree, .content) }
         }
         // Fresh user accounts or Setup Assistant completion disqualify the stage.
-        let users = try parentAt(root, "Users/Shared", device: attribution.filesystemDevice).0
-        try need(Set(try names(users)).isSubset(of: ["Shared", ".localized"]))
-        let db = try parentAt(root, "private/var/db/.AppleSetupDone", device: attribution.filesystemDevice).0
-        try absent(db, ".AppleSetupDone")
-        let operation = verify ? "verify" : "apply"
-        try absent(context.directory, operation + ".started")
-        try absent(context.directory, operation + ".receipt.json")
-        if verify {
-            let priorFD = try openChild(context.directory, "apply.receipt.json")
-            let priorInfo = try info(priorFD.value)
-            try need(priorInfo.st_uid == context.caller && priorInfo.st_mode & 0o7777 == 0o600 && priorInfo.st_nlink == 1)
-            let prior = try object(read(priorFD, limit: 65536))
-            try need(prior["ticket_sha256"] as? String == context.digest && prior["operation_id"] as? String == ticket.operation_id && prior["operation"] as? String == "apply")
-            guard let priorGeneration = integer(prior["attachment_generation"]), priorGeneration > 0 else { throw Failure.rejected }
-            try need(priorGeneration != Int64(attribution.generation) && integer(prior["schema"]) == 1 && integer(prior["entry_count"]) == Int64(ticket.entries.count))
-            try need(bool(prior["fixture_only"], simulate) && bool(prior["metadata_applied"], !simulate)
-                     && bool(prior["persistent_ownership_verified"], false) && bool(prior["readonly_owners_on"], false)
-                     && prior["helper_contract"] as? String == buildContract)
+        try Failure.stageState.checking {
+            let users = try parentAt(root, "Users/Shared", device: attribution.filesystemDevice).0
+            try need(Set(try names(users)).isSubset(of: ["Shared", ".localized"]))
+            let db = try parentAt(root, "private/var/db/.AppleSetupDone", device: attribution.filesystemDevice).0
+            try absent(db, ".AppleSetupDone")
         }
-        // A partial failure consumes this one operation. No retry or rollback.
-        try writePrivate(context.directory, operation + ".started", bytes: receiptBytes(["ticket_sha256": context.digest, "operation": operation]), owner: 0, group: 0)
+        let operation = verify ? "verify" : "apply"
+        try Failure.receipt.checking {
+            try absent(context.directory, operation + ".started")
+            try absent(context.directory, operation + ".receipt.json")
+            if verify {
+                let priorFD = try openChild(context.directory, "apply.receipt.json")
+                let priorInfo = try info(priorFD.value)
+                try need(priorInfo.st_uid == context.caller && priorInfo.st_mode & 0o7777 == 0o600 && priorInfo.st_nlink == 1)
+                let prior = try object(read(priorFD, limit: 65536))
+                try need(prior["ticket_sha256"] as? String == context.digest && prior["operation_id"] as? String == ticket.operation_id && prior["operation"] as? String == "apply")
+                guard let priorGeneration = integer(prior["attachment_generation"]), priorGeneration > 0 else { throw Failure.rejected }
+                try need(priorGeneration != Int64(attribution.generation) && integer(prior["schema"]) == 1 && integer(prior["entry_count"]) == Int64(ticket.entries.count))
+                try need(bool(prior["fixture_only"], simulate) && bool(prior["metadata_applied"], !simulate)
+                         && bool(prior["persistent_ownership_verified"], false) && bool(prior["readonly_owners_on"], false)
+                         && prior["helper_contract"] as? String == buildContract)
+            }
+            // A partial failure consumes this one operation. No retry or rollback.
+            try writePrivate(context.directory, operation + ".started", bytes: receiptBytes(["ticket_sha256": context.digest, "operation": operation]), owner: 0, group: 0)
+        }
         try stageState(context)
-        try need(try nativeMetadata(context, root: root, verify: verify) == attribution)
+        try Failure.disk.checking { try need(try nativeMetadata(context, root: root, verify: verify) == attribution) }
         if !verify {
             for entry in ticket.entries.sorted(by: { $0.path.count > $1.path.count }) {
-                let (parent, name, fd) = try checkEntry(entry, root: root, device: attribution.filesystemDevice, verify: false, simulate: simulate, ownersEnabled: attribution.ownersEnabled)
+                let (parent, name, fd) = try checkEntry(entry, root: root, device: attribution.filesystemDevice, verify: false, simulate: simulate)
                 let desired = try desired(entry)
                 #if !GOLD_OWNERSHIP_FIXTURE
-                if let fd { try need(fchown(fd.value, desired.0, desired.1) == 0) }
-                else { try need(fchownat(parent.value, name, desired.0, desired.1, AT_SYMLINK_NOFOLLOW) == 0) }
+                if let fd { try need(fchown(fd.value, desired.0, desired.1) == 0, .mutation) }
+                else { try need(fchownat(parent.value, name, desired.0, desired.1, AT_SYMLINK_NOFOLLOW) == 0, .mutation) }
                 #else
                 _ = (parent, name, fd, desired) // Simulation: never changes owner.
                 #endif
             }
         }
         try stageState(context)
-        try need(try nativeMetadata(context, root: root, verify: verify) == attribution)
-        try need(try collectPaths(root, device: attribution.filesystemDevice) == keys)
+        try Failure.disk.checking { try need(try nativeMetadata(context, root: root, verify: verify) == attribution) }
+        try Failure.paths.checking { try need(try collectPaths(root, device: attribution.filesystemDevice) == keys) }
         let receipt: [String: Any] = ["schema": 1, "operation_id": ticket.operation_id,
             "ticket_sha256": context.digest, "operation": operation,
             "attachment_generation": attribution.generation, "entry_count": ticket.entries.count,
@@ -709,7 +752,9 @@ enum GuestOwnership {
             "persistent_ownership_verified": verify && !simulate,
             "readonly_owners_on": verify, "guest_started": false, "published": false, "helper_contract": buildContract,
             "authorization": simulate ? "fixture_no_authorization" : "macos_system_administrator"]
-        try writePrivate(context.directory, operation + ".receipt.json", bytes: receiptBytes(receipt), owner: context.caller, group: context.callerGroup)
+        try Failure.receipt.checking {
+            try writePrivate(context.directory, operation + ".receipt.json", bytes: receiptBytes(receipt), owner: context.caller, group: context.callerGroup)
+        }
     }
 }
 
@@ -717,18 +762,20 @@ enum GuestOwnership {
     static func main() {
         umask(0o077)
         do {
-            try GuestOwnership.need(CommandLine.arguments.count == 3 && ["--apply", "--verify"].contains(CommandLine.arguments[2]))
+            try GuestOwnership.need(CommandLine.arguments.count == 3 && ["--apply", "--verify"].contains(CommandLine.arguments[2]), .invocation)
             #if GOLD_OWNERSHIP_FIXTURE
             let prefix = "/private/tmp/gold-ownership-tests-"
-            try GuestOwnership.need(CommandLine.arguments[1].hasPrefix(prefix))
+            try GuestOwnership.need(CommandLine.arguments[1].hasPrefix(prefix), .invocation)
             #else
-            try GuestOwnership.need(getuid() == 0 && geteuid() == 0)
+            try GuestOwnership.need(getuid() == 0 && geteuid() == 0, .invocation)
             #endif
-            let context = try GuestOwnership.load(CommandLine.arguments[1])
+            let context = try GuestOwnership.Failure.ticket.checking { try GuestOwnership.load(CommandLine.arguments[1]) }
             try GuestOwnership.execute(context, verify: CommandLine.arguments[2] == "--verify")
             #if GOLD_OWNERSHIP_FIXTURE
             print("fixture_metadata_simulation_completed")
             #endif
+        } catch let failure as GuestOwnership.Failure {
+            exit(failure.rawValue)
         } catch {
             // No original errors, paths, credentials or user-controlled text.
             exit(2)

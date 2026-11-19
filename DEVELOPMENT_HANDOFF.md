@@ -60,7 +60,8 @@
 | `system-authorization-launch-failed` | 无法启动 `/usr/bin/osascript` | 检查控制器进程的运行环境。 |
 | `system-authorization-interaction-not-allowed` | 系统不允许当前进程弹出交互窗口（-60007） | 在已登录的前台桌面会话里打开管理器。长期方案是由原生 App 发起授权，与下文 B2 一起做。 |
 | `system-authorization-user-cancelled` / `-authorization-denied` | 弹窗出现过，但被取消或密码错误。现在任务会先暂停、等你选择重试（见下文「授权被拒后原地重试」）；只有放弃、超时或第 3 次仍被拒才会以这个代码失败 | 弹窗标题显示为「osascript」，容易被忽略。改由原生 App 发起。 |
-| `system-authorization-helper-exit-2` | 已授权，helper 以 root 运行后拒绝执行 | helper 对**所有**错误都 `exit(2)`（[GuestOwnershipHelper.swift:734](<GuestOwnershipHelper.swift:734>)），目前无法细分。下一步需要给 helper 加固定的失败类别。重点检查：[argv[0] 与票据路径比较](<GuestOwnershipHelper.swift:316>)、票据与属主检查、`config.json` 写锁必须仍由父进程持有。 |
+| `system-authorization-helper-exit-2` | 旧助手的通用失败，或新版未分类错误 | 不反推成具体原因。对已终止的任务不要重放票据、改阶段或覆盖回执。 |
+| `system-authorization-helper-exit-20` 至 `-32` | 新助手的固定失败类别；结合 `failed_step` 区分写入/复核 | 见[属主助手诊断表](<GUEST_OWNERSHIP.md#native-failure-categories>)。同一编号只定位检查类别，不证明可以安全重试。 |
 | `system-authorization-helper-exit-126` / `-127` | shell 无法执行 helper | 检查 helper 的路径、权限和所在卷。 |
 | `system-authorization-helper-exit-N`（N≥128） | helper 被信号终止 | — |
 | `system-authorization-authorization-error-N` | 其他系统授权错误 | 按错误号查 Security 框架的状态码。 |
@@ -185,7 +186,7 @@
    - **TOCTOU 风险**：[`request_authorization`](<guest_ownership.py:624>) 先以普通用户身份校验 helper，再让 root 执行同一个用户可写路径。等待输入密码期间，同 UID 的进程可以替换这个文件。
      - **修法**：在 root 脚本里先把 helper 复制到只有 root 可写的目录，用 root 重新计算 sha256，比对一致后再执行。
      - **注意**：helper 会检查 [`argv[0] == ticket.helper`](<GuestOwnershipHelper.swift:316>)，需要同步修改这项检查。
-   - **改由原生 App 发起授权**（Authorization Services），并让 helper 输出固定的失败类别，不再一律 `exit(2)`。
+   - **改由原生 App 发起授权**（Authorization Services）仍待办。helper 固定失败类别已实现，历史任务的 `exit(2)` 无法追溯。
 2. **移除实验性代码（D）。** [NativeApp.swift](<NativeApp.swift>) 仍然注册了账户初始化桥：包括密码表单、辅助功能和屏幕录制权限请求、同意 macOS 许可的勾选框，前端也能触发它；但 README 写的是「未交付」。另外，[deploy_rebuild_update.py](<deploy_rebuild_update.py>) 的文件清单缺少 `oneclick.py` 等文件，执行后会让已安装的 App 无法启动，而且它用 `assert` 做安全检查。
 3. **非破坏性恢复和首次启动仍未验收。**
    - 已进入私有配置写盘后才失败的任务，与主动选择「先不配置 VPN」的干净等待状态不同。

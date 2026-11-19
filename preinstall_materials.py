@@ -1,7 +1,8 @@
 """Owned, durable preparation of the complete reviewed original GUI material set.
 
-No VM lifecycle, server, app execution, automatic retry, cache adoption or import
-side effects. Caller keeps the lifecycle lock and private root exclusive through
+No VM lifecycle, server, app execution, automatic retry, adoption of foreign or
+partial caches, or import side effects. Only this store's own completed attempts
+can be reused, and only after full native revalidation (load_reusable). Caller keeps the lifecycle lock and private root exclusive through
 subsequent installation. Native trust checks are mandatory, including on reload.
 """
 from contextlib import contextmanager
@@ -17,6 +18,7 @@ import re
 import stat
 import uuid
 
+import error_codes
 import guest_app_artifacts as artifacts
 from guest_app_pins import reviewed_manifests
 from offline_install import Material, PRODUCTS, APP_NAMES, validate_material_set
@@ -318,11 +320,14 @@ class MaterialManager:
         return {'schema': SCHEMA, 'store_id': self.store['store_id'], 'attempt_id': attempt_id,
                 'manifest_sha256': [m.manifest_sha256 for m in self.manifests]}
 
-    def _notify(self, stage, product=None):
+    def _notify(self, stage, product=None, completed_bytes=None, total_bytes=None):
         if self.progress is not None:
+            event = {'attempt_id': self.last_attempt_id, 'stage': stage,
+                     'product': product, 'resume_supported': False}
+            if completed_bytes is not None:
+                event.update(completed_bytes=completed_bytes, total_bytes=total_bytes)
             try:
-                self.progress({'attempt_id': self.last_attempt_id, 'stage': stage,
-                               'product': product, 'resume_supported': False})
+                self.progress(event)
             except Exception:
                 # Observers do not control transaction success or inject diagnostics.
                 pass
@@ -379,6 +384,59 @@ class MaterialManager:
                 'evidence_sha256': {name: _file_hash(evidence / name) for name in
                                     ('manifest.json', 'download.json', 'verification.json')}}
 
+    def _byte_progress(self, product):
+        """Throttled byte progress for one download: about every 2%, plus the end."""
+        last = [None]
+        def report(done, total):
+            if type(done) is not int or done < 0 or not (total is None or (type(total) is int and total > 0)):
+                return
+            step = max(total // 50, 1) if total else 8 * 1024 ** 2
+            if last[0] is not None and done - last[0] < step and done != total:
+                return
+            last[0] = done
+            self._notify('downloading', product, done, total)
+        return report
+
+    def load_reusable(self) -> tuple[Material, ...]:
+        """Newest completed attempt of THIS store for the current manifests, revalidated.
+
+        Candidates are attempts whose signed start record matches this store and
+        the current reviewed manifests, with a signed completion record and no
+        failure record. Each is rebuilt by load(): full hashing plus native
+        signature, notarization and quarantine checks, every time. A candidate
+        that fails is skipped and left exactly as found (never repaired). Raises
+        'material-cache-miss' when none passes; callers then download afresh.
+        """
+        scan_limit, tries = 256, 3
+        _need(capability_report()['ready'], 'unsupported-material-capability')
+        candidates = []
+        try:
+            with self._lock():
+                with os.scandir(_directory(self.root / 'attempts')) as entries:
+                    for index, entry in enumerate(entries):
+                        _need(index < scan_limit, 'too-many-material-attempts')
+                        if _ID.fullmatch(entry.name) is None or not entry.is_dir(follow_symlinks=False):
+                            continue
+                        try:
+                            attempt = self._attempt(entry.name)
+                            if (os.path.lexists(attempt / 'failure.json')
+                                    or not os.path.lexists(attempt / 'complete.json')):
+                                continue  # Failed or interrupted: never adopted.
+                            candidates.append((_regular(attempt / 'complete.json').st_mtime_ns, entry.name))
+                        except Exception:
+                            continue  # Other manifests/store or unreadable: not a candidate.
+        except MaterialPreparationError:
+            raise
+        except Exception:
+            raise MaterialPreparationError('material-cache-miss') from None
+        for _, attempt_id in sorted(candidates, reverse=True)[:tries]:
+            try:
+                return self.load(attempt_id)
+            except MaterialPreparationError:
+                continue
+        self.last_attempt_id = None
+        raise MaterialPreparationError('material-cache-miss')
+
     def prepare(self) -> tuple[Material, ...]:
         """Fresh attempt only. Returns the exact complete tuple[Material, ...].
 
@@ -395,7 +453,7 @@ class MaterialManager:
             except Exception:
                 raise MaterialPreparationError('attempt-output-already-exists-or-unsafe') from None
             self.last_attempt_id = attempt_id
-            stage_name = 'initializing'
+            stage_name, product = 'initializing', None
             try:
                 self._record(attempt / 'attempt.json', self._start(attempt_id))
                 for name in ('cache', 'staging', 'evidence'):
@@ -409,7 +467,8 @@ class MaterialManager:
                     stage_name = 'downloading'
                     self._checkpoint(stage_name, product)
                     receipt = artifacts.download_artifact(manifest, cache, loopback_proxy=self.loopback_proxy,
-                                                          deadline_seconds=self.deadline_seconds)
+                                                          deadline_seconds=self.deadline_seconds,
+                                                          progress=self._byte_progress(product))
                     raw = self._receipt(manifest, cache, receipt)
                     self._evidence(receipt, evidence / 'download.json')
                     stage_name = 'quarantining'
@@ -430,7 +489,7 @@ class MaterialManager:
                     self._evidence(verified, evidence / 'verification.json')
                     self._record(evidence / 'material.json',
                                  self._binding(manifest, receipt, stage, apps, verified, evidence))
-                stage_name = 'verifying-complete-set'
+                stage_name, product = 'verifying-complete-set', None
                 self._checkpoint(stage_name)
                 complete = dict(self._start(attempt_id), status='prepared',
                                 material_sha256=[_file_hash(attempt / 'evidence' / m.product / 'material.json')
@@ -443,10 +502,15 @@ class MaterialManager:
                 self._notify('prepared')
                 return materials
             except BaseException as error:
-                code = error.code if isinstance(error, MaterialPreparationError) else stage_name + '-failed'
+                if isinstance(error, MaterialPreparationError):
+                    code = error.code
+                elif isinstance(error, artifacts.ArtifactError) and error.args and error_codes.is_code(error.args[0]):
+                    code = error.args[0]  # Fixed artifact cause, e.g. download-timeout.
+                else:
+                    code = stage_name + '-failed'
                 failure = dict(self._start(attempt_id), status='cancelled-retained' if code ==
                                'preparation-cancelled' else 'failed-retained', stage=stage_name,
-                               code=code, resume_supported=False)
+                               code=code, product=product, resume_supported=False)
                 try:
                     self._record(attempt / 'failure.json', failure)
                 except Exception:
@@ -454,7 +518,9 @@ class MaterialManager:
                 self._notify(failure['status'])
                 if isinstance(error, (KeyboardInterrupt, SystemExit)):
                     raise
-                raise MaterialPreparationError(code, attempt_id) from None
+                failed = MaterialPreparationError(code, attempt_id)
+                failed.product = product  # Which material failed; a fixed product key.
+                raise failed from None
 
     def _reconstruct(self, attempt, complete):
         for name in ('cache', 'staging', 'evidence'):

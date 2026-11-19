@@ -239,8 +239,9 @@ class PreparationTests(unittest.TestCase):
     def test_explicit_credential_free_loopback_is_forwarded_not_recorded(self):
         manager = self.manager(loopback_proxy='http://127.0.0.1:19080', deadline_seconds=99)
         manager.prepare()
-        self.assertTrue(all(call[2] == {'loopback_proxy': 'http://127.0.0.1:19080', 'deadline_seconds': 99}
-                            for call in self.downloads))
+        self.assertTrue(all({k: v for k, v in call[2].items() if k != 'progress'} ==
+                            {'loopback_proxy': 'http://127.0.0.1:19080', 'deadline_seconds': 99}
+                            and callable(call[2]['progress']) for call in self.downloads))
         self.assertNotIn('19080', json.dumps(manager.summary(manager.last_attempt_id)))
 
     def test_untrusted_proxy_inputs_rejected_without_downloads(self):
@@ -295,6 +296,92 @@ class PreparationTests(unittest.TestCase):
                 manager.prepare()
         self.assertEqual((attempt / 'complete.json').read_bytes(), before)
         self.assertFalse((attempt / 'failure.json').exists())
+
+    # --- Failure cause, byte progress and reuse of this store's verified attempts. ---
+
+    def test_download_failure_keeps_the_transfer_cause_and_failed_product(self):
+        manager = self.manager(progress=self.events.append)
+        real = self.download
+        def fail_second(manifest, cache, **kwargs):
+            if manifest.product == 'clashVergeRev':
+                raise artifacts.ArtifactError('download-timeout')
+            return real(manifest, cache, **kwargs)
+        with patch.object(artifacts, 'download_artifact', side_effect=fail_second):
+            with self.assertRaisesRegex(m.MaterialPreparationError, '^download-timeout$') as caught:
+                manager.prepare()
+        self.assertEqual((caught.exception.product, caught.exception.attempt_id),
+                         ('clashVergeRev', manager.last_attempt_id))
+        failure = manager._record_read(self.root / 'attempts' / manager.last_attempt_id / 'failure.json')
+        self.assertEqual((failure['stage'], failure['code'], failure['product']),
+                         ('downloading', 'download-timeout', 'clashVergeRev'))
+        self.assertEqual(manager.summary(manager.last_attempt_id)['status'], 'failed-retained')
+        for error in (artifacts.ArtifactError('Not A Code /Users/x'), RuntimeError('download-timeout')):
+            with self.subTest(error=type(error).__name__), \
+                    patch.object(artifacts, 'download_artifact', side_effect=error):
+                with self.assertRaisesRegex(m.MaterialPreparationError, '^downloading-failed$') as caught:
+                    self.manager().prepare()
+                self.assertEqual(caught.exception.product, 'ccbaga')
+
+    def test_download_progress_names_the_product_and_bytes_and_is_throttled(self):
+        total = 100 * 1024 ** 2
+        real = self.download
+        def download(manifest, cache, **kwargs):
+            for done in range(0, total + 1, 256 * 1024):
+                kwargs['progress'](done, total)
+            return real(manifest, cache, **{k: v for k, v in kwargs.items() if k != 'progress'})
+        manager = self.manager(progress=self.events.append)
+        with patch.object(artifacts, 'download_artifact', side_effect=download):
+            manager.prepare()
+        for product in m.PRODUCTS:
+            with self.subTest(product=product):
+                byte_events = [e for e in self.events if e['product'] == product and 'completed_bytes' in e]
+                self.assertTrue(all(e['stage'] == 'downloading' and e['total_bytes'] == total for e in byte_events))
+                self.assertEqual(byte_events[-1]['completed_bytes'], total)
+                self.assertLessEqual(len(byte_events), 52)  # About every 2%, not every chunk.
+                self.assertGreaterEqual(len(byte_events), 10)
+
+    def test_reuse_revalidates_the_newest_complete_attempt_without_downloading(self):
+        _, older, older_attempt = self.prepared()
+        _, newer, newer_attempt = self.prepared()
+        os.utime(older_attempt / 'complete.json', ns=(1, 1))  # Make the order explicit.
+        downloads, calls = len(self.downloads), len(self.tool_calls)
+        reader = self.manager(progress=self.events.append)
+        self.assertEqual(reader.load_reusable(), newer)
+        self.assertEqual(reader.last_attempt_id, newer_attempt.name)
+        self.assertEqual(len(self.downloads), downloads)
+        self.assertEqual(len(self.tool_calls), calls + 4 * 4)  # Full native revalidation, every time.
+
+    def test_reuse_skips_failed_or_corrupt_attempts_and_never_repairs_them(self):
+        _, older, older_attempt = self.prepared()
+        _, newer, newer_attempt = self.prepared()
+        os.utime(older_attempt / 'complete.json', ns=(1, 1))
+        changed = newer[0].app_paths[0] / 'Contents/Resources/fixture.txt'
+        changed.write_bytes(b'changed source')
+        with patch.object(artifacts, 'download_artifact', side_effect=RuntimeError('network down')):
+            with self.assertRaises(m.MaterialPreparationError):
+                self.manager().prepare()  # A failed attempt is never a candidate.
+        downloads = len(self.downloads)
+        reader = self.manager()
+        self.assertEqual(reader.load_reusable(), older)
+        self.assertEqual(reader.last_attempt_id, older_attempt.name)
+        self.assertEqual(changed.read_bytes(), b'changed source')  # Left as found, not repaired.
+        Path(older[0].download.artifact_path).write_bytes(b'changed raw bytes')
+        with self.assertRaisesRegex(m.MaterialPreparationError, '^material-cache-miss$'):
+            self.manager().load_reusable()
+        self.assertEqual(len(self.downloads), downloads)
+
+    def test_reuse_needs_the_current_reviewed_manifests_and_this_store(self):
+        self.prepared()
+        changed = tuple(dataclasses.replace(v, maximum_bundle_entries=v.maximum_bundle_entries - 1) if v.product == 'ccbaga' else v
+                        for v in self.manifests)
+        calls = len(self.tool_calls)
+        with self.assertRaisesRegex(m.MaterialPreparationError, '^material-cache-miss$'):
+            m.MaterialManager(self.root, manifests=changed).load_reusable()
+        self.assertEqual(len(self.tool_calls), calls)  # No native work for a non-candidate.
+        empty = self.base / 'other-store'
+        empty.mkdir(mode=0o700)
+        with self.assertRaisesRegex(m.MaterialPreparationError, '^material-cache-miss$'):
+            m.MaterialManager(empty, manifests=self.manifests).load_reusable()
 
     def test_modified_raw_file_rejected_even_with_valid_saved_records(self):
         manager, materials, _ = self.prepared()
@@ -463,8 +550,10 @@ class PreparationTests(unittest.TestCase):
     def test_native_signature_rejection_retains_failure(self):
         manager = self.manager()
         with patch.object(artifacts, '_tool', side_effect=artifacts.ArtifactError('verification-tool-rejected')):
-            with self.assertRaisesRegex(m.MaterialPreparationError, '^verifying-failed$'):
+            # The artifact layer's fixed cause is kept, not reduced to "<stage>-failed".
+            with self.assertRaisesRegex(m.MaterialPreparationError, '^verification-tool-rejected$') as caught:
                 manager.prepare()
+        self.assertEqual(caught.exception.product, 'ccbaga')
         self.assert_rejected_load(manager)
 
     def test_full_set_recheck_catches_changes_to_earlier_product(self):

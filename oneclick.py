@@ -36,6 +36,11 @@ KEYS = frozenset(('name', 'cpu', 'memory_gib', 'disk_gib', 'ipsw', 'vpn_configur
 RESUME_KEYS = frozenset(('job_id', 'vpn_configuration_id', 'acknowledge_normalization') + ACKS[1:])
 PAUSE_PHASE = 'awaiting_vpn_configuration'
 RESUME_QUEUED = 'vpn_resume_queued'
+MIB = 1024 ** 2
+# Fixed product keys of the reviewed application materials and their UI names.
+MATERIAL_LABELS = {'ccbaga': 'CCBaga', 'clashVergeRev': 'Clash Verge', 'claudeDesktop': 'Claude Desktop'}
+_MATERIAL_STAGES = {'quarantining': '正在为 {} 标记下载来源', 'extracting': '正在解包 {}',
+                    'verifying': '正在校验 {} 的签名与公证', 'revalidating': '正在重新校验已缓存的 {}'}
 STAGE_FILES = ('disk.img', 'config.json', 'nvram.bin', '.clean-vm-installer.complete.json', '.offline-preinstall.complete.json')
 
 
@@ -381,7 +386,7 @@ class NativeServices:
     def prepare(self, request, update):
         import host_artifacts
         import host_tools
-        from preinstall_materials import MaterialManager
+        from preinstall_materials import MaterialManager, MaterialPreparationError
         c = self.context
         registry.private_dir(c.state / 'host-materials')
         registry.private_dir(c.state / 'tools')
@@ -400,9 +405,33 @@ class NativeServices:
         else:
             self.ipsw = host_artifacts.import_local('ipsw', Path(request['ipsw']), c.state / 'host-materials', progress=progress)
         registry.private_dir(c.state / 'application-materials')
-        manager = MaterialManager(c.state / 'application-materials', loopback_proxy=request['download_loopback_proxy'])
-        self.materials = manager.prepare()
+        def material_progress(event):
+            # Observer data is untrusted: only fixed product keys and integers are shown.
+            label = MATERIAL_LABELS.get(event.get('product')) if type(event) is dict and type(event.get('product')) is str else None
+            if label is None:
+                if type(event) is dict and event.get('stage') == 'verifying-complete-set':
+                    update('acquiring', '正在整体复核全部应用；不连接 VPN 节点。', None)
+                return
+            stage, done, total = event.get('stage'), event.get('completed_bytes'), event.get('total_bytes')
+            if stage == 'downloading' and type(done) is int and done >= 0:
+                if type(total) is int and total > 0:
+                    update('acquiring', '正在下载 %s（%d/%d MiB）；不连接 VPN 节点。' % (label, done // MIB, total // MIB),
+                           min(done / total, 1.0))
+                else:
+                    update('acquiring', '正在下载 %s（%d MiB）；不连接 VPN 节点。' % (label, done // MIB), None)
+            elif stage in _MATERIAL_STAGES:
+                update('acquiring', _MATERIAL_STAGES[stage].format(label) + '；不连接 VPN 节点。', None)
+        manager = MaterialManager(c.state / 'application-materials', loopback_proxy=request['download_loopback_proxy'],
+                                  progress=material_progress)
+        try:
+            # This store's own completed download, fully re-verified; otherwise download afresh.
+            self.materials, source = manager.load_reusable(), 'reused'
+        except MaterialPreparationError:
+            self.materials, source = manager.prepare(), 'downloaded'
         self.material_attempt_id = manager.last_attempt_id
+        update('acquiring', '应用材料已就绪（%s）；尚未创建或启动客机。' %
+               ('复用本机已校验的缓存，已重新完整校验' if source == 'reused' else '本次重新下载'),
+               None, materials_source=source)
         # The controller may use only this explicit statically verified Tart binding.
         registry.write_private(c.state / 'tart-tool.json', {
             'version': 1, 'executable_path': str(self.tart.executable_path),
@@ -749,11 +778,13 @@ def _worker_failure(c, update, error):
     inner = inner if type(inner) is dict else {}
     failed_step = inner.get('failed_step') if error_codes.is_step(inner.get('failed_step')) else None
     failure_reason = inner.get('failure_code') if error_codes.is_code(inner.get('failure_code')) else None
+    product = getattr(error, 'product', None)
+    failed_product = product if type(product) is str and product in MATERIAL_LABELS else None
     message = ('原始材料下载或校验未完成，尚未创建虚拟磁盘；已保留下载，不会自动重试。'
                if phase == 'acquiring' and not value.get('stage_path') else
                '预装未完成；保留所有暂存文件，不自动覆盖重试。请查看失败步骤。')
     return update('failed', message, failure_code=code, failed_phase=phase,
-                  failed_step=failed_step, failure_reason=failure_reason,
+                  failed_step=failed_step, failure_reason=failure_reason, failed_product=failed_product,
                   recovery_required=bool(value.get('stage_path')) or (c.jobdir / 'commit.json').exists(),
                   desktop_verified=False, vpn_connected=False, network_independently_verified=False)
 

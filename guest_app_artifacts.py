@@ -11,6 +11,7 @@ from the binary under examination. See GUEST_APP_ARTIFACTS.md.
 import dataclasses
 import fcntl
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -26,6 +27,8 @@ import urllib.request
 import unicodedata
 import uuid
 from xml.parsers.expat import ExpatError
+
+import error_codes
 
 
 MAX_DOWNLOAD_BYTES = 2 * 1024 ** 3
@@ -391,9 +394,20 @@ def _publish_partial(manifest, cache, partial, fd, value, size, final_host, etag
                            manifest.known_sha256 is not None, final_host, etag=etag)
 
 
+def _report(progress, done, total):
+    if progress is not None:
+        try:
+            progress(done, total)
+        except Exception:
+            pass  # Observers never control or break the transfer.
+
+
 def download_artifact(manifest, cache_dir, *, loopback_proxy=None,
-                      deadline_seconds=DEFAULT_DOWNLOAD_DEADLINE_SECONDS):
+                      deadline_seconds=DEFAULT_DOWNLOAD_DEADLINE_SECONDS, progress=None):
     """Explicit bounded raw download; no download happens on import.
+
+    progress(completed_bytes, total_bytes_or_None) is called after each chunk.
+    A failed transfer raises a fixed cause (error_codes.network_failure_code).
 
     Failing attempts retain a 0600 random .partial (no automatic resume/reuse). Only complete
     size/hash-checked bytes are atomically published without overwriting a file.
@@ -403,6 +417,7 @@ def download_artifact(manifest, cache_dir, *, loopback_proxy=None,
     """
     _need(isinstance(manifest, ArtifactManifest), 'invalid-manifest')
     manifest.__post_init__()
+    _need(progress is None or callable(progress), 'invalid-progress-callback')
     deadline = _deadline(deadline_seconds)
     cache = _checked_directory(cache_dir, private=True, create=True)
     token = uuid.uuid4().hex
@@ -420,6 +435,7 @@ def download_artifact(manifest, cache_dir, *, loopback_proxy=None,
             length = _response_length(response)
             if length is not None:
                 _need(0 < length <= manifest.maximum_download_bytes, 'download-too-large')
+            expected = length if length is not None else manifest.declared_size_bytes
             while True:
                 _need(time.monotonic() < deadline, 'download-deadline-exceeded')
                 chunk = response.read(min(CHUNK_BYTES, manifest.maximum_download_bytes - total + 1))
@@ -429,6 +445,7 @@ def download_artifact(manifest, cache_dir, *, loopback_proxy=None,
                 _need(total <= manifest.maximum_download_bytes, 'download-too-large')
                 output.write(chunk)
                 digest.update(chunk)
+                _report(progress, total, expected)
             _need(total > 0 and (length is None or total == length), 'truncated-download')
             _need(manifest.declared_size_bytes is None or total == manifest.declared_size_bytes,
                   'declared-size-mismatch')
@@ -440,8 +457,8 @@ def download_artifact(manifest, cache_dir, *, loopback_proxy=None,
                                     _https_url(current_url).hostname)
     except ArtifactError:
         raise
-    except (OSError, ValueError, urllib.error.URLError):
-        raise ArtifactError('download-failed') from None
+    except (OSError, ValueError, urllib.error.URLError, http.client.HTTPException) as error:
+        raise ArtifactError(error_codes.network_failure_code(error, 'download-failed')) from None
     finally:
         if response is not None:
             response.close()
@@ -561,8 +578,8 @@ def resume_artifact(manifest, cache_dir, partial_path, *, loopback_proxy=None,
                                     _https_url(current_url).hostname, etag)
     except ArtifactError:
         raise
-    except (OSError, ValueError, urllib.error.URLError):
-        raise ArtifactError('resume-failed') from None
+    except (OSError, ValueError, urllib.error.URLError, http.client.HTTPException) as error:
+        raise ArtifactError(error_codes.network_failure_code(error, 'resume-failed')) from None
     finally:
         if response is not None:
             response.close()

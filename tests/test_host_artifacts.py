@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+import socket
 import stat
 import tempfile
 from types import MappingProxyType
@@ -326,6 +327,17 @@ class HostArtifactTests(unittest.TestCase):
             with self.assertRaises(artifacts.ArtifactError):
                 self.acquire()
         self.assert_not_accepted()
+
+    def test_transfer_failure_cause_is_a_fixed_code(self):
+        for error, code in ((urllib.error.URLError(socket.timeout('SECRET')), 'download-timeout'),
+                            (urllib.error.URLError(ConnectionRefusedError(61, 'SECRET')), 'download-connect-failed')):
+            with self.subTest(code=code):
+                self.opener.open.side_effect = error
+                with self.assertRaises(artifacts.ArtifactError) as raised:
+                    self.acquire()
+                self.assertEqual(str(raised.exception), code)
+                self.assertTrue(raised.exception.__suppress_context__)
+                self.assertIsNotNone(raised.exception.attempt_id)
 
     def test_public_error_does_not_include_signed_url_or_credentials(self):
         self.opener.open.side_effect = urllib.error.URLError('https://user:password@host/?jwt=secret')

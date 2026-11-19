@@ -19,6 +19,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
+import error_codes
 import quarantine_policy
 
 
@@ -631,10 +632,11 @@ def _acquire(spec_key, private_cache_root, *, source=None, loopback_proxy=None,
         return receipt
     except ArtifactError as error:
         raise ArtifactError(error.code, attempt or error.attempt_id) from None
-    except Exception:
+    except Exception as error:
         # urllib/OS/JSON exceptions can contain private paths, credentials or CDN
-        # signed queries. Never return their text or an exception cause.
-        raise ArtifactError('artifact-io-failed', attempt) from None
+        # signed queries. Never return their text or an exception cause; only a
+        # fixed transfer category (timeout, dropped connection, DNS, TLS...).
+        raise ArtifactError(error_codes.network_failure_code(error, 'artifact-io-failed'), attempt) from None
     finally:
         if fd is not None:
             try:

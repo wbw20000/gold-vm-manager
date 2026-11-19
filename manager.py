@@ -42,7 +42,7 @@ PREINSTALL_PHASE_FIELDS = frozenset(('id', 'mode', 'name', 'phase', 'pid', 'prog
     'guest_started', 'desktop_verified', 'host_credentials_copied', 'user_vpn_configuration_supplied',
     'vpn_configuration_staged', 'vpn_connected', 'network_independently_verified', 'published',
     'needs_host_security_authorization', 'recovery_required', 'failure_code', 'failed_phase',
-    'failed_step', 'failure_reason', 'authorization_retry'))
+    'failed_step', 'failure_reason', 'authorization_retry', 'failed_product', 'materials_source'))
 HOME = Path.home()
 STATE_DIR = HOME / 'Library/Application Support/GoldVMManager'
 CONFIG_PATH = STATE_DIR / 'config.json'

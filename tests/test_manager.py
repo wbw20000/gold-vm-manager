@@ -335,6 +335,16 @@ class ControllerTests(PrivateFixture):
         self.assertNotIn('vpn_configuration', build)
         self.assertNotIn('stage_path', build)
 
+    def test_material_failure_and_source_are_public_fixed_fields(self):
+        self.assertTrue({'failed_product', 'materials_source'} <= m.PREINSTALL_PHASE_FIELDS)
+        job = {'id': 'a' * 32, 'mode': 'preinstall', 'name': 'material fixture', 'phase': 'failed',
+               'failed_phase': 'acquiring', 'failure_code': 'download-timeout', 'failed_product': 'ccbaga',
+               'materials_source': 'downloaded', 'system_restored': False}
+        self.controller.build_status = Mock(return_value=job)
+        build = self.controller.state()['build_job']
+        self.assertEqual((build['failure_code'], build['failed_product'], build['materials_source']),
+                         ('download-timeout', 'ccbaga', 'downloaded'))
+
     def test_paused_authorization_retry_is_public_only_while_waiting(self):
         retry = {'operation': 'apply', 'reason': 'system-authorization-user-cancelled', 'attempt': 1,
                  'max_attempts': 3, 'expires_at': '2026-11-18T23:30:00+00:00'}

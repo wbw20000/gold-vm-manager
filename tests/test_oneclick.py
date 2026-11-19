@@ -365,6 +365,9 @@ class WorkerTests(Fixture):
         self.materials = object()
         self.material_manager = self.patch(preinstall_materials, 'MaterialManager')
         self.material_manager.return_value.prepare.return_value = self.materials
+        # No verified cache by default: every fixture job downloads fresh materials.
+        self.material_manager.return_value.load_reusable.side_effect = \
+            preinstall_materials.MaterialPreparationError('material-cache-miss')
         self.app_changes = {}
         self.seed_changes = {}
         self.app = self.patch(offline_preinstall, 'preinstall_stage', side_effect=self.app_fixture)
@@ -623,7 +626,11 @@ class WorkerTests(Fixture):
         self.assertIsNone(vpn_store.load_configuration(self.state, self.other).bound_job)
         self.assertEqual(self.import_local.call_args[0], ('ipsw', self.restore_source, self.state / 'host-materials'))
         self.assertNotIn('loopback_proxy', self.import_local.call_args[1])
-        self.material_manager.assert_called_once_with(self.state / 'application-materials', loopback_proxy=self.proxy)
+        self.material_manager.assert_called_once_with(self.state / 'application-materials', loopback_proxy=self.proxy,
+                                                      progress=mock.ANY)
+        self.material_manager.return_value.load_reusable.assert_called_once_with()
+        self.material_manager.return_value.prepare.assert_called_once_with()
+        self.assertEqual(status['materials_source'], 'downloaded')
         self.assertEqual(self.runtime_prepare.call_args[1]['endpoints'], (('tcp', ENDPOINT, 443),))
         self.spawn.assert_called_once()  # Only the mocked isolated restore, no Tart/backend/boot.
         self.rename.assert_called_once()
@@ -787,6 +794,51 @@ class WorkerTests(Fixture):
         status = self.execute()
         self.assert_failed(status, 'awaiting_offline_preinstall', 'offline-preinstall-error', recovery=True)
         self.assertNotIn('NVRAM mismatch', json.dumps(status))
+
+    def test_verified_cached_materials_are_reused_before_any_download(self):
+        manager = self.material_manager.return_value
+        manager.load_reusable.side_effect = None
+        manager.load_reusable.return_value = self.materials
+        status = self.execute()
+        self.assertEqual(status['phase'], 'awaiting_first_desktop_acceptance', status)
+        self.assertEqual(status['materials_source'], 'reused')
+        manager.prepare.assert_not_called()
+
+    def test_material_progress_names_the_product_and_mebibytes(self):
+        seen = []
+        def prepare():
+            progress = self.material_manager.call_args.kwargs['progress']
+            mib = 1024 ** 2
+            for event in ({'attempt_id': 'a' * 32, 'stage': 'downloading', 'product': 'ccbaga',
+                           'resume_supported': False, 'completed_bytes': 101 * mib, 'total_bytes': 318 * mib},
+                          {'attempt_id': 'a' * 32, 'stage': 'verifying', 'product': 'clashVergeRev',
+                           'resume_supported': False},
+                          {'stage': 'downloading', 'product': '../' + SECRET, 'completed_bytes': 'x'}):
+                progress(event)
+                seen.append(self.job())
+            return self.materials
+        self.material_manager.return_value.prepare.side_effect = prepare
+        self.execute()
+        self.assertIn('正在下载 CCBaga（101/318 MiB）', seen[0]['message'])
+        self.assertAlmostEqual(seen[0]['progress'], 101 / 318)
+        self.assertIn('Clash Verge', seen[1]['message'])
+        self.assertIn('校验', seen[1]['message'])
+        self.assertNotIn('ipsw', seen[0]['message'] + seen[1]['message'])
+        self.assertNotIn(SECRET, json.dumps(seen))  # Untrusted observer data is never echoed.
+
+    def material_failure(self, product):
+        error = preinstall_materials.MaterialPreparationError('download-timeout', 'a' * 32)
+        error.product = product
+        self.material_manager.return_value.prepare.side_effect = error
+        status = self.execute()
+        self.assert_failed(status, 'acquiring', 'download-timeout', recovery=False)
+        return status
+
+    def test_material_failure_records_the_failed_product(self):
+        self.assertEqual(self.material_failure('clashVergeRev')['failed_product'], 'clashVergeRev')
+
+    def test_material_failure_never_records_an_unknown_product(self):
+        self.assertIsNone(self.material_failure('../' + SECRET)['failed_product'])
 
     def test_builtin_exception_text_is_never_a_failure_code(self):
         self.app.side_effect = ValueError(SECRET)

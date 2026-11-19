@@ -683,3 +683,31 @@ test('retry posts the exact decision once; abandon asks for confirmation before 
   assert.equal(node('confirm-dialog').open, false);
   assert.doesNotMatch(appSource.slice(appSource.indexOf('function pausedAuthorization'), appSource.indexOf('function openBuild')), /innerHTML/);
 });
+
+test('a material failure names the product, explains the transfer cause and keeps the code', () => {
+  const failed = (changes = {}) => renderFailedJob(Object.assign({ id: JOB_ID, mode: 'preinstall', name: 'bb1', phase: 'failed',
+    failed_phase: 'acquiring', system_restored: false, failure_code: 'download-timeout', failed_product: 'ccbaga' }, changes));
+  let view = failed();
+  assert.match(view.text, /材料准备失败/);
+  assert.match(view.text, /失败项目：CCBaga/);
+  assert.match(view.text, /原因：30 秒内没有收到/);
+  assert.match(view.text, /代码：download-timeout/);
+  assert.match(view.text, /此阶段不涉及管理员授权/);
+  assert.doesNotMatch(view.text, /亲自确认/);
+  view = failed({ failure_code: 'download-connection-lost', failed_product: 'clashVergeRev' });
+  assert.match(view.text, /失败项目：Clash Verge/);
+  assert.match(view.text, /连接被中断/);
+  view = failed({ failure_code: 'downloading-failed', failed_product: '../x' });
+  assert.doesNotMatch(view.text, /失败项目/, 'an unknown product is never shown');
+  assert.match(view.text, /原因：未能识别具体原因/);
+  assert.match(view.text, /代码：downloading-failed/);
+  view = failed({ failure_code: 'host-disk-full', failed_product: undefined });
+  assert.match(view.text, /磁盘空间不足/);
+});
+
+test('the job card says whether application materials were reused or downloaded', () => {
+  const job = (source) => ({ id: JOB_ID, mode: 'preinstall', name: 'bb2', phase: 'preinstalling', materials_source: source });
+  assert.match(renderFailedJob(job('reused')).text, /应用材料：复用本机已校验的缓存（本次已重新完整校验）/);
+  assert.match(renderFailedJob(job('downloaded')).text, /应用材料：本次重新下载/);
+  assert.doesNotMatch(renderFailedJob(job('elsewhere')).text, /应用材料/);
+});

@@ -119,6 +119,15 @@
   - 已经失败的任务仍然只能归档。
   - 如果在等待期间关机或进程被杀，任务会变成「中断」，并且内层操作仍标为 active，归档会拒绝。这与以前在授权过程中崩溃的情况相同，需要人工核对。
 
+### 材料下载：复用缓存、失败原因、进度（追加）
+
+- **起因**：一次预装在下载 CCBaga 时失败（约 101 MiB 时中断），界面只显示 `downloading-failed`，看不出是超时还是连接中断，还显示着过时的 IPSW 提示；本机已有完整的应用缓存，却仍要重新下载。
+- **复用缓存**：[`MaterialManager.load_reusable`](<preinstall_materials.py>) 只从本存储里挑选与当前固定版本一致、已完成且没有失败记录的下载，最多试最新的 3 个，每个都经 `load()` 做完整的原生重新校验；不通过就跳过，原样保留，不修复。全部不通过时 [`oneclick`](<oneclick.py>) 照常重新下载。任务记录 `materials_source`（`reused` / `downloaded`），卡片会显示。
+- **失败原因**：[`error_codes.network_failure_code`](<error_codes.py>) 把网络异常归入固定类别（`download-timeout`、`download-connection-lost`、`download-connect-failed`、`download-dns-failed`、`download-tls-failed`、`download-network-unreachable`、`download-protocol-error`、`host-disk-full`），应用下载和系统镜像下载都使用。材料层不再把下载层的代码改写成 `<阶段>-failed`，并记录失败的项目（`failed_product`）。卡片显示失败项目、中文原因和代码。
+- **进度**：应用下载新增字节进度（约每 2% 一次），卡片显示「正在下载 CCBaga（101/318 MiB）」以及解包、校验阶段，不再停留在 IPSW 提示。
+- **没做**：自动续传 / 自动重试。下载层已有带固定哈希校验的 `resume_artifact`，但项目原则是不自动重试，需要负责人决定后再接。
+- **注意**：宿主上有一个未提交的 stash（「Preserve unfinished retained-disk retry…」），它修改了 `preinstall_materials.py` 和 `host_artifacts.py`。本次改动避开了它触及的位置，但恢复 stash 时仍需检查。
+
 ## 验证
 
 ### 本轮在客机里的结果

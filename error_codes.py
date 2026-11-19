@@ -11,8 +11,13 @@ of value are accepted:
 
 Anything else becomes the caller's default.
 """
+import errno
+import http.client
 import re
+import socket
+import ssl
 import subprocess
+import urllib.error
 
 # Existing ``.code`` attributes are constant slugs, some without hyphens.
 _ATTRIBUTE_CODE = re.compile(r'[a-z][a-z0-9-]{0,100}\Z')
@@ -56,4 +61,38 @@ def public_code(error, default):
     mapped = _CLASS_CODES.get(type(error).__name__)
     if mapped is not None and project_defined:
         return mapped
+    return default
+
+
+_UNREACHABLE = (errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ENETDOWN, errno.EHOSTDOWN)
+
+
+def network_failure_code(error, default):
+    """Fixed category for a failed transfer; the exception text is never used.
+
+    Distinguishes "no data for the socket timeout" from "connection dropped",
+    "could not connect", DNS, TLS, unreachable network and a full host disk.
+    Anything else, including text-only URLError and HTTP status errors, keeps
+    the caller's default.
+    """
+    if (isinstance(error, urllib.error.URLError) and not isinstance(error, urllib.error.HTTPError)
+            and isinstance(getattr(error, 'reason', None), BaseException)):
+        error = error.reason
+    if isinstance(error, (socket.timeout, TimeoutError)):
+        return 'download-timeout'
+    if isinstance(error, ssl.SSLError):
+        return 'download-tls-failed'
+    if isinstance(error, socket.gaierror):
+        return 'download-dns-failed'
+    if isinstance(error, ConnectionRefusedError):
+        return 'download-connect-failed'
+    if isinstance(error, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError,
+                          http.client.IncompleteRead, http.client.RemoteDisconnected)):
+        return 'download-connection-lost'
+    if isinstance(error, OSError) and error.errno in _UNREACHABLE:
+        return 'download-network-unreachable'
+    if isinstance(error, OSError) and error.errno == errno.ENOSPC:
+        return 'host-disk-full'
+    if isinstance(error, http.client.HTTPException):
+        return 'download-protocol-error'
     return default

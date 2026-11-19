@@ -6,12 +6,14 @@ Never download binaries, invoke Apple tools, inspect host apps, mount or launch.
 import dataclasses
 from email.message import Message
 import hashlib
+import http.client
 import importlib
 import io
 import json
 import os
 from pathlib import Path
 import plistlib
+import socket
 import subprocess
 import tempfile
 import unittest
@@ -62,6 +64,19 @@ class Response(io.BytesIO):
 
     def geturl(self):
         return self.url
+
+
+class FailingResponse(Response):
+    """Delivers a first chunk, then the transfer fails with `error`."""
+    def __init__(self, url, error):
+        super().__init__(url, payload=BODY[:10])
+        self.error, self.reads = error, 0
+
+    def read(self, size=-1):
+        self.reads += 1
+        if self.reads > 1:
+            raise self.error
+        return super().read(size)
 
 
 class ArtifactFixtures(unittest.TestCase):
@@ -291,6 +306,39 @@ class ArtifactFixtures(unittest.TestCase):
         with self.assertRaisesRegex(artifacts.ArtifactError, '^download-failed$'):
             artifacts.download_artifact(manifest(), self.cache)
         self.assertFalse(list(self.cache.glob('*.dmg')))
+
+    def test_transfer_failures_keep_a_fixed_cause_without_text(self):
+        for error, code in ((socket.timeout('SECRET'), 'download-timeout'),
+                            (ConnectionResetError(54, 'SECRET'), 'download-connection-lost'),
+                            (http.client.IncompleteRead(b'SECRET', 10), 'download-connection-lost')):
+            with self.subTest(code=code):
+                self.opener.open.side_effect = None
+                self.opener.open.return_value = FailingResponse(manifest().artifact_url, error)
+                with self.assertRaises(artifacts.ArtifactError) as raised:
+                    artifacts.download_artifact(manifest(), self.cache)
+                self.assertEqual(str(raised.exception), code)
+                self.assertTrue(raised.exception.__suppress_context__)
+        self.opener.open.side_effect = urllib.error.URLError(socket.gaierror(8, 'SECRET.invalid'))
+        with self.assertRaisesRegex(artifacts.ArtifactError, '^download-dns-failed$'):
+            artifacts.download_artifact(manifest(), self.cache)
+        self.assertFalse(list(self.cache.glob('*.dmg')))
+
+    def test_download_reports_bytes_and_observer_errors_never_break_it(self):
+        selected, seen = manifest(), []
+        self.opener.open.side_effect = None
+        self.opener.open.return_value = Response(selected.artifact_url, headers=(('Content-Length', str(len(BODY))),))
+        receipt = artifacts.download_artifact(selected, self.cache, progress=lambda done, total: seen.append((done, total)))
+        self.assertEqual(receipt.size_bytes, len(BODY))
+        self.assertEqual(seen[-1], (len(BODY), len(BODY)))
+        self.assertEqual([done for done, _ in seen], sorted(done for done, _ in seen))
+        def broken(done, total):
+            raise RuntimeError('observer SECRET')
+        self.opener.open.return_value = Response(selected.artifact_url)
+        self.assertEqual(artifacts.download_artifact(selected, self.cache, progress=broken).size_bytes, len(BODY))
+        self.opener.open.reset_mock()
+        with self.assertRaisesRegex(artifacts.ArtifactError, '^invalid-progress-callback$'):
+            artifacts.download_artifact(selected, self.cache, progress='not callable')
+        self.opener.open.assert_not_called()
 
     def test_cache_rejects_public_or_symlink_directory(self):
         self.cache.chmod(0o755)

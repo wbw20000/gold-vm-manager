@@ -829,6 +829,31 @@
       message = (['unsafe-tar-path', 'invalid-tart-license-member'].includes(job.failure_code) ? 'Tart 安装包的路径未通过检查。' : '原始材料下载或校验未完成。') + '尚未创建虚拟磁盘，此阶段不涉及管理员授权。已保留下载，不自动重试。';
     }
     region.append(el('strong', '', `${job.mode === 'preinstall' ? '一键预装' : job.mode === 'offline_validate' ? '仅安装 VM' : job.mode === 'delete' ? '删除' : job.mode === 'rebuild' ? '重建' : '新建'} ${job.name || ''} · ${labels[job.phase] || job.phase}`), el('span', '', message));
+    const own = (map, key) => typeof key === 'string' && Object.prototype.hasOwnProperty.call(map, key);
+    if (materialFailure) {
+      // Fixed product keys and cause codes only; the backend never forwards network text.
+      const products = { ccbaga: 'CCBaga', clashVergeRev: 'Clash Verge', claudeDesktop: 'Claude Desktop' };
+      const causes = {
+        'download-timeout': '30 秒内没有收到服务器的响应或数据（网络停滞或被阻断）。',
+        'download-connection-lost': '下载途中连接被中断。',
+        'download-connect-failed': '无法连接下载服务器。',
+        'download-dns-failed': '无法解析下载服务器的地址。',
+        'download-tls-failed': '与下载服务器的安全连接（TLS）失败，可能是代理或证书问题。',
+        'download-network-unreachable': '网络不可达。',
+        'download-protocol-error': '下载服务器的响应格式异常。',
+        'download-deadline-exceeded': '下载超过单个文件的总时限。',
+        'truncated-download': '下载提前结束，文件不完整。',
+        'checksum-mismatch': '文件校验值与固定版本不符，已拒绝使用。',
+        'declared-size-mismatch': '文件大小与固定版本不符，已拒绝使用。',
+        'host-disk-full': '本机磁盘空间不足。',
+      };
+      if (own(products, job.failed_product)) region.append(el('span', 'build-job-failure', `失败项目：${products[job.failed_product]}`));
+      region.append(el('span', 'build-job-failure', `原因：${own(causes, job.failure_code) ? causes[job.failure_code] : '未能识别具体原因，请按下方代码排查。'}`));
+      region.append(el('span', 'build-job-failure', `代码：${typeof job.failure_code === 'string' && job.failure_code ? job.failure_code : '未记录'}`));
+    }
+    if (job.mode === 'preinstall' && (job.materials_source === 'reused' || job.materials_source === 'downloaded')) {
+      region.append(el('span', '', job.materials_source === 'reused' ? '应用材料：复用本机已校验的缓存（本次已重新完整校验）' : '应用材料：本次重新下载'));
+    }
     if (job.mode === 'preinstall' && job.phase === 'awaiting_vpn_configuration') {
       region.append(el('span', '', '尚未配置客机网络；VM 尚未发布或启动。完成此任务前不能开始其他 VM 操作。'));
       if (waitingVpnJob()) region.append(button('继续配置 VPN', 'text-button', () => openWaitingVpnConfiguration(job.id, job.name),

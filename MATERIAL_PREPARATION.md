@@ -16,8 +16,12 @@ manager = MaterialManager(
     # loopback_proxy="http://127.0.0.1:19080",  # optional, explicit, no credentials
     cancelled=cancel_event.is_set,
     progress=publish_progress,            # dict: attempt_id, stage, product, resume_supported
+                                          # (+ completed_bytes, total_bytes while downloading)
 )
-materials = manager.prepare()             # tuple[offline_install.Material, ...], fixed order
+try:
+    materials = manager.load_reusable()   # this store's newest completed attempt, fully revalidated
+except MaterialPreparationError:          # 'material-cache-miss' (or every candidate failed)
+    materials = manager.prepare()         # tuple[offline_install.Material, ...], fixed order
 attempt_id = manager.last_attempt_id      # save in the parent's lifecycle transaction
 public_status = manager.summary(attempt_id)
 # Later, using the SAME root and reviewed catalog:
@@ -34,11 +38,13 @@ Each `prepare()` exclusively creates a new random attempt with its own cache, st
 
 The dedicated store binds root identity and authenticated records to exact manifests, original download receipts, raw-file identity/hash, complete source trees, app-root identities, quarantine values and verification evidence. `load(id)` accepts only this store's committed records and repeats raw hashing, filesystem checks and native full-set verification; it does not repair missing quarantine. Internal, contained Framework symlinks remain intact; control/cache path symlinks, escaping links, hardlinked regular files, foreign owners, unsafe permissions, extra/missing applications and reused output directories are rejected. Records are private, exclusive-create and directory-fsynced; outputs are never overwritten or deleted.
 
+`load_reusable()` lets a new job reuse a download that an earlier job already completed and verified, instead of downloading again. Candidates are only this store's attempts whose signed start record matches the store and the **current** reviewed manifests, with a signed completion record and no failure record; failed, cancelled and interrupted attempts are never candidates. The newest candidates (at most three, by completion time) are each rebuilt through `load()`, so every reuse repeats raw hashing plus native signature, notarization and quarantine checks. A candidate that fails is skipped and left exactly as found, never repaired. When none passes it raises `material-cache-miss` and the caller downloads a fresh set. There is still no import of foreign caches or partial downloads.
+
 Authentication detects accidental/foreign record edits, **not a hostile same-UID process able to read the store key**. Keep the entire root exclusive and do not expose it as a shared writable directory. A store lock refuses concurrent operations, but does not replace the parent's lifecycle lock. Returned materials remain source inputs: the existing offline installer must reverify them and validate the new guest disk independently.
 
 ## Failures, cancellation and limits
 
-`MaterialPreparationError.code` is a stable sanitized code; `.attempt_id` and `manager.last_attempt_id` identify a retained attempt when one was allocated. `summary(id)` returns only public official URLs, fixed product/app names and status; it is **not** current verification or installation success. Raw native evidence is private untrusted diagnostic data, never UI content. Progress observer exceptions are ignored. Neither public summaries nor progress include proxy values, exception bodies, signed CDN redirect URLs or command output.
+`MaterialPreparationError.code` is a stable sanitized code; `.attempt_id` and `manager.last_attempt_id` identify a retained attempt when one was allocated, and `.product` names the product key that was being processed (`None` before the first or after the last product). A fixed artifact-layer cause is kept as the code (for example `download-timeout`, `download-connection-lost`, `checksum-mismatch`, `verification-tool-rejected`); only causes without a fixed code fall back to `<stage>-failed`. The failure record stores the same `code` and `product`. Byte progress is throttled to about every 2% of a download, plus its end. `summary(id)` returns only public official URLs, fixed product/app names and status; it is **not** current verification or installation success. Raw native evidence is private untrusted diagnostic data, never UI content. Progress observer exceptions are ignored. Neither public summaries nor progress include proxy values, exception bodies, signed CDN redirect URLs or command output.
 
 Cancellation is cooperative **between** bounded download/native stages, not interruption of an in-flight download or DMG mount. The download deadline defaults to the established helper's 2700 seconds and can be explicitly bounded with `deadline_seconds=`. Native operations retain their existing timeouts and controlled cleanup. Do not kill a worker and infer that attachments were cleaned up.
 

@@ -128,6 +128,14 @@
 - **没做**：自动续传 / 自动重试。下载层已有带固定哈希校验的 `resume_artifact`，但项目原则是不自动重试，需要负责人决定后再接。
 - **注意**：宿主上有一个未提交的 stash（「Preserve unfinished retained-disk retry…」），它修改了 `preinstall_materials.py` 和 `host_artifacts.py`。本次改动避开了它触及的位置，但恢复 stash 时仍需检查。
 
+### 写入属主改到启用所有权的挂载上（追加）
+
+- **起因**：实测 bb1 两次管理员授权都通过，复核属主时助手退出码 2。写入属主那步是在「忽略所有权」（owners off）的挂载上做的，而 macOS 在这种挂载上会悄悄丢弃改属主操作（`fchown` 返回成功、磁盘上不变），复核时读到的还是旧属主。这是根据 xnu 行为的推断，没有在 root 下实测确认（负责人决定直接修）。
+- **做法**（只改 Python，[offline_vpn.py](<offline_vpn.py>)）：写配置仍用 owners off 的可写挂载（新证据目录 `seed-write-session`，因为宿主用户要写进 root 所有的客机目录）；写完卸载，再以 owners **on** 重新可写挂载到原来的 `write-session`（助手要求的固定路径），在这里收集并哈希文件、生成票据、请求 root 改属主。之后的只读核对和复核不变。
+- **新增检查**：重新挂载后收集到的文件必须与刚写入的完全一致（inode、权限、大小、哈希），否则在弹出授权前就失败，代码 `seed-changed-before-ownership-apply`，失败步骤 `owners-on-reattach`（界面显示「以启用所有权方式重新挂载」）。Python 仍不在 owners on 的挂载上读取私有配置做快照。
+- **客机实测的前提**：在同版本 macOS（26.6.2 / 25G83）的客机上，用普通用户在 owners off 下创建的文件，换成 owners on 挂载后仍显示为该用户所有并可读，所以宿主用户能在 owners on 的挂载上收集文件。
+- **仍需宿主实测**：root 在 owners on 的可写挂载上改属主后，重新挂载是否保留——这是修复成立的关键，只能用真实预装或 `build/guest-tools/ownership-persistence-check.sh` 确认。没有改 Swift 助手。
+
 ## 验证
 
 ### 本轮在客机里的结果

@@ -874,7 +874,7 @@
     if (job.mode === 'preinstall' && job.phase === 'failed' && !materialFailure) {
       // Fixed codes only; the backend never forwards native output, paths or node data.
       const steps = { preflight: '前置检查', 'readonly-app-baseline': '只读核对已装应用', 'writing-private-seed': '写入私有 VPN 首次登录配置',
-        'authorized-ownership-apply': '写入属主（需管理员授权）', 'independent-readonly-bytes': '独立只读复核写入内容',
+        'owners-on-reattach': '以启用所有权方式重新挂载', 'authorized-ownership-apply': '写入属主（需管理员授权）', 'independent-readonly-bytes': '独立只读复核写入内容',
         'authorized-readonly-persistent-owners': '复核属主（需管理员授权）' };
       const reasons = {
         'system-authorization-preflight-rejected': '授权前的本地校验未通过（属主助手签名、摘要或票据不符），所以没有弹出管理员授权窗口。',

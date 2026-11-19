@@ -389,6 +389,22 @@ def _seed_snapshot(session, seed, helper_bytes, created_parents, *, writable=Fal
     return result
 
 
+def _seed_unchanged(entries, snapshot, created_parents):
+    """True if the ticket's freshly collected entries are exactly the written seed."""
+    by_path = {entry.path: entry for entry in entries}
+    for item in snapshot:
+        entry = by_path.get(item['path'])
+        if entry is None:
+            if item['kind'] == 'directory' and item['path'] in created_parents:
+                continue  # A created parent such as Library/LaunchAgents is not a ticket entry.
+            return False
+        if (entry.kind, entry.inode, entry.mode) != (item['kind'], item['inode'], item['mode']):
+            return False
+        if item['kind'] == 'file' and (entry.size, entry.sha256) != (item['size'], item['sha256']):
+            return False
+    return True
+
+
 def _generation(session, previous):
     # Exact DiskSession.owned generation: whole, devices, hdid PID, owner,
     # writable flag, pinned image dev/inode/size. Device numbers alone expire.
@@ -631,15 +647,41 @@ def configure_preinstalled_stage(*, state_dir, tart_home, job_id, name, private_
             identities()
             phase = 'writing-private-seed'
             _state(target, operation_id, phase)
-            with WritableDiskSession(target, evidence / 'write-session', baseline,
-                                     acknowledge_write=True, lock_held=True, ownership_mode='off') as writable:
+            # macOS silently discards chown/fchown on a mount that ignores
+            # ownership, even for root. So the host account writes the seed with
+            # owners OFF (it cannot create files in root-owned guest folders
+            # otherwise), detaches, and root changes owners only on the fresh
+            # owners-ON writable attachment below.
+            with WritableDiskSession(target, evidence / 'seed-write-session', baseline,
+                                     acknowledge_write=True, lock_held=True, ownership_mode='off') as writer:
+                _generation(writer, generations)
+                _need(offline_volume._persistent_identity(writer.attribution) == persistent, 'writable-data-identity-changed')
+                writer.mount_writable()
+                created_parents = _write_seed(writer, seed, helper_bytes)
+                seed_snapshot = _seed_snapshot(writer, seed, helper_bytes, created_parents, writable=True)
+                identities()
+            _need(writer.summary.get('cleanup_confirmed') is True, 'seed-write-detach-unconfirmed')
+            identities()
+            # Writes legitimately change mtime/ctime. Pin the new stamp of the
+            # same detached image before the next strict attachment check.
+            seed_write_stamp = signature(target.image)
+            _need(seed_write_stamp[:3] == target.baseline[:3], 'stage-image-identity-or-size-changed')
+            seeded_target = StageTarget(target.state_dir, target.tart_home, job_id, name,
+                                        target.stage, target.image, seed_write_stamp)
+            phase = 'owners-on-reattach'
+            _state(target, operation_id, phase, created_parent_paths=created_parents)
+            with WritableDiskSession(seeded_target, evidence / 'write-session', baseline,
+                                     acknowledge_write=True, lock_held=True, ownership_mode='on') as writable:
                 apply_generation = _generation(writable, generations)
                 _need(offline_volume._persistent_identity(writable.attribution) == persistent, 'writable-data-identity-changed')
                 writable.mount_writable()
                 _need(writable.mountpoint == paths['apply_mount'], 'wrong-ownership-apply-mount')
-                created_parents = _write_seed(writable, seed, helper_bytes)
-                seed_snapshot = _seed_snapshot(writable, seed, helper_bytes, created_parents, writable=True)
                 identities()
+                # Owners are real on this mount: never read the private seed through
+                # _seed_snapshot here. The ticket's own fresh hashing must still be
+                # exactly what was written, or root is never asked.
+                entries = ownership.collect_entries(writable.mountpoint)
+                _need(_seed_unchanged(entries, seed_snapshot, created_parents), 'seed-changed-before-ownership-apply')
                 _state(target, operation_id, 'awaiting_owner_apply', authorization=True,
                        created_parent_paths=created_parents)
                 # Ticket directories are new private host outputs, not guest paths.
@@ -649,7 +691,6 @@ def configure_preinstalled_stage(*, state_dir, tart_home, job_id, name, private_
                 _private_directory(paths['directory'])
                 registry.sync_directory(target.stage)
                 registry.sync_directory(paths['directory'].parent)
-                entries = ownership.collect_entries(writable.mountpoint)
                 ticket = ownership.prepare_ticket(state_dir=target.state_dir, tart_home=target.tart_home,
                     job_id=job_id, name=name, operation_id=operation_id,
                     apply_mount=paths['apply_mount'], verify_mount=paths['verify_mount'],

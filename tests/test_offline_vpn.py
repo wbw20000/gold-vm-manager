@@ -88,6 +88,7 @@ class OfflineVPNTests(unittest.TestCase):
             'type': 'trojan', 'server': '8.8.8.8', 'port': 443, 'password': 'PRIVATE-node-password',
             'sni': 'example.com', 'network': 'tcp', 'tls': True}]}).private_config
         self.sessions, self.auth_calls, self.events = [], [], []
+        self.auth_sessions, self.ticket_sessions = [], []
         self.active_session = None
         self.entry_snapshots = None
         self.hooks = {}
@@ -302,6 +303,7 @@ class OfflineVPNTests(unittest.TestCase):
         config_fd = kwargs['config_lock_fd']
         self.assertEqual(os.fstat(config_fd).st_ino, (self.stage / 'config.json').stat().st_ino)
         self.assertEqual(os.pread(config_fd, 4096, 0), b'{"fixture":true}\n')
+        self.ticket_sessions.append((self.active_session.directory.name, self.active_session.ownership_mode))
         current = registry.read_private(self.state / 'build-current.json')
         self.assertEqual(current['phase'], 'awaiting_system_authorization')
         self.assertTrue(current['vpn_configuration']['active'])
@@ -317,7 +319,9 @@ class OfflineVPNTests(unittest.TestCase):
     def authorize(self, ticket, operation, *, acknowledge_authorization):
         self.assertIs(acknowledge_authorization, True)
         session = self.active_session
-        self.assertEqual(session.ownership_mode, 'off' if operation == 'apply' else 'on')
+        # macOS silently discards chown on an owners-off mount: both root steps need owners on.
+        self.auth_sessions.append((operation, session.directory.name, session.ownership_mode, session.writable))
+        self.assertEqual(session.ownership_mode, 'on')
         self.assertEqual(session.writable, operation == 'apply')
         self.auth_calls.append(operation)
         self.events.append(('authorization', operation))
@@ -358,8 +362,9 @@ class OfflineVPNTests(unittest.TestCase):
         nvram_before = offline_disk.signature(self.stage / 'nvram.bin')
         result = self.run_configure()
         self.assertEqual([s.directory.name for s in self.sessions],
-                         ['baseline-readonly', 'write-session', 'bytes-readonly', 'owner-readonly'])
-        self.assertEqual([s.ownership_mode for s in self.sessions], ['off', 'off', 'off', 'on'])
+                         ['baseline-readonly', 'seed-write-session', 'write-session', 'bytes-readonly', 'owner-readonly'])
+        self.assertEqual([s.ownership_mode for s in self.sessions], ['off', 'off', 'on', 'off', 'on'])
+        self.assertEqual([s.writable for s in self.sessions], [False, True, True, False, False])
         self.assertTrue(all(s.summary['cleanup_confirmed'] for s in self.sessions))
         self.assertEqual(self.auth_calls, ['apply', 'verify'])
         self.assertEqual(self.source_verifier.call_count, 1)
@@ -512,7 +517,7 @@ class OfflineVPNTests(unittest.TestCase):
     def test_user_denial_retains_seed_no_false_completion_or_second_authorization(self):
         self.authorization.side_effect = lambda *a, **k: ownership.AuthorizationResult('denied', 'apply', False)
         self.assert_retained()
-        self.assertEqual(len(self.sessions), 2)
+        self.assertEqual(len(self.sessions), 3)
         self.assertTrue((self.storage / guest_vpn_seed.SEED_PATH).exists())
         self.assertFalse((self.stage / vpn._COMPLETE).exists())
 
@@ -602,7 +607,7 @@ class OfflineVPNTests(unittest.TestCase):
         self.assertTrue(result['persistent_ownership_verified'])
         self.assertEqual(self.auth_calls, ['apply', 'apply', 'verify'])
         self.assertEqual([s.directory.name for s in self.sessions],
-                         ['baseline-readonly', 'write-session', 'bytes-readonly', 'owner-readonly'])
+                         ['baseline-readonly', 'seed-write-session', 'write-session', 'bytes-readonly', 'owner-readonly'])
         waiting, session_name, writable = seen[0]
         # Still the one writable session, still mounted: nothing was detached or redone.
         self.assertEqual((session_name, writable), ('write-session', True))
@@ -747,7 +752,7 @@ class OfflineVPNTests(unittest.TestCase):
     def test_helper_success_without_private_receipt_is_not_acceptance(self):
         self.authorization.side_effect = lambda *a, **k: ownership.AuthorizationResult('completed', 'apply', True)
         self.assert_retained()
-        self.assertEqual(len(self.sessions), 2)
+        self.assertEqual(len(self.sessions), 3)
 
     def test_fixture_receipt_is_never_treated_as_real_administrator_proof(self):
         self.receipt_mutation = lambda operation, receipt: receipt.update(fixture_only=True)
@@ -761,12 +766,12 @@ class OfflineVPNTests(unittest.TestCase):
         self.receipt_mutation = bad_verify
         self.assert_retained()
         self.assertEqual(self.auth_calls, ['apply', 'verify'])
-        self.assertEqual(len(self.sessions), 4)
+        self.assertEqual(len(self.sessions), 5)
 
     def test_apply_metadata_does_not_substitute_for_independent_ro_seed_bytes(self):
         self.hooks['write-session:cleanup'] = lambda s: (s.mountpoint / guest_vpn_seed.SEED_PATH).write_bytes(b'changed private bytes')
         self.assert_retained()
-        self.assertEqual(len(self.sessions), 3)
+        self.assertEqual(len(self.sessions), 4)
         self.assertEqual(self.auth_calls, ['apply'])
 
     def test_replaced_seed_inode_rejected_even_if_bytes_and_modes_match(self):
@@ -777,7 +782,7 @@ class OfflineVPNTests(unittest.TestCase):
             self.file(source, content, mode=0o600)
         self.hooks['write-session:cleanup'] = replace_seed
         self.assert_retained()
-        self.assertEqual(len(self.sessions), 3)
+        self.assertEqual(len(self.sessions), 4)
         self.assertEqual(self.auth_calls, ['apply'])
 
     def test_saved_state_alone_and_no_published_vm_refused(self):
@@ -798,17 +803,17 @@ class OfflineVPNTests(unittest.TestCase):
     def test_modified_apps_after_seed_write_rejected(self):
         self.hooks['write-session:cleanup'] = lambda s: (s.mountpoint / 'Applications/Claude.app/Contents/Resources/fixture').write_bytes(b'changed app')
         self.assert_retained()
-        self.assertEqual(len(self.sessions), 3)
+        self.assertEqual(len(self.sessions), 4)
 
     def test_vm_config_or_nvram_change_is_not_rebased_away(self):
         self.hooks['authorization:apply'] = lambda s: (self.stage / 'nvram.bin').write_bytes(b'changed NVRAM')
         self.assert_retained()
-        self.assertEqual(len(self.sessions), 2)
+        self.assertEqual(len(self.sessions), 3)
 
     def test_fresh_attachment_generation_is_required(self):
         self.hooks['bytes-readonly:enter'] = lambda s: setattr(s, 'attachment_generation', self.sessions[1].attachment_generation)
         self.assert_retained()
-        self.assertEqual(len(self.sessions), 3)
+        self.assertEqual(len(self.sessions), 4)
         self.assertEqual(self.auth_calls, ['apply'])
 
     def test_no_python_private_seed_read_on_owners_on_mount(self):
@@ -819,6 +824,47 @@ class OfflineVPNTests(unittest.TestCase):
         with patch.object(vpn, '_seed_snapshot', side_effect=checked):
             self.run_configure()
         self.assertEqual(self.auth_calls, ['apply', 'verify'])
+
+    # --- Root changes owners only on a fresh owners-ON writable attachment. ---
+
+    def test_root_owner_change_runs_on_a_fresh_owners_on_writable_attachment(self):
+        written = []
+        def seed_write_changed_image(session):
+            written.append((session.ownership_mode, (session.mountpoint / guest_vpn_seed.SEED_PATH).is_file()))
+            before = offline_disk.signature(session.target.image)
+            os.utime(session.target.image, ns=(before[3], before[3] + 1_000_000_000))
+            after = offline_disk.signature(session.target.image)
+            self.assertEqual(before[:3], after[:3])
+            self.assertNotEqual(before, after)
+        self.hooks['seed-write-session:cleanup'] = seed_write_changed_image
+        self.run_configure()
+        self.assertEqual(written, [('off', True)])  # The host writes the seed with owners off.
+        self.assertEqual(self.ticket_sessions, [('write-session', 'on')])
+        self.assertEqual(self.auth_sessions, [('apply', 'write-session', 'on', True),
+                                              ('verify', 'owner-readonly', 'on', False)])
+        events = [e for e in self.events if e[0] in ('attach', 'detach')]
+        self.assertLess(events.index(('detach', 'seed-write-session', 'off')),
+                        events.index(('attach', 'write-session', 'on')))
+
+    def test_seed_changed_before_the_owner_change_is_refused_before_any_prompt(self):
+        self.hooks['seed-write-session:cleanup'] = lambda s: (s.mountpoint / guest_vpn_seed.SEED_PATH).write_bytes(b'changed private bytes')
+        self.assert_retained()
+        current, failed = self.failure_records()
+        for record in (current['vpn_configuration'], failed):
+            self.assertEqual((record['failed_step'], record['failure_code']),
+                             ('owners-on-reattach', 'seed-changed-before-ownership-apply'))
+        self.assertEqual((self.auth_calls, self.ticket_sessions), ([], []))
+
+    def test_owners_on_reattach_failure_is_its_own_step_and_never_prompts(self):
+        def refuse(session):
+            raise offline_disk.OfflineDiskError('Explicit writable ownership mode not applied by macOS')
+        self.hooks['write-session:enter'] = refuse
+        self.assert_retained()
+        current, failed = self.failure_records()
+        self.assertEqual(failed['failed_step'], 'owners-on-reattach')
+        self.assertEqual(current['vpn_configuration']['failed_step'], 'owners-on-reattach')
+        self.assertEqual(self.auth_calls, [])
+        self.assertTrue((self.storage / guest_vpn_seed.SEED_PATH).exists())
 
     def test_borrowed_lifecycle_fd_survives_full_operation(self):
         fd = os.open(str(self.state / 'build.lock'), os.O_RDWR | os.O_NOFOLLOW)
@@ -836,7 +882,7 @@ class OfflineVPNTests(unittest.TestCase):
         with self.assertRaises(vpn.OfflineVPNError):
             self.run_configure()
         self.assertEqual((receipt.stat().st_ino, receipt.read_bytes()), before)
-        self.assertEqual(len(self.sessions), 4)
+        self.assertEqual(len(self.sessions), 5)
 
     def test_arbitrary_evidence_directory_not_accepted(self):
         other = self.mkdir(self.root / 'unrelated-evidence')

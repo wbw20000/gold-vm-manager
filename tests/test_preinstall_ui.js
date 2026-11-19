@@ -711,3 +711,11 @@ test('the job card says whether application materials were reused or downloaded'
   assert.match(renderFailedJob(job('downloaded')).text, /应用材料：本次重新下载/);
   assert.doesNotMatch(renderFailedJob(job('elsewhere')).text, /应用材料/);
 });
+
+test('a failure while re-attaching with ownership enabled is named as its own step', () => {
+  const { text } = renderFailedJob({ id: JOB_ID, mode: 'preinstall', name: 'bb1', phase: 'failed', failed_phase: 'failed_retained',
+    failed_step: 'owners-on-reattach', failure_code: 'offline-vpn-failed-retained',
+    failure_reason: 'seed-changed-before-ownership-apply', recovery_required: true });
+  assert.match(text, /失败步骤：以启用所有权方式重新挂载（owners-on-reattach）/);
+  assert.match(text, /代码：offline-vpn-failed-retained \/ seed-changed-before-ownership-apply/);
+});

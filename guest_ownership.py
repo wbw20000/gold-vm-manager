@@ -13,6 +13,7 @@ import re
 import shlex
 import stat
 import subprocess
+from typing import Optional
 import unicodedata
 
 import host_tools
@@ -74,6 +75,40 @@ class AuthorizationResult:
     operation: str
     authorized_helper_completed: bool
     independent_readonly_acceptance: bool = False
+    # Fixed category only; never native text. failure_status is set only for
+    # 'helper-exit' (helper exit status) and 'authorization-error' (OSStatus).
+    failure_reason: Optional[str] = None
+    failure_status: Optional[int] = None
+
+
+# osascript reports `... execution error: <text> (<number>)`; only the number is used.
+_OSASCRIPT_STATUS = re.compile(r'\((-?\d{1,6})\)\s*\Z')
+_AUTHORIZATION_STATUS = {-128: 'user-cancelled', -60006: 'user-cancelled',
+                         -60005: 'authorization-denied', -60007: 'interaction-not-allowed'}
+
+
+def _classify_osascript_failure(stderr):
+    """Return (reason, status) from the trailing number only; the text is discarded."""
+    try:
+        lines = [line for line in (stderr or b'').decode('utf-8', 'replace').splitlines() if line.strip()]
+    except (AttributeError, TypeError):
+        lines = []
+    match = _OSASCRIPT_STATUS.search(lines[-1]) if lines else None
+    if match is None:
+        return 'unknown-failure', None
+    status = int(match.group(1))
+    if status in _AUTHORIZATION_STATUS:
+        return _AUTHORIZATION_STATUS[status], None
+    if 0 < status <= 255:
+        return 'helper-exit', status
+    if status < 0:
+        return 'authorization-error', status
+    return 'unknown-failure', None
+
+
+def _authorization_failure(operation, reason, status=None):
+    return AuthorizationResult('authorization_or_helper_failed_retained', operation, False,
+                               failure_reason=reason, failure_status=status)
 
 
 def _need(ok, message='Guest ownership validation failed; retain the unpublished stage'):
@@ -591,7 +626,10 @@ def request_authorization(ticket, operation, *, acknowledge_authorization=False,
 
     Call separately for apply and verify. macOS may reuse its own authorization,
     or display a second genuine prompt. Never promise zero/two fixed dialogs.
-    No password is requested by this module. stdout/stderr are always discarded.
+    No password is requested by this module. stdout is discarded; stderr is read
+    only for osascript's trailing numeric status and then dropped, so the result
+    distinguishes "never prompted" (preflight/launch), "prompt refused or not
+    allowed", "helper ran and refused" and "timed out" without native text.
     """
     _need(type(ticket) is OwnershipTicket and operation in ('apply', 'verify'))
     if acknowledge_authorization is not True:
@@ -608,15 +646,33 @@ def request_authorization(ticket, operation, *, acknowledge_authorization=False,
         host_tools.verify_local_signature(ticket.helper_path, {})
         command = ' '.join(shlex.quote(str(value)) for value in (ticket.helper_path, ticket.path, '--' + operation))
         script = 'do shell script ' + _apple_string(command) + ' with administrator privileges\n'
-        runner = subprocess.run if run is None else run
+    except Exception:
+        # Local checks failed before any prompt could be shown.
+        return _authorization_failure(operation, 'preflight-rejected')
+    runner = subprocess.run if run is None else run
+    try:
         result = runner(['/usr/bin/osascript', '-'], input=script.encode(),
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1800,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=1800,
                         env={'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'LANG': 'en_US.UTF-8'}, cwd='/')
-        if result.returncode:
-            return AuthorizationResult('authorization_or_helper_failed_retained', operation, False)
+    except subprocess.TimeoutExpired:
+        return _authorization_failure(operation, 'timeout')
+    except OSError:
+        return _authorization_failure(operation, 'launch-failed')
+    except Exception:
+        return _authorization_failure(operation, 'unknown-failure')
+    try:
+        returncode = result.returncode
+        if returncode:
+            reason, status = _classify_osascript_failure(getattr(result, 'stderr', None))
+            return _authorization_failure(operation, reason, status)
+    except Exception:
+        return _authorization_failure(operation, 'unknown-failure')
+    finally:
+        result = None  # Drop any captured native text promptly.
+    try:
         # Exit 0 alone is never acceptance: validate the private root receipt.
         return verify_receipt(ticket, operation)
     except OwnershipError:
         raise
     except Exception:
-        return AuthorizationResult('authorization_or_helper_failed_retained', operation, False)
+        return _authorization_failure(operation, 'unknown-failure')

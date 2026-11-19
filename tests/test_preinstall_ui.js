@@ -517,3 +517,90 @@ test('published/static-written job phases never claim connected VPN or automatic
   }
   assert.doesNotMatch(source, /\/api\/vms\/.*\/action|action:\s*['"]start|source_vm|acknowledge_erase/);
 });
+
+function jobRegion() {
+  return { children: [], hidden: false, classList: { toggle() {} }, replaceChildren() { this.children = []; }, append(...v) { this.children.push(...v); } };
+}
+
+function renderFailedJob(job, extra = {}) {
+  const region = jobRegion();
+  const buttons = [];
+  const sandbox = Object.assign({ state: { build_job: job }, selectedVM: '', connected: true, $: () => region,
+    el: (tag, cls, text) => ({ tag, cls, text }),
+    button: (text, cls, click, disabled) => { const item = { text, click, disabled }; buttons.push(item); return item; } }, extra);
+  vm.createContext(sandbox); vm.runInContext(declaration('renderBuildJob'), sandbox);
+  sandbox.renderBuildJob();
+  return { text: region.children.map(n => n.text).filter(Boolean).join('\n'), buttons: buttons.map(b => ({ text: b.text, disabled: b.disabled })) };
+}
+
+test('failed preinstall card names the failed step, explains the reason and keeps the raw codes', () => {
+  const { text, buttons } = renderFailedJob({ id: JOB_ID, mode: 'preinstall', name: 'backup1', phase: 'failed',
+    failed_phase: 'failed_retained', failed_step: 'authorized-ownership-apply', failure_code: 'offline-vpn-failed-retained',
+    failure_reason: 'system-authorization-interaction-not-allowed', recovery_required: true, published: false,
+    message: '预装未完成；保留所有暂存文件，不自动覆盖重试。请查看失败步骤。' });
+  assert.match(text, /失败步骤：写入属主（需管理员授权）/);
+  assert.match(text, /原因：系统未能显示管理员授权窗口/);
+  assert.match(text, /代码：offline-vpn-failed-retained \/ system-authorization-interaction-not-allowed/);
+  assert.match(text, /不代表 VPN 已连通/);
+  assert.equal(JSON.stringify(buttons), JSON.stringify([{ text: '归档此失败任务（保留暂存盘）', disabled: false }]));
+});
+
+test('failure details fall back to phase labels, keep helper exit numbers and never invent a reason', () => {
+  let view = renderFailedJob({ id: JOB_ID, mode: 'preinstall', name: 'n1', phase: 'failed', failed_phase: 'installing',
+    failure_code: 'apple-restore-not-complete', recovery_required: true });
+  assert.match(view.text, /失败步骤：离线安装系统（installing）/);
+  assert.match(view.text, /代码：apple-restore-not-complete/);
+  view = renderFailedJob({ id: JOB_ID, mode: 'preinstall', name: 'n2', phase: 'failed', failed_phase: 'failed_retained',
+    failed_step: 'authorized-ownership-apply', failure_code: 'offline-vpn-failed-retained',
+    failure_reason: 'system-authorization-helper-exit-3', recovery_required: true });
+  assert.match(view.text, /属主助手拒绝执行/);
+  assert.match(view.text, /system-authorization-helper-exit-3/);
+  view = renderFailedJob({ id: JOB_ID, mode: 'preinstall', name: 'n3', phase: 'failed', failed_phase: 'mystery_phase',
+    failure_code: 'unheard-of-code', recovery_required: false });
+  assert.match(view.text, /失败步骤：mystery_phase/);
+  assert.match(view.text, /代码：unheard-of-code/);
+  assert.match(view.text, /原因：未归类/);
+  assert.equal(view.buttons.length, 0, 'no archive action when nothing is locked');
+  view = renderFailedJob({ id: JOB_ID, mode: 'preinstall', name: 'n4', phase: 'failed', failed_phase: 'publishing',
+    failure_code: 'publication-registry-readback-failed', recovery_required: true, published: true });
+  assert.equal(view.buttons.filter(b => b.text.startsWith('归档')).length, 0, 'a published job is never archived from the UI');
+  view = renderFailedJob({ id: JOB_ID, mode: 'preinstall', name: 'n5', phase: 'failed', failed_phase: 'installing',
+    failure_code: 'apple-restore-not-complete', recovery_required: true }, { connected: false });
+  assert.equal(view.buttons[0].disabled, true);
+  assert.doesNotMatch(appSource.slice(appSource.indexOf('function renderBuildJob'), appSource.indexOf('function openBuild')), /innerHTML/);
+});
+
+test('archiving a failed job needs the exact VM name and sends only the job id and name', async () => {
+  const nodes = new Map();
+  const node = (id) => {
+    if (!nodes.has(id)) nodes.set(id, { id, value: '', hidden: false, disabled: false, textContent: '', className: '', required: false,
+      open: false, showModal() { this.open = true; }, close() { this.open = false; }, focus() {}, querySelectorAll() { return []; } });
+    return nodes.get(id);
+  };
+  const calls = [];
+  const sandbox = { $: node, connected: true, confirmContext: null, confirmBusy: false, buildActive: () => true,
+    api: async (route, options) => { calls.push([route, options.method, options.body]); return { ok: true, stage_retained: true }; },
+    refresh: async () => { calls.push(['refresh']); }, toast: () => {}, showError: (id, message) => { throw new Error(message); } };
+  vm.createContext(sandbox);
+  for (const name of ['openArchiveJob', 'confirmSubmitDisabled', 'submitConfirm']) vm.runInContext(declaration(name), sandbox);
+  const job = { id: JOB_ID, mode: 'preinstall', name: 'backup1', phase: 'failed', recovery_required: true, published: false };
+  sandbox.openArchiveJob(Object.assign({}, job, { recovery_required: false }));
+  assert.equal(node('confirm-dialog').open, false, 'only locked failed jobs can be archived');
+  sandbox.openArchiveJob(job);
+  assert.equal(node('confirm-dialog').open, true);
+  assert.match(node('confirm-description').textContent, /\.gold-manager-staging/);
+  assert.match(node('confirm-description').textContent, /不会删除/);
+  assert.equal(node('confirm-input-group').hidden, false);
+  assert.equal(node('confirm-submit').disabled, true);
+  node('confirm-name').value = 'backup1 ';
+  assert.equal(sandbox.confirmSubmitDisabled(), true);
+  node('confirm-name').value = 'backup1';
+  assert.equal(sandbox.confirmSubmitDisabled(), false, 'the failed job lock itself must not block its own archive');
+  await sandbox.submitConfirm({ preventDefault() {} });
+  assert.equal(JSON.stringify(calls[0]), JSON.stringify(['/api/preinstall/archive', 'POST', { job_id: JOB_ID, confirm_name: 'backup1' }]));
+  assert.equal(node('confirm-dialog').open, false);
+  sandbox.confirmContext = { type: 'action', id: 'gold', action: 'force-stop', typed: true };
+  node('confirm-name').value = 'gold';
+  assert.equal(sandbox.confirmSubmitDisabled(), true, 'other dangerous actions stay blocked while a job is locked');
+  assert.match(appSource, /addEventListener\('input', \(\) => \{ if \(confirmContext\?\.typed\) \$\('confirm-submit'\)\.disabled = confirmSubmitDisabled\(\); \}\)/);
+});

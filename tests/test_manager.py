@@ -319,6 +319,40 @@ class ControllerTests(PrivateFixture):
         self.run.assert_not_called()
         self.kill.assert_not_called()
 
+    def test_failed_preinstall_job_exposes_only_public_failure_details(self):
+        self.assertTrue({'failed_step', 'failure_reason'} <= m.PREINSTALL_PHASE_FIELDS)
+        job = {'id': 'a' * 32, 'mode': 'preinstall', 'name': 'failed fixture', 'phase': 'failed',
+               'failed_phase': 'failed_retained', 'failure_code': 'offline-vpn-failed-retained',
+               'failed_step': 'authorized-ownership-apply',
+               'failure_reason': 'system-authorization-interaction-not-allowed', 'recovery_required': True,
+               'stage_path': '/private/stage/fixture', 'vpn_configuration': {'operation_id': 'b' * 32,
+               'created_parent_paths': ['Library/LaunchAgents'], 'active': False}}
+        self.controller.build_status = Mock(return_value=job)
+        build = self.controller.state()['build_job']
+        self.assertEqual((build['failed_step'], build['failure_reason'], build['failure_code']),
+                         ('authorized-ownership-apply', 'system-authorization-interaction-not-allowed',
+                          'offline-vpn-failed-retained'))
+        self.assertNotIn('vpn_configuration', build)
+        self.assertNotIn('stage_path', build)
+
+    def test_archive_preinstall_delegates_and_hides_internal_reasons(self):
+        archive = self.start_patch(patch.object(m.oneclick, 'archive_failed', return_value={
+            'ok': True, 'job_id': 'a' * 32, 'name': 'failed fixture', 'stage_retained': True}))
+        value = {'job_id': 'a' * 32, 'confirm_name': 'failed fixture'}
+        self.assertEqual(self.controller.archive_preinstall(value)['stage_retained'], True)
+        archive.assert_called_once_with(value, state_dir=self.state_dir, tart_home=self.vm_root.parent)
+        archive.side_effect = m.oneclick.OneClickError('inert-internal-reason-not-for-ui')
+        with self.assertRaises(m.AppError) as raised:
+            self.controller.archive_preinstall(value)
+        self.assertEqual((raised.exception.code, raised.exception.status), ('archive_rejected', 409))
+        self.assertNotIn('inert-internal-reason', str(raised.exception))
+        self.controller.operations['gold'] = {'action': 'start'}
+        archive.reset_mock()
+        with self.assertRaises(m.AppError) as busy:
+            self.controller.archive_preinstall(value)
+        self.assertEqual(busy.exception.status, 409)
+        archive.assert_not_called()
+
     def test_preinstalled_start_requires_own_named_execution_consent(self):
         base = self.bases['gold']
         self.write_json(base / 'environment.json', {'version': 2})
@@ -465,6 +499,10 @@ class FakeController:
     def resume_preinstall(self, value):
         self.calls.append(('resume-preinstall', value))
         return {'ok': True, 'job': {'id': '2' * 32, 'phase': 'vpn_resume_queued'}}
+
+    def archive_preinstall(self, value):
+        self.calls.append(('archive-preinstall', value))
+        return {'ok': True, 'job_id': '2' * 32, 'name': 'fixture', 'stage_retained': True}
 
     def pick_ipsw(self, value):
         self.calls.append(('ipsw', value))
@@ -649,6 +687,17 @@ class HTTPSecurityTests(unittest.TestCase):
         self.assertEqual(self.fake.calls, [('preinstall-capabilities',), ('preinstall-examples',),
                                           ('validate-vpn', payload), ('create-preinstall', request),
                                           ('resume-preinstall', resume_data)])
+
+    def test_archive_route_requires_authentication_and_same_origin(self):
+        route = '/api/preinstall/archive'
+        value = {'job_id': '2' * 32, 'confirm_name': 'fixture'}
+        self.assertEqual(self.request(route, 'POST', value, {'Content-Type': 'application/json'})[0], 403)
+        self.assertEqual(self.request(route, 'POST', value, {**self.auth(), 'Content-Type': 'application/json'})[0], 403)
+        self.assertEqual(self.request(route, 'POST', value, {'Origin': self.origin, 'Content-Type': 'application/json'})[0], 401)
+        self.assertEqual(self.fake.calls, [])
+        status, result, _ = self.request(route, 'POST', value, self.mutation_headers())
+        self.assertEqual((status, result['stage_retained']), (200, True))
+        self.assertEqual(self.fake.calls, [('archive-preinstall', value)])
 
     def test_only_vpn_validation_has_a_larger_request_limit(self):
         payload = {'submission': {'input_mode': 'yaml', 'yaml_text': '柴' * 30000}, 'allow_resolve': False}

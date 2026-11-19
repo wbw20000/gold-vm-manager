@@ -600,6 +600,31 @@
     finally { setShareBusy(false); updateShareForm(); }
   }
 
+  function openArchiveJob(job) {
+    if (!connected || !job || job.mode !== 'preinstall' || job.phase !== 'failed' || job.recovery_required !== true
+      || job.published === true || typeof job.id !== 'string' || typeof job.name !== 'string' || !job.name) return;
+    confirmContext = { type: 'archive-job', id: job.name, jobId: job.id, typed: true };
+    $('confirm-title').textContent = `归档失败任务 ${job.name}？`;
+    $('confirm-description').textContent = `只移除这条失败任务的锁定记录，之后可以用新名称重新预装。不会删除、移动、续接或发布暂存盘：它仍保留在 ~/.tart/.gold-manager-staging/${job.id}，会继续占用磁盘空间，需要时请人工核对后自行删除。不会启动任何 VM。`;
+    $('confirm-input-group').hidden = false;
+    $('confirm-input-label').textContent = `请输入「${job.name}」以确认`;
+    $('confirm-name').value = '';
+    $('confirm-name').required = true;
+    $('confirm-submit').textContent = '归档失败任务';
+    $('confirm-submit').className = 'button button-danger';
+    $('confirm-submit').disabled = true;
+    $('confirm-error').hidden = true;
+    $('confirm-dialog').showModal();
+    $('confirm-name').focus();
+  }
+
+  function confirmSubmitDisabled() {
+    const context = confirmContext;
+    if (!context?.typed) return Boolean(confirmBusy);
+    // The failed job's own lock must not block archiving that job.
+    return Boolean(confirmBusy || (context.type !== 'archive-job' && buildActive()) || $('confirm-name').value !== context.id);
+  }
+
   async function submitConfirm(event) {
     event.preventDefault();
     const context = confirmContext;
@@ -613,6 +638,10 @@
       if (context.type === 'action') {
         const done = await runAction(context.id, context.action, context.typed ? $('confirm-name').value : undefined, context.backend === true);
         if (!done) { showError('confirm-error', lastActionError || '操作未完成，请刷新状态后核对；不要重复执行危险操作。'); return; }
+      } else if (context.type === 'archive-job') {
+        await api('/api/preinstall/archive', { method: 'POST', body: { job_id: context.jobId, confirm_name: $('confirm-name').value } });
+        toast('已归档失败任务；暂存盘仍保留，可以用新名称重新预装。');
+        await refresh(true);
       } else {
         const vm = vmById(context.id);
         await saveShares(context.id, sharesOf(vm).filter((s) => s.id !== context.shareId), context.baseKey);
@@ -762,6 +791,35 @@
       if (waitingVpnJob()) region.append(button('继续配置 VPN', 'text-button', () => openWaitingVpnConfiguration(job.id, job.name),
         !connected || preinstallBusy || !preinstallUI, 'continue-preinstall-vpn'));
     } else if (job.mode === 'preinstall' && !materialFailure) region.append(el('span', '', '发布或写入配置不代表 VPN 已连通。首次开机、系统与服务授权、账号登录及桌面实测仍需你亲自确认。'));
+    if (job.mode === 'preinstall' && job.phase === 'failed' && !materialFailure) {
+      // Fixed codes only; the backend never forwards native output, paths or node data.
+      const steps = { preflight: '前置检查', 'readonly-app-baseline': '只读核对已装应用', 'writing-private-seed': '写入私有 VPN 首次登录配置',
+        'authorized-ownership-apply': '写入属主（需管理员授权）', 'independent-readonly-bytes': '独立只读复核写入内容',
+        'authorized-readonly-persistent-owners': '复核属主（需管理员授权）' };
+      const reasons = {
+        'system-authorization-preflight-rejected': '授权前的本地校验未通过（属主助手签名、摘要或票据不符），所以没有弹出管理员授权窗口。',
+        'system-authorization-launch-failed': '无法启动系统授权程序，没有弹出管理员授权窗口。',
+        'system-authorization-interaction-not-allowed': '系统未能显示管理员授权窗口（当前进程不允许交互）。请在已登录的前台桌面会话中打开管理器再新建任务。',
+        'system-authorization-user-cancelled': '管理员授权窗口被取消。',
+        'system-authorization-authorization-denied': '管理员授权未通过（用户名或密码不正确）。',
+        'system-authorization-authorization-error': '系统授权服务返回错误（见代码中的编号）。',
+        'system-authorization-helper-exit': '已获得管理员授权，但属主助手拒绝执行或执行失败（见代码中的退出码）。',
+        'system-authorization-timeout': '等待管理员授权超时。',
+        'system-authorization-unknown-failure': '管理员授权或属主助手失败，原因未能识别。',
+        'guest-ownership-validation-failed': '属主校验未通过，已停止，未继续写入。',
+        'internal-error': '内部检查出现意外错误；已保留现场。',
+      };
+      const stepKey = job.failed_step || job.failed_phase;
+      const stepLabel = steps[job.failed_step] || (job.failed_step ? '' : labels[job.failed_phase]) || '';
+      region.append(el('span', 'build-job-failure', `失败步骤：${stepKey ? (stepLabel ? `${stepLabel}（${stepKey}）` : stepKey) : '未记录'}`));
+      const reasonCode = job.failure_reason || job.failure_code || '';
+      const reasonKey = Object.keys(reasons).find((key) => reasonCode === key || reasonCode.startsWith(`${key}-`));
+      region.append(el('span', 'build-job-failure', `原因：${reasonKey ? reasons[reasonKey] : '未归类，请按下方代码排查；不会自动重试。'}`));
+      region.append(el('span', 'build-job-failure', `代码：${[job.failure_code, job.failure_reason].filter(Boolean).join(' / ') || '未记录'}`));
+      if (job.recovery_required === true && job.published !== true) {
+        region.append(button('归档此失败任务（保留暂存盘）', 'text-button', () => openArchiveJob(job), !connected));
+      }
+    }
     if (typeof job.progress === 'number') {
       const progress = el('progress'); progress.max = 1; progress.value = job.progress;
       progress.setAttribute('aria-label', '当前阶段进度');
@@ -939,7 +997,7 @@
   $('pick-directory').addEventListener('click', pickDirectory);
   $('share-form').addEventListener('submit', submitShare);
   $('confirm-form').addEventListener('submit', submitConfirm);
-  $('confirm-name').addEventListener('input', () => { if (confirmContext?.typed) $('confirm-submit').disabled = confirmBusy || buildActive() || $('confirm-name').value !== confirmContext.id; });
+  $('confirm-name').addEventListener('input', () => { if (confirmContext?.typed) $('confirm-submit').disabled = confirmSubmitDisabled(); });
   ['share-name', 'share-mode', 'share-enabled', 'write-ack'].forEach((id) => $(id).addEventListener('input', updateShareForm));
   $('share-path').addEventListener('input', () => { $('write-ack').checked = false; updateShareForm(); });
   $('token-form').addEventListener('submit', async (event) => {

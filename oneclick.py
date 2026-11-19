@@ -21,6 +21,7 @@ import subprocess
 import unicodedata
 import uuid
 
+import error_codes
 import managed_registry as registry
 import lifecycle
 import vpn_store
@@ -742,13 +743,17 @@ def _worker_failure(c, update, error):
     if phase == 'failed':
         operation = value.get('vpn_configuration') or value.get('offline_preinstall') or {}
         phase = operation.get('phase', 'preinstalling')
-    code = getattr(error, 'code', '')
-    if type(code) is not str or not re.fullmatch('[a-z][a-z0-9-]{0,100}', code):
-        code = 'preinstall-step-failed'
+    code = error_codes.public_code(error, 'preinstall-step-failed')
+    # The VPN workflow records its own inner step and a sanitized reason.
+    inner = value.get('vpn_configuration')
+    inner = inner if type(inner) is dict else {}
+    failed_step = inner.get('failed_step') if error_codes.is_step(inner.get('failed_step')) else None
+    failure_reason = inner.get('failure_code') if error_codes.is_code(inner.get('failure_code')) else None
     message = ('原始材料下载或校验未完成，尚未创建虚拟磁盘；已保留下载，不会自动重试。'
                if phase == 'acquiring' and not value.get('stage_path') else
                '预装未完成；保留所有暂存文件，不自动覆盖重试。请查看失败步骤。')
     return update('failed', message, failure_code=code, failed_phase=phase,
+                  failed_step=failed_step, failure_reason=failure_reason,
                   recovery_required=bool(value.get('stage_path')) or (c.jobdir / 'commit.json').exists(),
                   desktop_verified=False, vpn_connected=False, network_independently_verified=False)
 
@@ -833,6 +838,63 @@ def execute_resume(context, *, services=None):
         return _finish_preinstall(c, d, stored, service, update)
     except Exception as error:
         return _worker_failure(c, update, error)
+
+
+ARCHIVE_KEYS = frozenset(('job_id', 'confirm_name'))
+
+
+def archive_failed(payload, *, state_dir=None, tart_home=None):
+    """Explicitly unlock a dead, failed, unpublished preinstall job; keep its stage.
+
+    Moves only the current-job record into the job's own directory. The stage,
+    its disk image, evidence and bound VPN ticket are left exactly as they are;
+    nothing is resumed, deleted, published or started.
+    """
+    state = Path(state_dir) if state_dir is not None else registry.STATE_DIR
+    home = Path(tart_home) if tart_home is not None else registry.HOME / '.tart'
+    _need(type(payload) is dict and set(payload) == ARCHIVE_KEYS
+          and type(payload['job_id']) is str and ID.fullmatch(payload['job_id'])
+          and type(payload['confirm_name']) is str, 'invalid-archive-request')
+    registry.private_dir(state)
+    fd = os.open(str(registry.safe_path(state / 'build.lock', False)), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            _lock(fd, state)
+        except BlockingIOError:
+            # A live worker inherits build.lock; never archive under it.
+            raise OneClickError('lifecycle-lock-busy') from None
+        current_path = state / 'build-current.json'
+        raw = registry.read_private(current_path)
+        job = lifecycle.status(state_dir=state)
+        _need(type(raw) is dict and type(job) is dict and raw.get('id') == job.get('id') == payload['job_id'],
+              'archive-job-not-current')
+        _need(raw.get('mode') == MODE and job.get('mode') == MODE, 'archive-preinstall-only')
+        _need(job.get('name') == payload['confirm_name'], 'archive-name-confirmation-mismatch')
+        # With build.lock held no worker is alive, so a derived 'interrupted'
+        # job is as dead as a 'failed' one. Anything else is still in progress.
+        _need(job.get('phase') in ('failed', 'interrupted') and not lifecycle.is_active(job)
+              and not lifecycle.waiting_for_vpn(job), 'archive-job-not-failed')
+        _need(job.get('published') is not True and raw.get('published') is not True, 'archive-published-job-refused')
+        for key in ('offline_preinstall', 'vpn_configuration'):
+            operation = raw.get(key)
+            _need(operation is None or (type(operation) is dict and operation.get('active') is not True),
+                  'archive-operation-still-active')
+        jobdir = state / 'build-jobs' / payload['job_id']
+        _need(not os.path.lexists(jobdir / 'commit.json'), 'archive-publication-journal-present')
+        archived = jobdir / 'archived-current.json'
+        _need(not os.path.lexists(archived), 'archive-record-already-exists')
+        stage = home / '.gold-manager-staging' / payload['job_id'] / 'new-environment'
+        image = stage / 'disk.img'
+        if os.path.lexists(image):
+            _require_detached(image)
+        record = dict(raw, archived_at=_now())
+        registry.write_private(archived, record)
+        _need(registry.read_private(archived) == record, 'archive-record-readback-failed')
+        os.unlink(str(registry.safe_path(current_path)))
+        registry.sync_directory(state)
+        return {'ok': True, 'job_id': payload['job_id'], 'name': job['name'], 'stage_retained': os.path.lexists(stage)}
+    finally:
+        os.close(fd)
 
 
 def main():

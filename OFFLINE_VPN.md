@@ -45,7 +45,7 @@ Success writes private `.offline-vpn.complete.json` and evidence, then sets `cur
 
 The private sidecar additionally holds `receipt_token`, seed/helper digests, inode bindings, full persistent volume identity and both authorization receipts. Its private `image_file_stamp` is the exact final detached `[st_dev, st_ino, st_size, st_mtime_ns, st_ctime_ns]`; the parent must compare it again under the storage lock immediately before publication. **Never expose that private record or token through API/UI/logs.** Parent code may read the private token only for its per-VM status receipt interface. Runtime preparation/publication, first login, Clash service authorization, Gatekeeper, account login and real connectivity checks remain separate parent/user work.
 
-Any failure after transaction entry retains stage/evidence, sets `phase=failed`, `recovery_required=True`, and never promotes partial writes or retries authorization. Recovery does not force-unmount, replace applications, clear security metadata, publish or start a VM. A failure before locks/preflight creates no disk session.
+Any failure after transaction entry retains stage/evidence, sets `phase=failed`, `recovery_required=True`, records the inner `failed_step` and a constant `failure_code` (for example `system-authorization-interaction-not-allowed`, or `internal-error` for unexpected exceptions) in `vpn_configuration` and `vpn-failed.json`, and never promotes partial writes or retries authorization. Recovery does not force-unmount, replace applications, clear security metadata, publish or start a VM. A failure before locks/preflight creates no disk session.
 
 ## Source-only tests
 

@@ -512,6 +512,51 @@ class OfflineVPNTests(unittest.TestCase):
         self.assertTrue((self.storage / guest_vpn_seed.SEED_PATH).exists())
         self.assertFalse((self.stage / vpn._COMPLETE).exists())
 
+    def failure_records(self):
+        current = registry.read_private(self.state / 'build-current.json')
+        records = sorted(self.jobdir.glob('offline-vpn-*/vpn-failed.json'))
+        self.assertEqual(len(records), 1)
+        return current, registry.read_private(records[0])
+
+    def test_user_denial_without_reason_records_unknown_authorization_failure(self):
+        self.authorization.side_effect = lambda *a, **k: ownership.AuthorizationResult('denied', 'apply', False)
+        self.assert_retained()
+        current, failed = self.failure_records()
+        for record in (current['vpn_configuration'], failed):
+            self.assertEqual((record['failed_step'], record['failure_code']),
+                             ('authorized-ownership-apply', 'system-authorization-unknown-failure'))
+
+    def test_authorization_reason_is_recorded_without_native_text(self):
+        self.authorization.side_effect = lambda *a, **k: ownership.AuthorizationResult(
+            'authorization_or_helper_failed_retained', 'apply', False, failure_reason='interaction-not-allowed')
+        self.assert_retained()
+        current, failed = self.failure_records()
+        for record in (current['vpn_configuration'], failed):
+            self.assertEqual((record['failed_step'], record['failure_code']),
+                             ('authorized-ownership-apply', 'system-authorization-interaction-not-allowed'))
+        self.assertEqual(failed['failed_phase'], 'authorized-ownership-apply')
+        self.assertEqual(self.authorization.call_count, 1)  # No second prompt after a refusal.
+
+    def test_helper_exit_status_is_part_of_the_fixed_code(self):
+        self.authorization.side_effect = lambda *a, **k: ownership.AuthorizationResult(
+            'authorization_or_helper_failed_retained', 'apply', False, failure_reason='helper-exit', failure_status=3)
+        self.assert_retained()
+        current, failed = self.failure_records()
+        self.assertEqual(failed['failure_code'], 'system-authorization-helper-exit-3')
+        self.assertEqual(current['vpn_configuration']['failure_code'], 'system-authorization-helper-exit-3')
+
+    def test_unexpected_inner_exception_records_internal_error_only(self):
+        def explode(session):
+            raise RuntimeError('PRIVATE-node-password /Users/private/path')
+        self.hooks['baseline-readonly:enter'] = explode
+        self.assert_retained()
+        current, failed = self.failure_records()
+        for record in (current['vpn_configuration'], failed):
+            self.assertEqual((record['failed_step'], record['failure_code']), ('readonly-app-baseline', 'internal-error'))
+        serial = json.dumps([current, failed])
+        self.assertNotIn('PRIVATE-node-password', serial)
+        self.assertNotIn('/Users/private/path', serial)
+
     def test_helper_success_without_private_receipt_is_not_acceptance(self):
         self.authorization.side_effect = lambda *a, **k: ownership.AuthorizationResult('completed', 'apply', True)
         self.assert_retained()

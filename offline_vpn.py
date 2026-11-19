@@ -15,6 +15,7 @@ import stat
 import struct
 import uuid
 
+import error_codes
 import guest_app_artifacts as artifacts
 from guest_app_pins import reviewed_manifests
 import guest_ownership as ownership
@@ -190,7 +191,7 @@ def load_completed_stage(state_dir, tart_home, job_id, name):
 
 
 def _state(target, operation_id, operation_phase, *, failed=False, complete=False, authorization=False,
-           created_parent_paths=()):
+           created_parent_paths=(), failed_step=None, failure_code=None):
     current = _safe_record(target.state_dir / 'build-current.json')
     _need(current.get('id') == target.job_id and current.get('mode') == 'preinstall'
           and current.get('name') == target.name and current.get('source_vm') is None
@@ -209,6 +210,10 @@ def _state(target, operation_id, operation_phase, *, failed=False, complete=Fals
         'active': not (complete or failed), 'updated_at': _time(),
         'created_parent_paths': list(created_parent_paths), 'vpn_connected': False}
     if failed:
+        # Only constant tokens are recorded; anything else is dropped, never echoed.
+        current['vpn_configuration'].update(
+            failed_step=failed_step if error_codes.is_step(failed_step) else None,
+            failure_code=failure_code if error_codes.is_code(failure_code) else None)
         current['recovery_required'] = True
         current['message'] = '客机网络配置未完成，已保留未发布暂存盘与私有证据；禁止自动覆盖、重试或启动，需人工核对。'
     elif complete:
@@ -384,9 +389,22 @@ def _generation_records(generations):
             for v in generations]
 
 
+def _authorization_code(result):
+    """Fixed public code for an unaccepted authorization result."""
+    reason = getattr(result, 'failure_reason', None)
+    if not error_codes.is_step(reason):
+        reason = 'unknown-failure'
+    code = 'system-authorization-' + reason
+    status = getattr(result, 'failure_status', None)
+    if reason in ('helper-exit', 'authorization-error') and type(status) is int and 0 < abs(status) < 10 ** 6:
+        code += '-' + str(abs(status))
+    return code
+
+
 def _ownership_receipt(ticket, operation, result, generation, count):
-    _need(type(result) is ownership.AuthorizationResult and result.authorized_helper_completed is True
-          and result.operation == operation and result.independent_readonly_acceptance is (operation == 'verify'),
+    _need(type(result) is ownership.AuthorizationResult and result.authorized_helper_completed is True,
+          _authorization_code(result))
+    _need(result.operation == operation and result.independent_readonly_acceptance is (operation == 'verify'),
           'system-authorization-or-helper-not-completed')
     record = _safe_record(ticket.path.parent / (operation + '.receipt.json'))
     _need(record.get('schema') == 1 and type(record.get('schema')) is int
@@ -577,13 +595,15 @@ def configure_preinstalled_stage(*, state_dir, tart_home, job_id, name, private_
                    created_parent_paths=created_parents)
             return public
         except BaseException as error:
+            inner_code = error_codes.public_code(error, 'internal-error')
             failure = dict(public, phase='failed', failed_phase=phase, recovery_required=True,
-                           manual_review_required=True, error_code='offline-vpn-failed-retained')
+                           manual_review_required=True, error_code='offline-vpn-failed-retained',
+                           failed_step=phase, failure_code=inner_code)
             failure.update({'vpn_configuration_staged': False, 'persistent_ownership_verified': False})
             try:
                 _new_private(evidence / 'vpn-failed.json', failure)
                 _state(target, operation_id, 'failed_retained', failed=True,
-                       created_parent_paths=created_parents)
+                       created_parent_paths=created_parents, failed_step=phase, failure_code=inner_code)
             except Exception:
                 pass  # Never overwrite foreign/new state to fabricate recovery.
             if isinstance(error, (KeyboardInterrupt, SystemExit)):

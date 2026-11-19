@@ -2,6 +2,16 @@
 
 这是可独立构建的源码仓库，不是虚拟机镜像或已公证安装包。**Claude 在客机运行；宿主只负责管理。** 这里不包含开发机器上的状态、节点、账号、日志、第三方二进制或测试磁盘。
 
+## 当前状态（2026-11-18）
+
+- **实机进度**：有一次真实运行完成了 macOS 恢复和四个原版应用的独立只读验收，随后在 VPN 阶段的 `authorized-ownership-apply` 失败。操作者没看到管理员弹窗；没有 `apply.started` 或成功回执；暂存盘已正常卸载，未发布、未开机。之后重跑又失败，界面只显示「请查看失败步骤」，却没有列出任何步骤。
+- **本轮已完成**：
+  - 让这类失败能看出「哪一步、什么原因」（A）。
+  - 修复审查中确认的三项缺陷：共享目录黑名单过窄（B1）、`status.pending` 残留导致 VM 无法启动（C1）、失败任务无法解锁（C2）。
+  - 详见下文「本轮改动」。
+- **宿主复核**：在已审查的 Apple Silicon / macOS 26.6.2 宿主，861 项 Python 测试和 37 项界面测试均通过。诊断版 App 已构建到新路径，原生外壳和辅助程序通过本地签名核验。尚未用诊断版跑真实预装或系统授权。
+- **下一步的关键输入**：新版界面在下一次失败时显示的代码。拿到代码后，按下文「按失败代码决定下一步」选择修复方向。
+
 ## 先看哪里
 
 | 范围 | 源码入口 |
@@ -11,25 +21,163 @@
 | 新建、预装和续接 | [流程编排](<oneclick.py>)、[生命周期与状态](<lifecycle.py>)、[Apple 恢复助手](<CleanVMInstaller.swift>)、[离线预装](<offline_preinstall.py>)、[APFS 归属](<offline_volume.py>)、[发布保护](<preinstall_runtime.py>)。系统与应用从受审查的固定来源获取，不从开发机器复制。 |
 | Clash 配置 | [公开占位模板](<examples/vpn/clash.yaml>)、[解析与策略](<vpn_config.py>)、[本地路径与私有票据](<vpn_store.py>)、[写盘与验收](<offline_vpn.py>)、[首次登录助手](<GuestVPNBootstrap.swift>)。界面默认填本地 YAML 绝对路径，也可先预装、后补 VPN。 |
 | 系统授权和网络 | [授权请求及回执](<guest_ownership.py>)、[固定属主助手](<GuestOwnershipHelper.swift>)、[受保护启动](<protected_launcher.py>)、[端点过滤](<packet_policy.py>)。没有普通 NAT 回退。 |
+| 失败代码 | [异常到公开代码的映射](<error_codes.py>)。界面只显示固定代码，不显示原生输出、路径或节点数据。 |
 | 构建 | [源码安装](<SOURCE_INSTALL.md>)、[双击入口](<Install.command>)、[打包清单](<install_app.py>)、[Git 排除项](<.gitignore>)。旧迁移工具和旧客机 setup 保留用于兼容，不是新版干净构建的前置条件。 |
 
-## 从干净仓库验证
+## 本轮改动（2026-11-18）
 
-首个已审查组合是 Apple Silicon / macOS 26.6.2；恢复镜像固定为 26.6.2 / 25G83。源码构建需系统 Python 3.9+、Ruby/Psych、Apple Command Line Tools 或受选定的 Xcode SDK；Node 仅用于运行界面测试，不是成品运行时依赖。
+改动范围：`error_codes.py`（新增）、`guest_ownership.py`、`offline_vpn.py`、`oneclick.py`、`manager.py`、`runtime_shares.py`、`protected_launcher.py`、`install_app.py`、`static/app.js`、`API_CONTRACT.md`，以及对应测试（新增 `tests/test_protected_launcher.py`）。没有改动 Swift 代码。
 
-在仓库根目录运行：
+### A. 预装失败可诊断
 
-```sh
-/usr/bin/python3 -B -m unittest discover -s tests -p 'test_*.py'
-node --test tests/test_offline_ui.js tests/test_preinstall_ui.js
-```
+失败信息沿以下链路传到界面：
 
-测试使用自有临时 fixture；原生恢复助手测试会从当前源码构建，不依赖私有构建产物。上述测试不会安装或启动虚拟机。构建本地 App 时，先按 [源码安装说明](<SOURCE_INSTALL.md>)选择不存在的输出路径；不要直接覆盖当前正在运行的版本。构建后的本地签名不等于 Developer ID 公证。
+1. [`request_authorization`](<guest_ownership.py:624>) 读取 osascript 的 stderr，只用正则从最后一行取出末尾的状态号，归入固定类别，然后立即丢弃原文。结果存入 [`AuthorizationResult`](<guest_ownership.py:73>) 的两个字段：`failure_reason` 和 `failure_status`。
+   - 授权前的本地校验（票据、helper 摘要、签名）失败时，直接返回 `preflight-rejected`，**不会调用 osascript**。
+   - 启动失败返回 `launch-failed`，超时返回 `timeout`。
+2. [`_authorization_code`](<offline_vpn.py:392>) 把结果拼成 `system-authorization-<reason>[-<status>]`。
+3. VPN 工作流的失败分支把内部步骤和原因写进两处：`build-current.json` 的 `vpn_configuration.failed_step / failure_code`，以及 `vpn-failed.json`。
+4. [`_worker_failure`](<oneclick.py:740>) 先用 [`error_codes.public_code`](<error_codes.py:46>) 求出外层代码，再把内层的步骤和原因转成任务字段 `failed_step / failure_reason`。
+5. [`PREINSTALL_PHASE_FIELDS`](<manager.py:40>) 把这两个字段透出给 `/api/state`。
+6. [`renderBuildJob`](<static/app.js:794>) 在失败卡片上显示三行：「失败步骤 / 原因 / 代码」。
 
-## 继续开发的优先问题
+`public_code` 按以下顺序取值，都不满足时用调用方给的默认码：
 
-1. **为宿主管理员授权失败提供可区分的、脱敏的诊断。** 已有一次真实运行完成 macOS 恢复及四个原版应用的独立只读验收；VPN 阶段失败在 `authorized-ownership-apply`。操作者未看到 macOS 管理员弹窗；没有 `apply.started` 或成功回执，暂存最后已正常卸载，未发布、未开机。不能由这些证据判断是授权请求未进入 GUI 会话，还是助手在写入前拒绝了校验。[授权桥](<guest_ownership.py>)目前丢弃 `osascript` 输出，[工作流](<offline_vpn.py>)保留步骤、但不对外返回底层原因。建议先用 fixture 分别验证启动失败、标准授权取消和助手校验失败的脱敏状态，再在有权限的前台 macOS 会话做真实验证。只记录固定错误类别，不保存管理员凭据、原生错误全文、节点或真实路径。
-2. **非破坏性恢复和首次启动仍未验收。** 已经进入私有配置写盘后失败的任务，与主动选择「先不配置 VPN」的干净等待状态不同。不能把失败任务直接改成可续接，不能重新使用旧授权票据、跳过只读验收、覆盖现有盘或把未验证状态标成成功。无真实授权和获准的配置不得执行实机连通测试。固定 gvproxy 不等于受系统信任；此前静态执行评估拒绝，不能清隔离或降低 Gatekeeper 检查。
-3. **验收分级。** 区分软件和磁盘核验、属主核验、事务发布、首次桌面、导入自报、VPN 连通分别成功的状态。独立 fixture、主机打包成功或客机回执不代表真 VM 网络已验收。
+1. 异常的 `.code` 属性；
+2. 本项目定义的 `ValueError` 子类中，`args[0]` 符合带连字符 slug 格式的值；
+3. 按异常类名查表 `_CLASS_CODES`；
+4. 内置异常（例如 `RuntimeError('任意文本')`）一律不采用其文本。
 
-公开任务请使用合成样例和最小错误类别。不要把本机 `evidence/`、管理器状态、原始凭据或已填入真实节点的配置加入 Git。更多边界见 [安全说明](<SECURITY.md>)、[一键预装指南](<ONE_CLICK_PREINSTALL.md>) 和 [属主授权契约](<GUEST_OWNERSHIP.md>)。
+**有意的行为变化**：VPN 阶段失败时，`failure_code` 从通用的 `preinstall-step-failed` 改为 `offline-vpn-failed-retained`；VPN 配置读取失败改为 `vpn-configuration-unavailable`。依赖旧代码的脚本需要同步修改。
+
+### 按失败代码决定下一步
+
+界面「代码」一行的格式是 `failure_code / failure_reason`，下表按 `failure_reason` 列出。
+
+| `failure_reason` | 含义 | 建议下一步 |
+| --- | --- | --- |
+| `system-authorization-preflight-rejected` | 本地校验未通过，**从未弹窗** | 核对 helper 构建产物与票据 metadata 的摘要、权限和本地签名（`_identity`、`host_tools.verify_local_signature`）。 |
+| `system-authorization-launch-failed` | 无法启动 `/usr/bin/osascript` | 检查控制器进程的运行环境。 |
+| `system-authorization-interaction-not-allowed` | 系统不允许当前进程弹出交互窗口（-60007） | 在已登录的前台桌面会话里打开管理器。长期方案是由原生 App 发起授权，与下文 B2 一起做。 |
+| `system-authorization-user-cancelled` / `-authorization-denied` | 弹窗出现过，但被取消或密码错误 | 弹窗标题显示为「osascript」，容易被忽略。改由原生 App 发起。 |
+| `system-authorization-helper-exit-2` | 已授权，helper 以 root 运行后拒绝执行 | helper 对**所有**错误都 `exit(2)`（[GuestOwnershipHelper.swift:734](<GuestOwnershipHelper.swift:734>)），目前无法细分。下一步需要给 helper 加固定的失败类别。重点检查：[argv[0] 与票据路径比较](<GuestOwnershipHelper.swift:316>)、票据与属主检查、`config.json` 写锁必须仍由父进程持有。 |
+| `system-authorization-helper-exit-126` / `-127` | shell 无法执行 helper | 检查 helper 的路径、权限和所在卷。 |
+| `system-authorization-helper-exit-N`（N≥128） | helper 被信号终止 | — |
+| `system-authorization-authorization-error-N` | 其他系统授权错误 | 按错误号查 Security 框架的状态码。 |
+| `system-authorization-timeout` | 30 分钟内没有完成 | — |
+| `system-authorization-unknown-failure` | stderr 无法解析 | 在宿主终端手动跑一次 osascript，确认 stderr 格式与 `_classify_osascript_failure` 的预期一致。 |
+| `guest-ownership-validation-failed` 或其他回执代码 | helper 退出码为 0，但回执校验未通过 | 对照 [属主授权契约](<GUEST_OWNERSHIP.md>) 核对回执。 |
+| `internal-error` | 内部步骤抛出了非项目异常 | 根据 `failed_step` 定位到该步骤再排查。 |
+
+### B1. 共享目录黑名单（[runtime_shares.py](<runtime_shares.py>)）
+
+- **改动**：新增拒绝以下目录：
+  - 整个 `~/Library`；
+  - 家目录下的所有隐藏目录；
+  - `~/Applications/tart.app`；
+  - 中文名的已安装 App。
+- **例外**：`~/Library/Mobile Documents` 和 `~/Library/CloudStorage` 下面的项目子目录仍可共享，但这两个根目录本身不行。
+- **原因**：读写共享 `~/Library/LaunchAgents` 等目录，会让客机能在宿主上执行代码。
+- **未做**：没有改成「只允许指定项目根」的白名单，目前仍是黑名单。
+
+### C1. 状态文件（[protected_launcher.py](<protected_launcher.py>)）
+
+- `write_status` 改用 `mkstemp` 生成唯一的临时文件名，失败时会删除临时文件。
+- 拿到 `run.lock` 后，会清理旧版残留的固定名 `status.pending`。只有当它是本用户的普通文件、且没有其他硬链接时才删除；否则拒绝启动。
+- **已发布的 VM 用的是创建时复制的旧启动器**，这项修复只对新发布的环境生效。
+
+### C2. 归档失败任务
+
+- 失败卡片新增「归档此失败任务（保留暂存盘）」按钮，需要输入完整 VM 名称确认。
+- 后端：[`oneclick.archive_failed`](<oneclick.py:846>)，接口 `POST /api/preinstall/archive`，请求体恰好是 `{job_id, confirm_name}`。
+- 归档的动作是：持有 `build.lock`，把 `build-current.json` 移到 `build-jobs/<id>/archived-current.json`，之后就能用新名称重新预装。
+- 拒绝归档的情况：
+  - 任务仍在进行，或正在等待配置 VPN；
+  - 已发布，或存在 `commit.json`；
+  - 内层操作仍在进行；
+  - 暂存盘仍挂载；
+  - 名称或 id 不符；
+  - 有其他操作正在运行。
+
+  有其他操作正在运行时返回 409 `busy`；其余情况统一返回 409 `archive_rejected`，提示文字是固定的，不回显内部原因。
+- **暂存盘不会被删除、续接或发布**，仍在 `~/.tart/.gold-manager-staging/<id>/`，会继续占用磁盘，需要人工核对后再处理。
+
+## 验证
+
+### 本轮在客机里的结果
+
+客机没有 Command Line Tools，所以改用独立的 Python 3.9.25 和 Node 22 运行时，按摘要校验后使用。
+
+| | 改动前 | 改动后 |
+| --- | --- | --- |
+| Python | 784 个，5 个失败 | 812 个，同样 5 个失败，没有新增失败 |
+| Node | 34/34 通过 | 37/37 通过 |
+
+这 5 个失败都与本轮改动无关：
+
+- 3 个 Swift fixture 的 `setUpClass`：客机没有 swiftc，包括 `test_CleanVMInstaller`、`test_guest_ownership.SwiftOwnershipFixtureTests`、`test_guest_vpn_seed.SwiftFixtureTests`。
+- `test_prepare_preserves_config_posix_lock_and_offset`：需要 `/usr/bin/python3` 子进程。
+- `test_host_tools…test_compiler_system_temp_requires_os_location_owner_and_exact_private_mode`：改动前就失败，原因未查，在宿主上应复查。
+
+**没有验证的部分**：
+
+- Swift 代码的编译。
+- 宿主上的打包和签名。
+- 真实 osascript 的 stderr 格式：只用 fixture 测过。
+- 失败卡片在 WKWebView 里的实际显示。
+- 真实的预装和归档。
+
+### 在宿主上要做的
+
+1. 用 `git diff` 审查本轮改动，然后提交。
+2. 在仓库根目录跑完整测试。宿主有 Command Line Tools，Swift 测试也应该通过：
+
+   ```sh
+   /usr/bin/python3 -B -m unittest discover -s tests -p 'test_*.py'
+   node --test tests/test_offline_ui.js tests/test_preinstall_ui.js
+   ```
+
+3. 按 [源码安装说明](<SOURCE_INSTALL.md>) 构建到一个**不存在的新路径**。安装器不会覆盖已有的 App，正在运行的旧版也不会自动更新。
+4. 用新版先归档旧的失败任务，再新建一次预装。
+5. 如果仍然失败，记下卡片上的「失败步骤」和「代码」，按上表决定下一步。只记录固定代码，不要附带原生日志、路径或节点信息。
+
+宿主已经用验签后的诊断版归档了上一项失败任务：只移动任务记录，复核了暂存盘、VM 配置和应用回执的文件身份均未变化，暂存盘仍未挂载、未发布、未开机。没有通过旧故障推断新的失败代码；下次复现时需先确认正在运行的是诊断版控制器，而非同版本号的旧后台。
+
+测试使用自有的临时 fixture，不会安装或启动虚拟机。构建后的本地签名不等于 Developer ID 公证。首个已审查组合是 Apple Silicon / macOS 26.6.2，恢复镜像固定为 26.6.2 / 25G83。源码构建需要系统 Python 3.9+、Ruby/Psych，以及 Apple Command Line Tools 或选定的 Xcode SDK。Node 只用于运行界面测试。
+
+## 待办（按优先级）
+
+1. **根据诊断结果修复管理员授权（B2）。** 两项都需要改 Swift，并在宿主上编译和实测。
+   - **TOCTOU 风险**：[`request_authorization`](<guest_ownership.py:624>) 先以普通用户身份校验 helper，再让 root 执行同一个用户可写路径。等待输入密码期间，同 UID 的进程可以替换这个文件。
+     - **修法**：在 root 脚本里先把 helper 复制到只有 root 可写的目录，用 root 重新计算 sha256，比对一致后再执行。
+     - **注意**：helper 会检查 [`argv[0] == ticket.helper`](<GuestOwnershipHelper.swift:316>)，需要同步修改这项检查。
+   - **改由原生 App 发起授权**（Authorization Services），并让 helper 输出固定的失败类别，不再一律 `exit(2)`。
+2. **移除实验性代码（D）。** [NativeApp.swift](<NativeApp.swift>) 仍然注册了账户初始化桥：包括密码表单、辅助功能和屏幕录制权限请求、同意 macOS 许可的勾选框，前端也能触发它；但 README 写的是「未交付」。另外，[deploy_rebuild_update.py](<deploy_rebuild_update.py>) 的文件清单缺少 `oneclick.py` 等文件，执行后会让已安装的 App 无法启动，而且它用 `assert` 做安全检查。
+3. **非破坏性恢复和首次启动仍未验收。**
+   - 已进入私有配置写盘后才失败的任务，与主动选择「先不配置 VPN」的干净等待状态不同。
+   - 失败任务**只能归档**，不能直接改成可续接；不能重用旧授权票据、跳过只读验收、覆盖现有盘，也不能把未验证状态标成成功。
+   - 没有真实授权和获准的配置时，不得执行实机连通测试。
+   - 固定的 gvproxy 不等于受系统信任；此前的静态执行评估是拒绝，不能清除隔离属性或降低 Gatekeeper 检查。
+   - `offline_recovery.py` 被打包了，但没有任何模块导入它，也没有命令行入口；仍缺一个只读的诊断命令。
+4. **验收分级。** 分别记录以下各项是否成功：软件和磁盘核验、属主核验、事务发布、首次桌面、导入自报、VPN 连通。独立 fixture 通过、宿主打包成功或客机回执，都不代表真实 VM 的网络已经验收。
+5. **审查中其余未处理的问题。**
+   - 宿主系统被精确锁定在 26.6.2（`host_tools.py`、`install_app.py`），系统小版本一更新就无法构建和预装。建议改为 ≥26.0 即可，遇到未审查的版本给出警告。
+   - 控制器在全局锁内运行 `tart list`，每次状态轮询都跑 `sysctl` 和 `ps`。
+   - 包转发每轮循环都重新解析 `control.json`，每个 socket 每轮只收一个包。
+   - 版本号在 `bootstrap.py` 和 `manager.py` 中各写一份，与 API 文档也不一致。
+   - 硬编码的 VM 名：`gold`、`gold-backup`、`gold-fresh`。
+   - 安全文件读写函数重复实现了约 15 份，检查项各不相同。
+   - 「打开窗口」每次都用 `swift -e` 现场编译。
+   - `/tmp/goldnet-*` 目录从不清理。
+   - 没有格式化工具、代码检查或 CI。
+6. **需要负责人决定的架构问题。** 是否放弃「宿主离线写客机磁盘」，改为在客机内用可见的安装器安装？这样做可以去掉宿主 root 授权、APFS 布局依赖和宿主版本锁定（上面第 1 项和第 5 项的第一条），代价是首次登录后用户要多做一步。另外，控制器依赖 Command Line Tools 自带的 `/usr/bin/python3`（3.9，已停止维护），没装 CLT 的 Mac 无法运行。
+
+## 改代码时要注意
+
+- **失败代码只能是固定 slug。** 新增代码时，要同时：
+  - 在 `error_codes.py` 或抛出处给出 slug；
+  - 在 `static/app.js` 的 `steps` / `reasons` 映射表里补上中文；
+  - 在测试里断言原始文本不会出现在状态 JSON 中。
+- **界面测试的取函数方式有限制。** `tests/test_*_ui.js` 用 `declaration(name)` 从 `app.js` 截取单个函数，截取范围到第一个 `\n  }` 为止。函数内部如果有缩进两格的 `}`，就会截错。
+- **打包清单是手写的。** 新增的 Python 模块必须加进 `install_app.py` 的 `FILES`，本轮已加入 `error_codes.py`。
+- **不要提交本地数据。** 公开任务请使用合成样例和最小错误类别。不要把本机 `evidence/`、管理器状态、原始凭据或已填入真实节点的配置加入 Git。更多边界见 [安全说明](<SECURITY.md>)、[一键预装指南](<ONE_CLICK_PREINSTALL.md>) 和 [属主授权契约](<GUEST_OWNERSHIP.md>)。

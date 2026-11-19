@@ -300,7 +300,8 @@ class PythonOwnershipTests(unittest.TestCase):
             self.assertEqual(argv, ['/usr/bin/osascript', '-'])
             self.assertIn(b'with administrator privileges', kwargs['input'])
             self.assertNotIn(SECRET.encode(), kwargs['input'])
-            self.assertIs(kwargs['stderr'], subprocess.DEVNULL)
+            # stderr is captured only to extract the trailing numeric status.
+            self.assertIs(kwargs['stderr'], subprocess.PIPE)
             self.assertIs(kwargs['stdout'], subprocess.DEVNULL)
             write(ticket.path.parent / 'apply.receipt.json', receipt(f, 'apply'))
             return subprocess.CompletedProcess(argv, 0)
@@ -328,6 +329,69 @@ class PythonOwnershipTests(unittest.TestCase):
                 result = ownership.request_authorization(ticket, 'apply', acknowledge_authorization=True, run=runner)
                 self.assertFalse(result.authorized_helper_completed)
                 self.assertNotIn(SECRET, repr(result))
+
+    def authorization_failure(self, runner):
+        ticket = self.fixture.ticket if getattr(self.fixture, 'ticket', None) else self.fixture.prepare()
+        with patch.object(ownership.host_tools, 'verify_local_signature'):
+            result = ownership.request_authorization(ticket, 'apply', acknowledge_authorization=True, run=runner)
+        self.assertFalse(result.authorized_helper_completed)
+        self.assertEqual((result.phase, result.operation), ('authorization_or_helper_failed_retained', 'apply'))
+        self.assertNotIn(SECRET, repr(result))
+        self.assertFalse((ticket.path.parent / 'apply.receipt.json').exists())
+        return result
+
+    def test_osascript_status_is_classified_without_retaining_native_text(self):
+        prefix = b'-:93:220: execution error: '
+        cases = (
+            (prefix + b'User canceled. (-128)\n', 'user-cancelled', None),
+            (prefix + b'The authorization was cancelled by the user. (-60006)\n', 'user-cancelled', None),
+            (prefix + b'The administrator user name or password was incorrect. (-60005)\n', 'authorization-denied', None),
+            (prefix + b'The authorization was denied since no user interaction was possible. (-60007)\n',
+             'interaction-not-allowed', None),
+            (prefix + b'Internal error. (-60008)\n', 'authorization-error', -60008),
+            (prefix + SECRET.encode() + b' /private/ticket path (3)\n', 'helper-exit', 3),
+            (b'garbage without a status ' + SECRET.encode(), 'unknown-failure', None),
+            (None, 'unknown-failure', None),
+        )
+        for stderr, reason, status in cases:
+            with self.subTest(reason=reason, stderr=stderr):
+                runner = lambda argv, _native=stderr, **kwargs: subprocess.CompletedProcess(argv, 1, None, _native)
+                result = self.authorization_failure(runner)
+                self.assertEqual((result.failure_reason, result.failure_status), (reason, status))
+
+    def test_osascript_timeout_and_launch_failure_are_distinct(self):
+        def timeout(argv, **kwargs):
+            raise subprocess.TimeoutExpired(argv, kwargs['timeout'], stderr=SECRET.encode())
+        def missing(argv, **kwargs):
+            raise FileNotFoundError(2, SECRET)
+        self.assertEqual(self.authorization_failure(timeout).failure_reason, 'timeout')
+        self.assertEqual(self.authorization_failure(missing).failure_reason, 'launch-failed')
+
+    def test_local_preflight_rejection_never_prompts(self):
+        ticket = self.fixture.prepare()
+        run = Mock()
+        with patch.object(ownership.host_tools, 'verify_local_signature', side_effect=RuntimeError(SECRET)):
+            result = ownership.request_authorization(ticket, 'apply', acknowledge_authorization=True, run=run)
+        run.assert_not_called()
+        self.assertFalse(result.authorized_helper_completed)
+        self.assertEqual((result.failure_reason, result.failure_status), ('preflight-rejected', None))
+        self.assertNotIn(SECRET, repr(result))
+        with patch.object(ownership.host_tools, 'verify_local_signature'), \
+                patch.object(ownership, '_identity', side_effect=ownership.OwnershipError(SECRET)):
+            result = ownership.request_authorization(ticket, 'apply', acknowledge_authorization=True, run=run)
+        run.assert_not_called()
+        self.assertEqual(result.failure_reason, 'preflight-rejected')
+
+    def test_successful_authorization_has_no_failure_fields(self):
+        f = self.fixture
+        ticket = f.prepare()
+        def fake_run(argv, **kwargs):
+            write(ticket.path.parent / 'apply.receipt.json', receipt(f, 'apply'))
+            return subprocess.CompletedProcess(argv, 0, None, b'')
+        with patch.object(ownership.host_tools, 'verify_local_signature'):
+            result = ownership.request_authorization(ticket, 'apply', acknowledge_authorization=True, run=fake_run)
+        self.assertTrue(result.authorized_helper_completed)
+        self.assertEqual((result.failure_reason, result.failure_status), (None, None))
 
     def test_fixture_receipt_and_same_generation_never_accepted(self):
         f = self.fixture

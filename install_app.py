@@ -19,7 +19,7 @@ FILES=('manager.py','bootstrap.py','runtime_shares.py','discard_state.py',
        'preinstall_materials.py','host_artifacts.py','host_tools.py','preinstall_runtime.py',
        'oneclick.py','offline_vpn.py','guest_ownership.py','offline_writable.py','offline_volume.py','offline_payload.py',
        'offline_install.py','offline_recovery.py','offline_disk.py','offline_preinstall.py',
-       'guest_app_artifacts.py','guest_app_pins.py','quarantine_policy.py')
+       'guest_app_artifacts.py','guest_app_pins.py','quarantine_policy.py','error_codes.py')
 STATIC_FILES=('index.html','style.css','app.js','preinstall.js','preinstall.css')
 SOURCE_FILES=('CleanVMInstaller.swift','CleanVMInstaller.entitlements.plist',
               'GuestVPNBootstrap.swift','GuestOwnershipHelper.swift','NativeApp.swift','GuestInitialization.swift')

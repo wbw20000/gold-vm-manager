@@ -41,7 +41,8 @@ PREINSTALL_PHASE_FIELDS = frozenset(('id', 'mode', 'name', 'phase', 'pid', 'prog
     'updated_at', 'message', 'source_vm', 'old_deleted', 'system_restored', 'applications_preinstalled',
     'guest_started', 'desktop_verified', 'host_credentials_copied', 'user_vpn_configuration_supplied',
     'vpn_configuration_staged', 'vpn_connected', 'network_independently_verified', 'published',
-    'needs_host_security_authorization', 'recovery_required', 'failure_code', 'failed_phase'))
+    'needs_host_security_authorization', 'recovery_required', 'failure_code', 'failed_phase',
+    'failed_step', 'failure_reason'))
 HOME = Path.home()
 STATE_DIR = HOME / 'Library/Application Support/GoldVMManager'
 CONFIG_PATH = STATE_DIR / 'config.json'
@@ -242,6 +243,16 @@ class Controller:
             except (ValueError, OSError, subprocess.SubprocessError):
                 raise AppError('无法继续 VPN 配置。请确认任务仍在等待、节点已重新校验，且暂存盘未被改动。', 'vpn_resume_rejected', 409) from None
             return {'ok': True, 'job': {k: v for k, v in job.items() if k in PREINSTALL_PHASE_FIELDS}}
+
+    def archive_preinstall(self, payload):
+        with self.lock:
+            if self.operations:
+                raise AppError('请先等待当前 VM 操作完成', 'busy', 409)
+            try:
+                return oneclick.archive_failed(payload, state_dir=STATE_DIR, tart_home=VM_ROOT.parent)
+            except (ValueError, OSError, subprocess.SubprocessError):
+                raise AppError('未归档。只能归档已结束、未发布、未挂载且名称完全一致的失败预装任务；暂存盘未改动。',
+                               'archive_rejected', 409) from None
 
     def pick_ipsw(self, payload):
         if payload != {}:
@@ -844,6 +855,8 @@ class Handler(BaseHTTPRequestHandler):
                 value = self.server.controller.create_preinstall(payload)
             elif path == '/api/preinstall/resume':
                 value = self.server.controller.resume_preinstall(payload)
+            elif path == '/api/preinstall/archive':
+                value = self.server.controller.archive_preinstall(payload)
             elif path == '/api/build':
                 value = self.server.controller.create_build(payload)
             elif path == '/api/pick-ipsw':

@@ -110,6 +110,32 @@ class RuntimeSharesTests(unittest.TestCase):
         result = m.validate_shares([self.share(path=str(p))])
         self.assertEqual(result[0]["path"], str(p))
 
+    def make_dir(self, relative):
+        path = self.home / relative
+        path.mkdir(parents=True, mode=0o700, exist_ok=True)
+        path.chmod(0o700)
+        return path
+
+    def test_host_autostart_credential_and_tool_directories_are_never_shareable(self):
+        # A read-write share of any of these lets guest software plant code or
+        # read secrets the host user relies on (LaunchAgents, shell/tool configs).
+        for relative in ("Library/LaunchAgents", "Library/Application Support/SomeBrowser",
+                         "Library/Preferences", "Library/Mobile Documents", "Library/CloudStorage",
+                         ".config/gh", ".claude", ".aws", ".gnupg", ".local/bin",
+                         "Applications/tart.app"):
+            with self.subTest(relative=relative):
+                path = self.make_dir(relative)
+                with self.assertRaises(m.ShareValidationError) as raised:
+                    m.validate_shares([self.share(path=str(path))])
+                self.assertEqual(raised.exception.code, "protected_directory")
+
+    def test_cloud_document_project_subdirectories_remain_shareable(self):
+        for relative in ("Library/Mobile Documents/com~apple~CloudDocs/project",
+                         "Library/CloudStorage/Dropbox/project", "Projects/demo"):
+            with self.subTest(relative=relative):
+                path = self.make_dir(relative)
+                self.assertEqual(m.validate_shares([self.share(path=str(path))])[0]["path"], str(path))
+
     def test_missing_id_generated_but_persisted_config_requires_id(self):
         s = self.share()
         del s["id"]

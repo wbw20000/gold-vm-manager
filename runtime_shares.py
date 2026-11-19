@@ -30,7 +30,11 @@ STATE_DIR = CONFIG_PATH.parent
 # Protect the active module's source/deployment directory, not an unrelated checkout.
 MANAGER_SOURCE_DIR = Path(__file__).resolve().parent
 MANAGER_INSTALL_DIR = HOST_HOME / "Applications/Gold VM Manager.app"
-MANAGER_EXTRA_DIRS = (HOST_HOME / "Applications/GoldVMManager",)
+MANAGER_EXTRA_DIRS = (HOST_HOME / "Applications/GoldVMManager",
+                      HOST_HOME / "Applications/Gold VM 管理器.app")
+# Inside ~/Library only these cloud-document roots may hold shareable project
+# folders, and only strictly below the root itself.
+CLOUD_DOCUMENT_ROOTS = ("Library/Mobile Documents", "Library/CloudStorage")
 NETWORK_CONTROLLER_DIRS = tuple(HOST_HOME / "Applications" / name for name in (
     "GoldNetwork", "GoldBackupNetwork", "GoldFreshNetwork"))
 # Exact roots differ from entire sensitive subtrees: /Users and home must not
@@ -106,9 +110,32 @@ def _protected_paths():
     roots.add(home)
     trees = list(PROTECTED_SUBTREES) + list(NETWORK_CONTROLLER_DIRS) + list(MANAGER_EXTRA_DIRS)
     trees += [home / ".ssh", home / ".tart", home / "Library/Keychains",
+              home / "Applications/tart.app",
               Path(STATE_DIR), Path(CONFIG_PATH).parent, Path(MANAGER_SOURCE_DIR),
               Path(MANAGER_INSTALL_DIR)]
     return roots, [Path(os.path.normpath(str(p))) for p in trees]
+
+
+def _host_private_location(path):
+    """Home locations a guest must never write to or read from.
+
+    A read-write share of ~/Library (LaunchAgents, Application Support,
+    Preferences) or of a home dot-directory (shell/tool configs, credentials)
+    lets guest software plant code that the host user later runs.
+    """
+    home = Path(os.path.normpath(str(HOST_HOME)))
+    if path == home or home not in path.parents:
+        return False
+    relative = path.relative_to(home).parts
+    if relative[0].startswith("."):
+        return True
+    if relative[0] != "Library":
+        return False
+    for root in CLOUD_DOCUMENT_ROOTS:
+        parts = Path(root).parts
+        if relative[:len(parts)] == parts and len(relative) > len(parts):
+            return False
+    return True
 
 
 def _share_directory(value):
@@ -127,8 +154,10 @@ def _share_directory(value):
         _fail("directory_owner", "共享目录必须属于当前宿主用户")
     roots, trees = _protected_paths()
     # Reject ancestors too: sharing a parent exposes its protected descendants.
-    if path in roots or any(_is_within(path, p) or _is_within(p, path) for p in trees):
-        _fail("protected_directory", "不能共享系统、密钥、虚拟机或管理控制目录及其上级目录")
+    if (path in roots or _host_private_location(path)
+            or any(_is_within(path, p) or _is_within(p, path) for p in trees)):
+        _fail("protected_directory", "不能共享系统、密钥、~/Library、家目录下的隐藏配置目录、虚拟机或管理控制目录及其上级目录；"
+                                     "iCloud 云盘或 CloudStorage 内的项目子目录除外")
     return str(canonical)
 
 

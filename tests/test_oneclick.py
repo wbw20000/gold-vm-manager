@@ -633,7 +633,8 @@ class WorkerTests(Fixture):
         request_path = self.context.jobdir / 'request.json'
         request = registry.read_private(request_path)
         registry.write_private(request_path, dict(request, vpn_configuration_id=self.other))
-        self.assert_failed(self.execute(), 'queued', 'preinstall-step-failed', recovery=False)
+        # The display-only store message never crosses; its class maps to a fixed category.
+        self.assert_failed(self.execute(), 'queued', 'vpn-configuration-unavailable', recovery=False)
         self.acquire.assert_not_called()
         self.spawn.assert_not_called()
         self.rename.assert_not_called()
@@ -739,12 +740,151 @@ class WorkerTests(Fixture):
 
         self.vpn.side_effect = authorization_denied
         status = self.execute()
-        self.assert_failed(status, 'failed_retained', 'preinstall-step-failed', recovery=True)
+        self.assert_failed(status, 'failed_retained', 'offline-vpn-failed-retained', recovery=True)
         self.assertIs(status['vpn_configuration_staged'], False)
         self.assertIs(status['vpn_configuration']['active'], False)
         self.assertIs(status['applications_preinstalled'], True)
+        # An older failure record without inner details still yields explicit empties.
+        self.assertIsNone(status['failed_step'])
+        self.assertIsNone(status['failure_reason'])
         self.runtime_prepare.assert_not_called()
         self.assert_rejected_before_rename(status)
+
+    def vpn_retained_failure(self, step='authorized-ownership-apply',
+                             code='system-authorization-interaction-not-allowed'):
+        def configure(**_):
+            c = self.context
+            target = SimpleNamespace(state_dir=c.state, stage=c.stage, job_id=c.job_id, name=NAME)
+            offline_vpn._state(target, '2' * 32, 'awaiting_owner_apply', authorization=True)
+            offline_vpn._state(target, '2' * 32, 'failed_retained', failed=True,
+                               failed_step=step, failure_code=code)
+            raise offline_vpn.OfflineVPNError('offline-vpn-failed-retained')
+        return configure
+
+    def test_offline_vpn_inner_step_and_reason_reach_job_status(self):
+        self.vpn.side_effect = self.vpn_retained_failure()
+        status = self.execute()
+        self.assert_failed(status, 'failed_retained', 'offline-vpn-failed-retained', recovery=True)
+        self.assertEqual((status['failed_step'], status['failure_reason']),
+                         ('authorized-ownership-apply', 'system-authorization-interaction-not-allowed'))
+        self.assertIs(status['vpn_configuration']['active'], False)
+        self.assert_rejected_before_rename(status)
+
+    def test_untrusted_inner_failure_fields_are_never_recorded(self):
+        self.vpn.side_effect = self.vpn_retained_failure(step='/Users/fixture/' + SECRET, code='Has Spaces ' + SECRET)
+        status = self.execute()
+        self.assert_failed(status, 'failed_retained', 'offline-vpn-failed-retained', recovery=True)
+        self.assertIsNone(status['failed_step'])
+        self.assertIsNone(status['failure_reason'])
+
+    def test_constant_code_in_project_error_args_is_reported(self):
+        self.vpn.side_effect = offline_vpn.OfflineVPNError('writable-detach-unconfirmed')
+        status = self.execute()
+        self.assert_failed(status, 'awaiting_first_desktop_acceptance', 'writable-detach-unconfirmed', recovery=True)
+
+    def test_project_error_sentence_maps_to_fixed_class_category(self):
+        self.app.side_effect = offline_preinstall.PreinstallError('Post-write file identity/config/NVRAM mismatch; no readonly acceptance')
+        status = self.execute()
+        self.assert_failed(status, 'awaiting_offline_preinstall', 'offline-preinstall-error', recovery=True)
+        self.assertNotIn('NVRAM mismatch', json.dumps(status))
+
+    def test_builtin_exception_text_is_never_a_failure_code(self):
+        self.app.side_effect = ValueError(SECRET)
+        self.assert_failed(self.execute(), 'awaiting_offline_preinstall', 'preinstall-step-failed', recovery=True)
+
+    def test_non_value_error_code_shaped_text_is_ignored(self):
+        self.app.side_effect = RuntimeError('readonly-app-bytes-changed')
+        self.assert_failed(self.execute(), 'awaiting_offline_preinstall', 'preinstall-step-failed', recovery=True)
+
+    # --- Archiving a failed job: explicit unlock that retains the stage. ---
+
+    def failed_vpn_job(self):
+        self.vpn.side_effect = self.vpn_retained_failure()
+        status = self.execute()
+        self.release_worker_lock()
+        return status
+
+    def archive(self, **overrides):
+        value = dict({'job_id': self.context.job_id, 'confirm_name': NAME}, **overrides)
+        return oneclick.archive_failed(value, state_dir=self.state, tart_home=self.tart_home)
+
+    def test_archive_failed_job_unlocks_new_fresh_job(self):
+        status = self.failed_vpn_job()
+        self.assertIs(status['recovery_required'], True)
+        disk = self.context.stage / 'disk.img'
+        before = disk.stat()
+        self.detached.reset_mock()
+        result = self.archive()
+        self.assertEqual(result, {'ok': True, 'job_id': self.context.job_id, 'name': NAME, 'stage_retained': True})
+        self.assertFalse((self.state / 'build-current.json').exists())
+        archived = registry.read_private(self.context.jobdir / 'archived-current.json')
+        self.assertIsInstance(archived.pop('archived_at'), str)
+        self.assertEqual(archived, status)
+        after = disk.stat()
+        self.assertEqual((after.st_ino, after.st_size), (before.st_ino, before.st_size))
+        self.detached.assert_called_once_with(disk)
+        self.assertIsNone(lifecycle.status(state_dir=self.state))
+        self.spawn.side_effect = self.worker_spawn
+        queued = self.start(dict(payload(self.other), name='Second fixture'))
+        self.assertEqual((queued['phase'], queued['name']), ('queued', 'Second fixture'))
+
+    def test_archive_rejects_unsafe_jobs_without_changing_records(self):
+        status = self.failed_vpn_job()
+        current_path = self.state / 'build-current.json'
+        archived_path = self.context.jobdir / 'archived-current.json'
+        journal = self.context.jobdir / 'commit.json'
+        now = oneclick._now()
+        record_cases = {
+            'queued-active': dict(status, phase='queued', pid=None, started_at=now),
+            'waiting-for-vpn': dict(status, phase='awaiting_vpn_configuration', recovery_required=False),
+            'published': dict(status, published=True),
+            'offline-preinstall-active': dict(status, offline_preinstall={'operation_id': '1' * 32, 'active': True}),
+            'vpn-configuration-active': dict(status, vpn_configuration=dict(status['vpn_configuration'], active=True)),
+            'other-mode': dict(status, mode='create'),
+        }
+        for label, record in record_cases.items():
+            with self.subTest(label):
+                self.write(current_path, record)
+                before = current_path.read_bytes()
+                with self.assertRaises(oneclick.OneClickError):
+                    self.archive()
+                self.assertEqual(current_path.read_bytes(), before)
+                self.assertFalse(archived_path.exists())
+        self.write(current_path, status)
+        before = current_path.read_bytes()
+        payload_cases = {
+            'wrong-name': {'confirm_name': 'Fresh fixture '},
+            'wrong-job': {'job_id': 'c' * 32},
+            'extra-field': {'force': True},
+        }
+        for label, change in payload_cases.items():
+            with self.subTest(label):
+                with self.assertRaises(oneclick.OneClickError):
+                    self.archive(**change)
+                self.assertEqual(current_path.read_bytes(), before)
+        for value in (None, [], {'job_id': self.context.job_id}):
+            with self.subTest(payload=value), self.assertRaises(oneclick.OneClickError):
+                oneclick.archive_failed(value, state_dir=self.state, tart_home=self.tart_home)
+        with self.subTest('commit-journal'):
+            self.write(journal, {'version': 1, 'id': self.context.job_id, 'phase': 'before_publish'})
+            with self.assertRaises(oneclick.OneClickError):
+                self.archive()
+            journal.unlink()
+        with self.subTest('still-attached'):
+            self.detached.side_effect = oneclick.OneClickError('publication-disk-still-attached')
+            with self.assertRaises(oneclick.OneClickError):
+                self.archive()
+            self.detached.side_effect = None
+        self.assertEqual(current_path.read_bytes(), before)
+        self.assertFalse(archived_path.exists())
+        self.assertTrue((self.context.stage / 'disk.img').is_file())
+
+    def test_archive_requires_the_lifecycle_lock(self):
+        self.vpn.side_effect = self.vpn_retained_failure()
+        self.execute()  # The fixture worker still holds build.lock.
+        with self.assertRaisesRegex(oneclick.OneClickError, 'lifecycle-lock-busy'):
+            self.archive()
+        self.assertTrue((self.state / 'build-current.json').exists())
 
     def assert_rejected_before_rename(self, result):
         self.assertEqual(result['phase'], 'failed', result)

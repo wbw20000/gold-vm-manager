@@ -116,15 +116,39 @@ def write_status(path, data):
     resolved = path.parent.resolve() / path.name
     if resolved != BASE / 'status.json' or path.is_symlink():
         raise RuntimeError('Unexpected status path')
-    temp = BASE / 'status.pending'
-    if temp.exists() or temp.is_symlink():
-        raise RuntimeError('Unexpected existing status staging file')
-    with temp.open('x', encoding='utf-8') as f:
-        json.dump(data, f, sort_keys=True)
-        f.write('\n')
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(str(temp), str(resolved))
+    # A unique, exclusively created staging name: a file left behind by a crash
+    # can never block later updates, and a failed write never leaves one.
+    fd, name = tempfile.mkstemp(prefix='status.', suffix='.pending', dir=str(BASE))
+    temp = Path(name)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(data, f, sort_keys=True)
+            f.write('\n')
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(str(temp), str(resolved))
+    except BaseException:
+        try:
+            temp.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def remove_stale_status_staging():
+    """Remove the legacy fixed staging file left by an older launcher crash.
+
+    Call only while holding run.lock. Only a private regular file owned by us is
+    removed; anything else (e.g. a symlink) fails closed and is left in place.
+    """
+    legacy = BASE / 'status.pending'
+    try:
+        info = os.lstat(str(legacy))
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+        raise RuntimeError('Unexpected legacy status staging file')
+    legacy.unlink()
 
 
 def local_control(management_capability):
@@ -204,6 +228,7 @@ def main():
         if v2:
             lock.close()
         return 0
+    remove_stale_status_staging()  # Safe only now: run.lock excludes any other writer.
     write_status(BASE/'status.json',{'state':'validating','launcher_pid':os.getpid(),'started_unix':time.time()})
     gv = BASE / 'gvproxy-darwin'
     if v2:

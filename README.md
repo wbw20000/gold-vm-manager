@@ -1,5 +1,8 @@
 # Gold VM Manager
 
+Claude code 防封分享
+https://x.com/clarkwang258/status/2123747367639994757?a=N5rdDh7ujMJGPXSOWh4&s=20
+
 简体中文 · [English](README.en.md)
 
 在 Apple Silicon Mac 上创建独立的 macOS VM，在客机里使用 **Claude Code**。项目的目的是减少宿主与客机配置混用、代理断开后意外直连等风险，**不能保证不封号，也不能改变 Claude 的地区、账户或套餐资格**。

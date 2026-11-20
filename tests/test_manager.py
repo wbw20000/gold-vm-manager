@@ -1001,6 +1001,15 @@ class BootstrapTests(PrivateFixture):
         import io
         self.opener.open.return_value.__enter__.return_value = io.BytesIO(json.dumps(value).encode())
 
+    def test_bootstrap_requires_the_packaged_controller_version(self):
+        self.assertEqual(b.CONTROLLER_VERSION, m.VERSION)
+        info = self.info()
+        self.kill.side_effect = None
+        self.response({'ok': True, 'app': {'name': 'Gold VM Manager', 'version': m.VERSION}})
+        self.assertEqual(b.running_info(required_version=b.CONTROLLER_VERSION), info)
+        self.response({'ok': True, 'app': {'name': 'Gold VM Manager', 'version': '1.3.0'}})
+        self.assertIsNone(b.running_info(required_version=b.CONTROLLER_VERSION))
+
     def test_absent_or_unsafe_server_info_does_not_contact_any_process(self):
         self.assertIsNone(b.running_info())
         self.info()

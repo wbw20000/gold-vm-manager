@@ -520,15 +520,11 @@ class TemplateTests(unittest.TestCase):
         return (Path(__file__).resolve().parents[1] / 'examples' / 'vpn' / 'clash.yaml').read_text(encoding='utf-8')
 
     @unittest.skipUnless(os.path.isfile('/usr/bin/ruby'), 'System Ruby is not available')
-    def test_public_upload_template_has_one_placeholder_and_cannot_connect(self):
+    def test_public_upload_template_has_no_enabled_nodes(self):
         text = self.upload_template()
-        self.assertEqual(vpn._safe_yaml(text), {'proxies': [{
-            'type': 'trojan', 'server': '192.0.2.10', 'port': 443,
-            'password': 'REPLACE_WITH_TROJAN_PASSWORD', 'sni': 'vpn.example.com',
-            'network': 'tcp', 'skip-cert-verify': False,
-        }]})
+        self.assertEqual(vpn._safe_yaml(text), {'proxies': []})
         resolver = Mock(side_effect=AssertionError('no DNS'))
-        with self.assertRaisesRegex(vpn.VPNConfigurationError, 'globally routable unicast IPv4'):
+        with self.assertRaises(vpn.VPNConfigurationError):
             vpn.parse_submission({'input_mode': 'yaml', 'yaml_text': text}, resolver=resolver)
         resolver.assert_not_called()
 
@@ -536,7 +532,7 @@ class TemplateTests(unittest.TestCase):
     def test_filling_each_documented_node_block_is_accepted_by_the_upload_parser(self):
         template = self.upload_template()
         lines = template.splitlines()
-        variants = [('trojan', template)]
+        variants = []
         start = '#   - type: '
         for index, line in enumerate(lines):
             if not line.startswith(start):
@@ -560,14 +556,11 @@ class TemplateTests(unittest.TestCase):
                 self.assertEqual(result.summary['node_count'], 1)
                 self.assertEqual(result.summary['protocols'], [kind])
 
-    def test_json_template_is_nonfunctional_rfc5737_only(self):
+    def test_json_template_has_no_nodes(self):
         path = Path(__file__).resolve().parents[1] / 'examples' / 'vpn' / 'fields.json'
-        # Only the committed fixture is read; no host/user configuration files.
+        # Only the committed template is read; no host/user configuration files.
         payload = json.loads(path.read_text(encoding='utf-8'))
-        self.assertEqual(payload['input_mode'], 'fields')
-        self.assertEqual(len(payload['nodes']), 6)
-        for raw in payload['nodes']:
-            self.assertTrue(raw['server'].startswith(('192.0.2.', '198.51.100.', '203.0.113.')))
+        self.assertEqual(payload, {'input_mode': 'fields', 'nodes': []})
         with self.assertRaises(vpn.VPNConfigurationError):
             vpn.parse_submission(payload)
 

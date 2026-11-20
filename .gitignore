@@ -74,8 +74,11 @@ shares.last-start.json
 *.log
 
 # Local authentication material (examples must be deliberately reviewed).
-clash.local.yaml
-clash.local.yml
+# Node configurations are private by default; only the reviewed empty YAML is tracked.
+*.yaml
+*.yml
+!/examples/vpn/clash.yaml
+*.local.json
 .env
 .env.*
 *.pem

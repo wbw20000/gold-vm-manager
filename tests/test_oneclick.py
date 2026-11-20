@@ -1205,8 +1205,13 @@ class BuildInstallersTests(unittest.TestCase):
         self.assertEqual(json.loads(profile.read_text(encoding='utf-8')), self.config)
         self.assertIn('节点', profile.read_text(encoding='utf-8'))  # Readable names, not escapes.
         note = (self.target / oneclick.INSTALLERS_README).read_text(encoding='utf-8')
-        for words in ('Finder', '应用程序', '订阅', '本地', '虚拟网卡模式', '标记首次设置完成'):
+        for words in ('Finder', '一个一个拖到客机桌面，再从桌面一个一个拖进「应用程序」',
+                      '订阅', '本地', '虚拟网卡模式', '浏览器环境', '电脑环境', '定位服务', '检测项全部变绿',
+                      'https://ip.net.coffee/claude/', '70 分或以上', '未报告 IP 或 DNS 泄露',
+                      'Claude 官方页面注册或登录', '标记首次设置完成'):
             self.assertIn(words, note)
+        self.assertLess(note.index('浏览器环境'), note.index('https://ip.net.coffee/claude/'))
+        self.assertLess(note.index('https://ip.net.coffee/claude/'), note.index('Claude 官方页面注册或登录'))
         for path in (profile, self.target / oneclick.INSTALLERS_README):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
         self.assertNotIn(SECRET, note)

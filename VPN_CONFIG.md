@@ -49,7 +49,7 @@ Output has silent logging, loopback-only local proxy/DNS, no controller API or c
 
 ## Nonfunctional templates and tests
 
-The [Clash YAML upload template](<examples/vpn/clash.yaml>) starts with one active Trojan TLS/TCP node. To use another supported protocol, replace only the active node with the corresponding commented example, leaving `proxies:` and the indentation intact. Use your operator's actual endpoint, port, credentials and TLS name; leave certificate verification enabled. Save the filled copy outside version control and upload it in the one-click preinstall form. The [parameter-form JSON](<examples/vpn/fields.json>) is a separate multi-protocol reference. Neither file contains real endpoints or credentials, and both are deliberately rejected unchanged.
+The [Clash YAML template](<examples/vpn/clash.yaml>) has zero active nodes (`proxies: []`). In a copy outside version control, change that line to `proxies:`, then uncomment the matching protocol block below it and keep the indentation. Use your operator's actual endpoint, port, credentials and TLS name; leave certificate verification enabled. Enter only the filled copy's local path in the one-click form. The [parameter-form JSON](<examples/vpn/fields.json>) contains an empty `nodes` array. Neither template contains real endpoints or credentials, and both are deliberately rejected unchanged.
 
 Run the fixture-only suite:
 

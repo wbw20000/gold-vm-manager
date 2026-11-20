@@ -118,6 +118,77 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(updated_shares['vms']['other']['shares'][0]['path'], host_path)
 
 
+class LegacyOwnershipMarkerTests(unittest.TestCase):
+    """Older preinstalled VMs (bb1) hold root-owned start markers of the retired helper."""
+
+    def setUp(self):
+        import os
+        import shutil
+        import tempfile
+        self.os = os
+        self.root = Path(tempfile.mkdtemp(prefix='gold-deletion-markers-')).resolve()
+        self.addCleanup(shutil.rmtree, str(self.root))
+        self.vm = self.root / 'bb1'
+        self.vm.mkdir(mode=0o700)
+        for name in ('config.json', 'disk.img', 'nvram.bin', '.offline-vpn.complete.json'):
+            (self.vm / name).write_bytes(b'inert fixture')
+        self.operation = self.vm / '.guest-ownership' / ('c' * 32)
+        self.operation.mkdir(mode=0o700, parents=True)
+        for name in ('ticket.json', 'apply.receipt.json', 'apply.started', 'verify.started'):
+            (self.operation / name).write_bytes(b'{}')
+        self.root_owned = {self.operation / 'apply.started', self.operation / 'verify.started'}
+
+    def check(self):
+        real = Path.lstat
+        def lstat(path):
+            info = real(path)
+            if path in self.root_owned:
+                values = list(info[:10])
+                values[4] = 0  # st_uid: written by the retired root helper with owner 0.
+                return self.os.stat_result(values)
+            return info
+        with patch.object(Path, 'lstat', autospec=True, side_effect=lstat):
+            deletion._check_tree(self.vm, None)
+
+    def test_exact_root_owned_start_markers_do_not_block_deletion(self):
+        self.check()
+
+    def test_any_other_root_owned_entry_still_blocks_deletion(self):
+        for path in (self.operation / 'ticket.json', self.vm / 'disk.img', self.operation,
+                     self.vm / '.guest-ownership' / 'apply.started'):
+            with self.subTest(path=path.name):
+                self.root_owned = {path}
+                if not path.exists():
+                    path.write_bytes(b'{}')
+                with self.assertRaises(deletion.DeletionRejected):
+                    self.check()
+        self.root_owned = {self.operation / 'apply.started'}
+        other = self.vm / '.guest-ownership' / 'not-an-operation-id'
+        other.mkdir(mode=0o700)
+        (other / 'apply.started').write_bytes(b'{}')
+        self.root_owned.add(other / 'apply.started')
+        with self.assertRaises(deletion.DeletionRejected):
+            self.check()
+
+    def test_predicate_needs_the_exact_place_owner_type_and_size(self):
+        marker = self.operation / 'apply.started'
+        good = SimpleNamespace(st_uid=0, st_mode=stat.S_IFREG | 0o600, st_nlink=1, st_size=64)
+        self.assertTrue(deletion.lifecycle.legacy_ownership_marker(self.vm, marker, good))
+        for changed in (dict(st_uid=502), dict(st_mode=stat.S_IFLNK | 0o600), dict(st_nlink=2),
+                        dict(st_size=65537), dict(st_mode=stat.S_IFDIR | 0o700)):
+            with self.subTest(changed=changed):
+                info = SimpleNamespace(**dict(vars(good), **changed))
+                self.assertFalse(deletion.lifecycle.legacy_ownership_marker(self.vm, marker, info))
+        for path in (self.operation / 'other.started', self.vm / 'apply.started', self.root / 'elsewhere' / 'apply.started'):
+            with self.subTest(path=str(path)):
+                self.assertFalse(deletion.lifecycle.legacy_ownership_marker(self.vm, path, good))
+        # The generic tree check used by rebuilds does not take the exception unless asked.
+        with patch.object(Path, 'lstat', autospec=True, side_effect=lambda path: SimpleNamespace(
+                **dict(vars(good), st_dev=self.vm.stat().st_dev)) if path == marker else Path.stat(path)):
+            with self.assertRaises(ValueError):
+                deletion.lifecycle.check_tree(self.vm)
+
+
 class StatusTests(unittest.TestCase):
     def test_incomplete_journal_requires_recovery(self):
         current = {'id': JID, 'mode': 'delete', 'phase': 'failed'}

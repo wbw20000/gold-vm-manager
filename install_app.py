@@ -15,14 +15,13 @@ ROOT=Path(__file__).resolve().parent
 APP=Path('/Applications/Gold VM 管理器.app')
 FILES=('manager.py','bootstrap.py','runtime_shares.py','discard_state.py',
        'managed_registry.py','lifecycle.py','process_identity.py','provisioning.py','protected_launcher.py','packet_policy.py',
-       'setup_profile.py','vm_deletion.py','vpn_config.py','vpn_store.py','guest_vpn_seed.py',
+       'setup_profile.py','vm_deletion.py','vpn_config.py','vpn_store.py',
        'preinstall_materials.py','host_artifacts.py','host_tools.py','preinstall_runtime.py',
-       'oneclick.py','offline_vpn.py','guest_ownership.py','offline_writable.py','offline_volume.py','offline_payload.py',
-       'offline_install.py','offline_recovery.py','offline_disk.py','offline_preinstall.py',
+       'oneclick.py','offline_volume.py','offline_payload.py',
        'guest_app_artifacts.py','guest_app_pins.py','quarantine_policy.py','error_codes.py')
 STATIC_FILES=('index.html','style.css','app.js','preinstall.js','preinstall.css')
 SOURCE_FILES=('CleanVMInstaller.swift','CleanVMInstaller.entitlements.plist',
-              'GuestVPNBootstrap.swift','GuestOwnershipHelper.swift','NativeApp.swift','GuestInitialization.swift')
+              'NativeApp.swift','GuestInitialization.swift')
 GUEST_SETUP_FILES=('Install.command','install_guest.rb','README.txt')
 EXAMPLE_FILES=('vpn/clash.yaml','vpn/fields.json')
 
@@ -61,10 +60,9 @@ def package_app(output, private_build_root):
     build=host_tools._attempt(private_build_root, 'package')
     for name in SOURCE_FILES:
         host_tools._write(build/name, snapshot[name])
-    # Helpers are signed and verified before entering the wrapper bundle.
+    # The restore helper is signed and verified before entering the wrapper bundle.
     # Bind compile_helpers to this owned source snapshot, not a historic build.
-    clean,guest=host_tools._compile_helpers(build,build)
-    ownership=host_tools._compile_ownership_helper(build,build)
+    clean,=host_tools._compile_helpers(build,build)
     sdk=host_tools.source_prerequisites()['sdk_path']
     app.mkdir(mode=0o700)  # Exclusive final claim; a concurrent existing app wins.
     contents=app/'Contents'
@@ -79,23 +77,18 @@ def package_app(output, private_build_root):
         else:
             host_tools._write(payload/name,raw,0o700 if name=='guest_setup/Install.command' else 0o600)
     expected_entitlements={'com.apple.security.virtualization':True}
-    for source in (clean,guest,ownership):
-        target=payload/source.name
-        raw=host_tools._read(source,cap=64*1024*1024,private=True)
-        host_tools._write(target,raw,0o700)
-        host_tools.verify_local_signature(target,expected_entitlements if source==clean else {})
-    portable_receipts={}
-    for source_root,name in ((clean.parent,host_tools.HELPERS_PORTABLE_RECEIPT),
-                             (ownership.parent,host_tools.OWNERSHIP_PORTABLE_RECEIPT)):
-        raw=host_tools._read(source_root/name,cap=65536,private=True)
-        host_tools._write(payload/name,raw)
-        portable_receipts[name]=hashlib.sha256(raw).hexdigest()
+    raw=host_tools._read(clean,cap=64*1024*1024,private=True)
+    host_tools._write(payload/clean.name,raw,0o700)
+    host_tools.verify_local_signature(payload/clean.name,expected_entitlements)
+    raw=host_tools._read(clean.parent/host_tools.HELPERS_PORTABLE_RECEIPT,cap=65536,private=True)
+    host_tools._write(payload/host_tools.HELPERS_PORTABLE_RECEIPT,raw)
+    portable_receipts={host_tools.HELPERS_PORTABLE_RECEIPT:hashlib.sha256(raw).hexdigest()}
     info={
         'CFBundleName':'Gold VM Manager','CFBundleDisplayName':'Gold VM 管理器',
-        'CFBundleIdentifier':'local.gold.vm-manager','CFBundleVersion':'6',
+        'CFBundleIdentifier':'local.gold.vm-manager','CFBundleVersion':'7',
         'CFBundleIconFile':'AppIcon',
         'LSApplicationCategoryType':'public.app-category.developer-tools',
-        'CFBundleShortVersionString':'1.3.0','CFBundleExecutable':'GoldVMManager',
+        'CFBundleShortVersionString':'1.4.0','CFBundleExecutable':'GoldVMManager',
         'CFBundlePackageType':'APPL','LSMinimumSystemVersion':'26.6.2',
         'NSHighResolutionCapable':True,
         'NSAppTransportSecurity':{'NSAllowsLocalNetworking':True},
@@ -114,7 +107,6 @@ def package_app(output, private_build_root):
     # Exercise the actual installed-app resolution path after the outer seal;
     # this must verify/reuse binaries without invoking a compiler or SDK lookup.
     host_tools.resolve_helpers(payload,build)
-    host_tools.resolve_ownership_helper(payload,build)
     for name,raw in snapshot.items():
         target=contents/'Resources/AppIcon.icns' if name.startswith('assets/') else payload/name
         if host_tools._digest(target)!=hashlib.sha256(raw).hexdigest():
@@ -122,11 +114,10 @@ def package_app(output, private_build_root):
     result={'schema':1,'app_path':str(app),'native_webkit_window':True,'loopback_port':18765,
             'signature':'local-ad-hoc','notarized':False,'developer_id_notarized':False,
             'gatekeeper_disabled':False,'launched':False,
-            'helper_entitlements':{'CleanVMInstaller':expected_entitlements,'GuestVPNBootstrap':{},'GuestOwnershipHelper':{}},
+            'helper_entitlements':{'CleanVMInstaller':expected_entitlements},
             'package_receipt':str(build/'package.json'),'portable_helper_receipts':portable_receipts,
             'artifact_hashes':{name:host_tools._digest(path) for name,path in (
-                ('GoldVMManager',mac/'GoldVMManager'),('CleanVMInstaller',payload/'CleanVMInstaller'),
-                ('GuestVPNBootstrap',payload/'GuestVPNBootstrap'),('GuestOwnershipHelper',payload/'GuestOwnershipHelper'))},
+                ('GoldVMManager',mac/'GoldVMManager'),('CleanVMInstaller',payload/'CleanVMInstaller'))},
             'source_hashes':{name:hashlib.sha256(raw).hexdigest() for name,raw in snapshot.items()}}
     host_tools._write(build/'package.json',host_tools._json(result))
     host_tools._sync(app.parent)

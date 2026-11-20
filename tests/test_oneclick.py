@@ -21,13 +21,11 @@ import host_artifacts
 import host_tools
 import lifecycle
 import managed_registry as registry
-from offline_disk import signature as disk_signature
-import offline_preinstall
-import offline_vpn
 import oneclick
 import preinstall_materials
 import preinstall_runtime
 import provisioning
+import quarantine_policy
 import setup_profile
 import vpn_store
 
@@ -39,7 +37,7 @@ UNSELECTED = 'inert-unselected-password-do-not-use'
 ENDPOINT = '8.8.4.4'  # Numeric only, never contacted.
 SNI = 'fixture.example.com'
 RECEIPT_TOKEN = 'e' * 64
-ACKS = ('acknowledge_preinstall', 'acknowledge_network_policy', 'acknowledge_guest_autoconfigure')
+ACKS = ('acknowledge_preinstall', 'acknowledge_network_policy')
 UNVERIFIED = ('old_deleted', 'credentials_copied', 'host_credentials_copied', 'guest_started',
               'desktop_verified', 'vpn_connected', 'network_independently_verified')
 
@@ -345,16 +343,13 @@ class WorkerTests(Fixture):
         self.inspection = dict(self.restore_version, schemaVersion=1, event='inspect', supported=True,
                                minimumCPUCount=2, minimumMemorySize=4 * GIB)
         self.installer = self.fixture_file('installer.fixture', b'not executable')
-        self.bootstrap = self.fixture_file('bootstrap.fixture', b'not executable')
-        self.ownership = self.fixture_file('ownership.fixture', b'not executable')
         self.tart = self.fixture_file('tart.fixture', b'not a program', mode=0o700)
         self.backend = self.fixture_file('gvproxy.fixture', b'not a backend')
         self.image = self.fixture_file('pinned.ipsw.fixture', b'not a restore image')
         self.tools = SimpleNamespace(executable_path=self.tart, executable_sha256='1' * 64,
                                      receipt_path=self.root / 'tart-receipt.fixture')
         self.tart_archive = SimpleNamespace(artifact_path=self.root / 'tart-archive.fixture')
-        self.resolve_helpers = self.patch(host_tools, 'resolve_helpers', return_value=(self.installer, self.bootstrap))
-        self.patch(host_tools, 'resolve_ownership_helper', return_value=self.ownership)
+        self.resolve_helpers = self.patch(host_tools, 'resolve_helpers', return_value=self.installer)
         self.ensure_tart = self.patch(host_tools, 'ensure_tart', return_value=self.tools)
         self.podman_package = SimpleNamespace(artifact_path=self.root / 'podman-installer.fixture')
         self.ensure_gvproxy = self.patch(host_tools, 'ensure_gvproxy',
@@ -371,10 +366,7 @@ class WorkerTests(Fixture):
         # No verified cache by default: every fixture job downloads fresh materials.
         self.material_manager.return_value.load_reusable.side_effect = \
             preinstall_materials.MaterialPreparationError('material-cache-miss')
-        self.app_changes = {}
-        self.seed_changes = {}
-        self.app = self.patch(offline_preinstall, 'preinstall_stage', side_effect=self.app_fixture)
-        self.vpn = self.patch(offline_vpn, 'configure_preinstalled_stage', side_effect=self.vpn_fixture)
+        self.installers = self.patch(oneclick, 'build_installers', side_effect=self.installers_fixture)
         self.patch(preinstall_runtime, '_verified_backend', side_effect=self.verify_inert_backend)
         self.patch(preinstall_runtime, '_quarantine', return_value=b'0083;0;Fixture;package-origin')
         self.patch(preinstall_runtime, '_preserve_quarantine')  # Simulated xattr; never invoke native tools.
@@ -447,60 +439,20 @@ class WorkerTests(Fixture):
         return SimpleNamespace(stdout=iter(['unstructured log\n'] + [json.dumps(e) for e in self.install_events]),
                                wait=mock.Mock(return_value=0))
 
-    def offline_target(self, kwargs, **extra):
+    def installers_fixture(self, target, materials, private_config):
         c = self.context
-        self.assertEqual(kwargs, dict(state_dir=c.state, tart_home=c.tart_home, job_id=c.job_id,
-            name=NAME, materials=self.materials, acknowledge_write=True, lifecycle_lock_fd=c.lock_fd, **extra))
-        return SimpleNamespace(state_dir=c.state, stage=c.stage, job_id=c.job_id, name=NAME)
-
-    def app_fixture(self, **kwargs):
-        c = self.context
-        target = self.offline_target(kwargs, evidence_dir=c.jobdir / 'application-preinstall')
-        self.assertEqual(self.job()['phase'], 'awaiting_offline_preinstall')
-        self.assertIs(self.job()['system_restored'], True)
-        self.assertIs(self.job()['applications_preinstalled'], False)
-        self.trace.append(('offline', 'applications'))
-        apps = [{'name': app.name, 'bundle_identifier': app.bundle_identifiers[0],
-                 'short_version': app.short_versions[0], 'bundle_version': app.bundle_versions[0],
-                 'team_id': manifest.vendor_team_ids[0], 'bundle_bytes': 64, 'bundle_tree_sha256': 'd' * 64}
-                for manifest in reviewed_manifests() for app in manifest.expected_apps]
-        receipt = {'schema': 1, 'operation_id': '1' * 32, 'job_id': c.job_id, 'name': NAME,
-            'stage_path': str(c.stage), 'applications_preinstalled': True, 'guest_started': False,
-            'desktop_verified': False, 'published': False, 'credentials_copied': False,
-            'readonly_remount_verified': True, 'final_detach_confirmed': True,
-            'vm_config_and_nvram_unchanged': True, 'image_file_identity_and_size_unchanged': True,
-            'data_uuid': '11111111-2222-4333-8444-555555555555',
-            'volume_group_uuid': '66666666-7777-4888-8999-000000000000', 'applications': apps}
-        receipt.update(self.app_changes)
-        registry.write_private(c.stage / '.offline-preinstall.complete.json', receipt)
-        offline_preinstall._state(target, '1' * 32, 'verified_awaiting_first_desktop', complete=True,
-                                 message='Fixture independent application readback.')
-        return receipt
-
-    def vpn_fixture(self, **kwargs):
-        c = self.context
+        self.assertEqual(target, c.jobdir / 'installers')
+        self.assertIs(materials, self.materials)
         selected = vpn_store.load_configuration(self.state, self.selected, job_id=c.job_id)
         self.assertEqual(selected.bound_job, c.job_id)
-        self.assertEqual(selected.private_config['proxies'][0]['password'], SECRET)
-        target = self.offline_target(kwargs, private_config=selected.private_config, bootstrap_helper_path=self.bootstrap,
-                                     ownership_helper_path=self.ownership, acknowledge_system_authorization=True)
-        self.assertIs(self.job()['applications_preinstalled'], True)
-        self.assertIs(self.job()['vpn_configuration_staged'], False)
-        self.trace.append(('offline', 'vpn'))
-        offline_vpn._state(target, '2' * 32, 'awaiting_owner_verify', authorization=True)
-        public = {'schema': 1, 'operation_id': '2' * 32, 'job_id': c.job_id, 'name': NAME,
-            'phase': 'awaiting_first_desktop_acceptance', 'applications_preinstalled': True,
-            'vpn_configuration_staged': True, 'persistent_ownership_verified': True,
-            'readonly_payload_verified': True, 'readonly_remount_verified': True, 'final_detach_confirmed': True,
-            'config_unchanged': True, 'nvram_unchanged': True,
-            'guest_started': False, 'desktop_verified': False, 'published': False,
-            'host_credentials_copied': False, 'vpn_connected': False, 'first_login_acceptance_required': True}
-        receipt = dict(public, stage_path=str(c.stage), receipt_token=RECEIPT_TOKEN,
-                       image_file_stamp=list(disk_signature(c.stage / 'disk.img')))
-        receipt.update(self.seed_changes)
-        registry.write_private(c.stage / '.offline-vpn.complete.json', receipt)
-        offline_vpn._state(target, '2' * 32, 'verified_awaiting_first_login', complete=True)
-        return public
+        self.assertEqual(private_config, selected.private_config)
+        self.assertEqual(self.job()['phase'], 'preparing_runtime')
+        self.assertIs(self.job()['system_restored'], True)
+        self.trace.append(('installers', 'built'))
+        target.mkdir(mode=0o700)
+        (target / 'inert.fixture').write_bytes(b'inert fixture; not an app')
+        target.chmod(0o755)
+        return target
 
     def verify_inert_backend(self, path):
         self.assertIn(path, (self.backend, self.context.base / 'gvproxy-darwin'))
@@ -602,21 +554,31 @@ class WorkerTests(Fixture):
         self.assertEqual(status['phase'], 'awaiting_first_desktop_acceptance', status)
         self.assertEqual(status['published_path'], str(self.target))
         self.assertIsNone(status['stage_path'])
-        for flag in ('system_restored', 'applications_preinstalled', 'user_vpn_configuration_supplied',
-                     'vpn_configuration_staged', 'published', 'needs_host_security_authorization'):
+        for flag in ('system_restored', 'user_vpn_configuration_supplied', 'published', 'needs_host_security_authorization'):
             self.assertIs(status[flag], True, flag)
+        # Nothing is written into the guest disk any more.
+        for flag in ('applications_preinstalled', 'vpn_configuration_staged'):
+            self.assertIs(status[flag], False, flag)
         self.assert_unverified(status)
         self.assertEqual(status, self.job())
         self.assertEqual(status, registry.read_private(self.context.jobdir / 'status.json'))
         self.assert_redacted(status)
-        self.assertEqual(self.trace.count(('offline', 'applications')), 1)
+        self.assertEqual(self.trace.count(('installers', 'built')), 1)
         # Only gvproxy, from Podman's notarized installer; never the bare release binary.
         self.assertIn('podman-installer', [c.args[0] for c in self.acquire.call_args_list])
         self.ensure_gvproxy.assert_called_once_with(self.state / 'tools', artifact_receipt=self.podman_package)
         self.assertEqual(self.runtime_prepare.call_args.kwargs['gvproxy_path'], self.backend)
         self.assertLess(self.trace.index(('installer', 'inspect')), self.trace.index(('installer', 'create')))
-        self.assertLess(self.trace.index(('offline', 'applications')), self.trace.index(('offline', 'vpn')))
-        self.assertLess(self.trace.index(('status', 'awaiting_system_authorization')), self.trace.index(('status', 'publishing')))
+        self.assertLess(self.trace.index(('installer', 'create')), self.trace.index(('installers', 'built')))
+        self.assertLess(self.trace.index(('installers', 'built')), self.trace.index(('status', 'publishing')))
+        self.assertNotIn(('status', 'awaiting_system_authorization'), self.trace)
+        self.assertEqual(self.runtime_prepare.call_args.kwargs['installers'], self.context.jobdir / 'installers')
+        meta = preinstall_runtime.validate_environment(self.context.base)
+        self.assertEqual(meta['version'], 3)
+        self.assertEqual((self.context.base / 'installers' / 'inert.fixture').read_bytes(), b'inert fixture; not an app')
+        self.assertFalse((self.context.jobdir / 'installers').exists())
+        for name in ('.offline-preinstall.complete.json', '.offline-vpn.complete.json', '.guest-ownership'):
+            self.assertFalse((self.target / name).exists(), name)
         self.assertLess(self.trace.index(('readback', 'environment')), self.trace.index(('journal', 'committed_new_registered')))
         self.assertEqual(registry.read_private(self.journal_path)['phase'], 'committed_new_registered')
         self.assertEqual(lifecycle.status(state_dir=self.state), status)
@@ -684,7 +646,7 @@ class WorkerTests(Fixture):
         self.assert_failed(self.execute(), 'acquiring', 'preinstall-step-failed', recovery=False)
         self.assertFalse(self.context.stage.exists())
         self.spawn.assert_not_called()
-        self.app.assert_not_called()
+        self.installers.assert_not_called()
         self.rename.assert_not_called()
 
     def test_image_minimum_failure_never_creates_stage(self):
@@ -692,7 +654,7 @@ class WorkerTests(Fixture):
         self.assert_failed(self.execute(), 'inspecting', 'selected-resources-below-image-minimum', recovery=False)
         self.assertFalse(self.context.stage.exists())
         self.spawn.assert_not_called()
-        self.app.assert_not_called()
+        self.installers.assert_not_called()
         self.rename.assert_not_called()
 
     def test_apple_compatibility_does_not_accept_an_unreviewed_build(self):
@@ -700,17 +662,16 @@ class WorkerTests(Fixture):
         self.assert_failed(self.execute(), 'inspecting', 'reviewed-restore-build-mismatch', recovery=False)
         self.assertFalse(self.context.stage.exists())
         self.spawn.assert_not_called()
-        self.app.assert_not_called()
+        self.installers.assert_not_called()
         self.rename.assert_not_called()
 
-    def test_unreviewed_completion_build_does_not_advance_to_offline_writes(self):
+    def test_unreviewed_completion_build_does_not_advance_to_installers(self):
         self.completed_version['macOSVersion'] = '26.6.1'
         status = self.execute()
         self.assert_failed(status, 'installing', 'reviewed-restore-build-mismatch', recovery=True)
         self.assertIs(status['system_restored'], False)
         self.assertTrue((self.context.stage / 'disk.img').is_file())
-        self.app.assert_not_called()
-        self.vpn.assert_not_called()
+        self.installers.assert_not_called()
         self.rename.assert_not_called()
 
     def test_incomplete_restore_retains_stage_but_does_not_claim_system_restored(self):
@@ -720,88 +681,27 @@ class WorkerTests(Fixture):
         self.assertIs(status['system_restored'], False)
         self.assertTrue((self.context.stage / 'disk.img').is_file())
         self.assertFalse(self.journal_path.exists())
-        self.app.assert_not_called()
-        self.vpn.assert_not_called()
+        self.installers.assert_not_called()
         self.rename.assert_not_called()
 
-    def test_provider_return_is_not_application_readback_acceptance(self):
-        self.app.side_effect = lambda **_: {'applications_preinstalled': True}
+    def test_installer_folder_failure_keeps_the_stage_and_never_publishes(self):
+        self.installers.side_effect = oneclick.OneClickError('installer-copy-mismatch')
         status = self.execute()
-        self.assert_failed(status, 'awaiting_offline_preinstall', 'application-readback-not-accepted', recovery=True)
-        self.assertIs(status['applications_preinstalled'], False)
-        self.vpn.assert_not_called()
+        self.assert_failed(status, 'preparing_runtime', 'installer-copy-mismatch', recovery=True)
+        self.assertIs(status['system_restored'], True)
         self.runtime_prepare.assert_not_called()
-        self.rename.assert_not_called()
-
-    def test_provider_return_is_not_vpn_readback_acceptance(self):
-        self.vpn.side_effect = lambda **_: {'vpn_configuration_staged': True}
-        status = self.execute()
-        self.assertEqual(status['phase'], 'failed', status)
-        self.assertEqual(status['failure_code'], 'vpn-seed-readback-not-accepted')
-        self.assertIs(status['applications_preinstalled'], True)
-        self.assertIs(status['vpn_configuration_staged'], False)
-        self.assertIs(status['recovery_required'], True)
-        self.assert_unverified(status)
-        self.runtime_prepare.assert_not_called()
-        self.rename.assert_not_called()
-
-    def test_authorization_failure_keeps_offline_vpn_phase_and_preserves_stage(self):
-        def authorization_denied(**_):
-            c = self.context
-            target = SimpleNamespace(state_dir=c.state, stage=c.stage, job_id=c.job_id, name=NAME)
-            offline_vpn._state(target, '2' * 32, 'awaiting_owner_verify', authorization=True)
-            offline_vpn._state(target, '2' * 32, 'failed_retained', failed=True)
-            raise offline_vpn.OfflineVPNError('offline-vpn-failed-retained')
-
-        self.vpn.side_effect = authorization_denied
-        status = self.execute()
-        self.assert_failed(status, 'failed_retained', 'offline-vpn-failed-retained', recovery=True)
-        self.assertIs(status['vpn_configuration_staged'], False)
-        self.assertIs(status['vpn_configuration']['active'], False)
-        self.assertIs(status['applications_preinstalled'], True)
-        # An older failure record without inner details still yields explicit empties.
-        self.assertIsNone(status['failed_step'])
-        self.assertIsNone(status['failure_reason'])
-        self.runtime_prepare.assert_not_called()
+        self.assertFalse(self.context.base.exists())
         self.assert_rejected_before_rename(status)
-
-    def vpn_retained_failure(self, step='authorized-ownership-apply',
-                             code='system-authorization-interaction-not-allowed'):
-        def configure(**_):
-            c = self.context
-            target = SimpleNamespace(state_dir=c.state, stage=c.stage, job_id=c.job_id, name=NAME)
-            offline_vpn._state(target, '2' * 32, 'awaiting_owner_apply', authorization=True)
-            offline_vpn._state(target, '2' * 32, 'failed_retained', failed=True,
-                               failed_step=step, failure_code=code)
-            raise offline_vpn.OfflineVPNError('offline-vpn-failed-retained')
-        return configure
-
-    def test_offline_vpn_inner_step_and_reason_reach_job_status(self):
-        self.vpn.side_effect = self.vpn_retained_failure()
-        status = self.execute()
-        self.assert_failed(status, 'failed_retained', 'offline-vpn-failed-retained', recovery=True)
-        self.assertEqual((status['failed_step'], status['failure_reason']),
-                         ('authorized-ownership-apply', 'system-authorization-interaction-not-allowed'))
-        self.assertIs(status['vpn_configuration']['active'], False)
-        self.assert_rejected_before_rename(status)
-
-    def test_untrusted_inner_failure_fields_are_never_recorded(self):
-        self.vpn.side_effect = self.vpn_retained_failure(step='/Users/fixture/' + SECRET, code='Has Spaces ' + SECRET)
-        status = self.execute()
-        self.assert_failed(status, 'failed_retained', 'offline-vpn-failed-retained', recovery=True)
-        self.assertIsNone(status['failed_step'])
-        self.assertIsNone(status['failure_reason'])
 
     def test_constant_code_in_project_error_args_is_reported(self):
-        self.vpn.side_effect = offline_vpn.OfflineVPNError('writable-detach-unconfirmed')
-        status = self.execute()
-        self.assert_failed(status, 'awaiting_first_desktop_acceptance', 'writable-detach-unconfirmed', recovery=True)
+        self.installers.side_effect = preinstall_materials.MaterialPreparationError('modified-source-or-evidence')
+        self.assert_failed(self.execute(), 'preparing_runtime', 'modified-source-or-evidence', recovery=True)
 
     def test_project_error_sentence_maps_to_fixed_class_category(self):
-        self.app.side_effect = offline_preinstall.PreinstallError('Post-write file identity/config/NVRAM mismatch; no readonly acceptance')
+        self.installers.side_effect = quarantine_policy.QuarantineError('Missing or malformed quarantine')
         status = self.execute()
-        self.assert_failed(status, 'awaiting_offline_preinstall', 'offline-preinstall-error', recovery=True)
-        self.assertNotIn('NVRAM mismatch', json.dumps(status))
+        self.assert_failed(status, 'preparing_runtime', 'quarantine-check-failed', recovery=True)
+        self.assertNotIn('malformed', json.dumps(status))
 
     def test_verified_cached_materials_are_reused_before_any_download(self):
         manager = self.material_manager.return_value
@@ -849,17 +749,17 @@ class WorkerTests(Fixture):
         self.assertIsNone(self.material_failure('../' + SECRET)['failed_product'])
 
     def test_builtin_exception_text_is_never_a_failure_code(self):
-        self.app.side_effect = ValueError(SECRET)
-        self.assert_failed(self.execute(), 'awaiting_offline_preinstall', 'preinstall-step-failed', recovery=True)
+        self.installers.side_effect = ValueError(SECRET)
+        self.assert_failed(self.execute(), 'preparing_runtime', 'preinstall-step-failed', recovery=True)
 
     def test_non_value_error_code_shaped_text_is_ignored(self):
-        self.app.side_effect = RuntimeError('readonly-app-bytes-changed')
-        self.assert_failed(self.execute(), 'awaiting_offline_preinstall', 'preinstall-step-failed', recovery=True)
+        self.installers.side_effect = RuntimeError('installer-copy-mismatch')
+        self.assert_failed(self.execute(), 'preparing_runtime', 'preinstall-step-failed', recovery=True)
 
     # --- Archiving a failed job: explicit unlock that retains the stage. ---
 
-    def failed_vpn_job(self):
-        self.vpn.side_effect = self.vpn_retained_failure()
+    def failed_job(self):
+        self.installers.side_effect = oneclick.OneClickError('installer-copy-mismatch')
         status = self.execute()
         self.release_worker_lock()
         return status
@@ -869,7 +769,7 @@ class WorkerTests(Fixture):
         return oneclick.archive_failed(value, state_dir=self.state, tart_home=self.tart_home)
 
     def test_archive_failed_job_unlocks_new_fresh_job(self):
-        status = self.failed_vpn_job()
+        status = self.failed_job()
         self.assertIs(status['recovery_required'], True)
         disk = self.context.stage / 'disk.img'
         before = disk.stat()
@@ -889,7 +789,7 @@ class WorkerTests(Fixture):
         self.assertEqual((queued['phase'], queued['name']), ('queued', 'Second fixture'))
 
     def test_archive_rejects_unsafe_jobs_without_changing_records(self):
-        status = self.failed_vpn_job()
+        status = self.failed_job()
         current_path = self.state / 'build-current.json'
         archived_path = self.context.jobdir / 'archived-current.json'
         journal = self.context.jobdir / 'commit.json'
@@ -899,7 +799,7 @@ class WorkerTests(Fixture):
             'waiting-for-vpn': dict(status, phase='awaiting_vpn_configuration', recovery_required=False),
             'published': dict(status, published=True),
             'offline-preinstall-active': dict(status, offline_preinstall={'operation_id': '1' * 32, 'active': True}),
-            'vpn-configuration-active': dict(status, vpn_configuration=dict(status['vpn_configuration'], active=True)),
+            'vpn-configuration-active': dict(status, vpn_configuration={'operation_id': '2' * 32, 'active': True}),
             'other-mode': dict(status, mode='create'),
         }
         for label, record in record_cases.items():
@@ -939,35 +839,8 @@ class WorkerTests(Fixture):
         self.assertFalse(archived_path.exists())
         self.assertTrue((self.context.stage / 'disk.img').is_file())
 
-    def test_authorization_decision_needs_a_live_paused_job_and_an_exact_payload(self):
-        job_id = 'a' * 32
-        paused = {'id': job_id, 'mode': 'preinstall', 'name': NAME, 'phase': 'awaiting_system_authorization'}
-        patchers = (mock.patch.object(lifecycle, 'status', return_value=paused),
-                    mock.patch.object(offline_vpn, 'submit_authorization_decision', create=True,
-                                      return_value={'operation': 'apply', 'attempt': 1, 'decision': 'retry'}))
-        status, submit = (p.start() for p in patchers)
-        for p in patchers:
-            self.addCleanup(p.stop)
-        value = {'job_id': job_id, 'attempt': 1, 'decision': 'retry'}
-        self.assertEqual(oneclick.authorization_decision(value, state_dir=self.state),
-                         {'ok': True, 'job_id': job_id, 'operation': 'apply', 'attempt': 1, 'decision': 'retry'})
-        submit.assert_called_once_with(self.state, job_id, 1, 'retry')
-        status.assert_called_with(state_dir=self.state)
-        submit.reset_mock()
-        for bad in (None, [], {'job_id': job_id, 'attempt': 1}, dict(value, force=True), dict(value, attempt=True),
-                    dict(value, attempt='1'), dict(value, decision='continue'), dict(value, job_id='../' + job_id)):
-            with self.subTest(payload=bad), self.assertRaises(oneclick.OneClickError):
-                oneclick.authorization_decision(bad, state_dir=self.state)
-        for job in (None, dict(paused, phase='failed'), dict(paused, phase='interrupted'),
-                    dict(paused, phase='configuring_vpn'), dict(paused, id='b' * 32), dict(paused, mode='create')):
-            with self.subTest(job=job):
-                status.return_value = job
-                with self.assertRaises(oneclick.OneClickError):
-                    oneclick.authorization_decision(value, state_dir=self.state)
-        submit.assert_not_called()
-
     def test_archive_requires_the_lifecycle_lock(self):
-        self.vpn.side_effect = self.vpn_retained_failure()
+        self.installers.side_effect = oneclick.OneClickError('installer-copy-mismatch')
         self.execute()  # The fixture worker still holds build.lock.
         with self.assertRaisesRegex(oneclick.OneClickError, 'lifecycle-lock-busy'):
             self.archive()
@@ -983,32 +856,33 @@ class WorkerTests(Fixture):
         self.assertFalse(self.journal_path.exists())
         self.rename.assert_not_called()
 
-    def test_hash_bound_application_receipt_still_needs_readonly_verification(self):
-        # The fake provider updates status and runtime hashes these exact bytes.
-        # Neither is sufficient when the underlying acceptance claim is false.
-        self.app_changes['readonly_remount_verified'] = False
-        self.assert_rejected_before_rename(self.execute())
+    def test_a_started_stage_is_never_published(self):
+        build = self.installers.side_effect
+        def started(*args):
+            (self.context.stage / 'state.vzvmsave').write_bytes(b'inert saved-state fixture')
+            return build(*args)
+        self.installers.side_effect = started
+        status = self.execute()
+        self.assert_failed(status, 'publishing', 'previously-started-stage', recovery=True)
+        self.assert_rejected_before_rename(status)
 
-    def test_hash_bound_vpn_receipt_still_needs_persistent_owners_verification(self):
-        self.seed_changes['persistent_ownership_verified'] = False
-        self.assert_rejected_before_rename(self.execute())
+    def test_the_authorization_pause_no_longer_exists(self):
+        self.assertFalse(hasattr(oneclick, 'authorization_decision'))
+        self.assertFalse(hasattr(oneclick.NativeServices, 'preinstall'))
+        self.assertFalse(hasattr(oneclick.NativeServices, 'configure'))
 
     def test_completion_build_is_rechecked_before_exclusive_publication(self):
-        configure = self.vpn.side_effect
-        def changed_receipt(**kwargs):
-            result = configure(**kwargs)
+        build = self.installers.side_effect
+        def changed_receipt(*args):
+            result = build(*args)
             path = self.context.stage / '.clean-vm-installer.complete.json'
             receipt = registry.read_private(path)
             self.write(path, dict(receipt, buildVersion='25G82'))
             return result
-        self.vpn.side_effect = changed_receipt
+        self.installers.side_effect = changed_receipt
         status = self.execute()
         self.assert_failed(status, 'publishing', 'reviewed-restore-build-mismatch', recovery=True)
         self.assert_rejected_before_rename(status)
-
-    def test_mismatched_readonly_disk_stamp_never_publishes(self):
-        self.seed_changes['image_file_stamp'] = [0] * 5
-        self.assert_rejected_before_rename(self.execute())
 
     def test_detach_gate_refuses_publication_and_keeps_stage(self):
         self.detached.side_effect = oneclick.OneClickError('fixture-image-still-attached')
@@ -1038,7 +912,7 @@ class WorkerTests(Fixture):
         before = old_config.read_bytes()
         self.assert_rejected_before_rename(self.execute())
         self.assertEqual(old_config.read_bytes(), before)
-        self.app.assert_not_called()
+        self.installers.assert_not_called()
 
     def test_same_name_racing_exclusive_rename_retains_both_inodes_without_registration(self):
         def race(src, source, dst, dest, flags):
@@ -1112,27 +986,23 @@ class DeferredWorkerTests(Fixture):
                 for item in oneclick.STAGE_FILES:
                     (ctx.stage / item).write_bytes(b'inert stage fixture')
             self.service.restore.side_effect = restore
-            def preinstall(_, update):
-                update('awaiting_first_desktop_acceptance', 'fixture', applications_preinstalled=True)
-            self.service.preinstall.side_effect = preinstall
             with mock.patch.object(shutil, 'disk_usage', return_value=SimpleNamespace(free=100*GIB)), \
                  mock.patch.object(oneclick, '_require_detached'):
                 result = oneclick.execute(ctx, services=self.service)
         self.release_worker_lock()
         self.assertEqual(result['phase'], oneclick.PAUSE_PHASE, result)
-        self.assertTrue(result['system_restored'] and result['applications_preinstalled'])
-        self.assertFalse(result['published'] or result['user_vpn_configuration_supplied'] or result['vpn_configuration_staged'])
+        self.assertIs(result['system_restored'], True)
+        self.assertFalse(result['published'] or result['user_vpn_configuration_supplied'] or result['vpn_configuration_staged']
+                         or result['applications_preinstalled'])
         self.assert_unverified(result)
         self.assertFalse(self.target.exists())
-        self.service.configure.assert_not_called()
         self.service.runtime.assert_not_called()
         self.service.publish.assert_not_called()
         self.assertTrue(lifecycle.waiting_for_vpn(lifecycle.status(state_dir=self.state)))
         return result
 
     def queue_resume(self, ticket, **changes):
-        data={'job_id':self.context.job_id,'vpn_configuration_id':ticket,
-              'acknowledge_network_policy':True,'acknowledge_guest_autoconfigure':True}
+        data={'job_id':self.context.job_id,'vpn_configuration_id':ticket,'acknowledge_network_policy':True}
         return oneclick.resume(dict(data,**changes),state_dir=self.state,tart_home=self.tart_home)
 
     def test_deferral_rejects_implicit_or_mixed_consent(self):
@@ -1159,13 +1029,12 @@ class DeferredWorkerTests(Fixture):
         self.assertEqual(queued['phase'],oneclick.RESUME_QUEUED)
         self.assertIn('--resume-vpn',self.spawn.call_args.args[0]);self.assertNotIn(ticket,self.spawn.call_args.args[0])
         ctx=oneclick.Context(self.state,self.tart_home,self.context.job_id,self.worker_fd)
-        def configure(d, stored, update):
+        def runtime(d, stored, update):
             self.assertNotIn('defer_vpn',d)
             self.assertEqual(stored.bound_job,ctx.job_id)
             self.assertEqual(oneclick._stage_stamps(ctx),stamp)
-            update('configuring_vpn','fixture',vpn_configuration_staged=True)
-        self.service.configure.side_effect=configure
-        self.service.runtime.return_value={'fixture':True}
+            return {'fixture':True}
+        self.service.runtime.side_effect=runtime
         self.service.publish.return_value=self.target
         with mock.patch.object(oneclick, '_require_detached'):
             done=oneclick.execute_resume(ctx,services=self.service)
@@ -1173,9 +1042,8 @@ class DeferredWorkerTests(Fixture):
         self.assertFalse(done['guest_started'] or done['vpn_connected'])
         self.service.prepare.assert_called_once()
         self.service.restore.assert_called_once()
-        self.service.preinstall.assert_called_once()
         self.service.load_deferred_materials.assert_called_once_with({'fixture':'reviewed'})
-        self.service.configure.assert_called_once()
+        self.service.runtime.assert_called_once()
         self.assertEqual(registry.read_private(self.jobdir()/'vpn-wait.json')['request'],original)
         self.assertEqual(registry.read_private(self.jobdir()/'request.json')['vpn_configuration_id'],ticket)
         self.assert_redacted(done)
@@ -1183,14 +1051,14 @@ class DeferredWorkerTests(Fixture):
 
     def test_wrong_job_missing_consent_or_changed_disk_never_claims_ticket(self):
         self.pause(); ticket=self.submission()
-        for changes in ({'job_id':'a'*32},{'acknowledge_guest_autoconfigure':False}):
+        for changes in ({'job_id':'a'*32},{'acknowledge_network_policy':False},{'acknowledge_guest_autoconfigure':True}):
             with self.assertRaises(oneclick.OneClickError):self.queue_resume(ticket,**changes)
         with (self.context.stage/'disk.img').open('r+b') as f:f.write(b'changed fixture')
         with self.assertRaisesRegex(oneclick.OneClickError,'deferred-stage-changed'):
             self.queue_resume(ticket)
         self.assertIsNone(vpn_store.load_configuration(self.state,ticket).bound_job)
         self.assertFalse((self.jobdir()/'vpn-resume.json').exists())
-        self.service.configure.assert_not_called()
+        self.service.runtime.assert_not_called()
 
     def test_file_changed_after_queue_fails_without_configuration_or_publish(self):
         self.pause(); ticket=self.submission();self.queue_resume(ticket)
@@ -1199,7 +1067,7 @@ class DeferredWorkerTests(Fixture):
         done=oneclick.execute_resume(ctx,services=self.service)
         self.assertEqual(done['phase'],'failed')
         self.assertTrue(done['recovery_required'])
-        self.service.configure.assert_not_called()
+        self.service.runtime.assert_not_called()
         self.service.publish.assert_not_called()
 
 
@@ -1225,8 +1093,7 @@ class DeferredBackendTests(unittest.TestCase):
         patch(preinstall_runtime, '_verified_backend', return_value=(b'', None))
         patch(registry, 'read_private', return_value=self.tart)
         patch(lifecycle, 'inventory_tool', return_value=Path(self.tart['executable_path']))
-        patch(host_tools, 'resolve_helpers', return_value=(None, None))
-        patch(host_tools, 'resolve_ownership_helper', return_value=None)
+        patch(host_tools, 'resolve_helpers', return_value=None)
         patch(preinstall_materials, 'MaterialManager')
         self.acquire = patch(host_artifacts, 'acquire', side_effect=AssertionError('no download'))
         self.extract = patch(host_tools, 'ensure_gvproxy', side_effect=AssertionError('no extraction'))
@@ -1266,6 +1133,134 @@ class DeferredBackendTests(unittest.TestCase):
         for bad in ('gvproxy-tool-x', 'other-' + 'a' * 32, 7):
             with self.subTest(bad=bad), self.assertRaisesRegex(oneclick.OneClickError, '^deferred-material-record-mismatch$'):
                 self.service.load_deferred_materials(dict(record, backend=bad))
+
+
+class BuildInstallersTests(unittest.TestCase):
+    """The read-only first-setup folder: real APFS clones of inert fixture bundles only."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix='gold-installers-test-')).resolve()
+        self.addCleanup(self.cleanup)
+        self.addCleanup(os.umask, os.umask(0o077))
+        self.sources = self.root / 'staging'
+        self.sources.mkdir(mode=0o700)
+        self.apps = []
+        for name in ('One.app', 'Two.app'):
+            app = self.sources / name
+            (app / 'Contents' / 'MacOS').mkdir(parents=True, mode=0o755)
+            (app / 'Contents' / 'MacOS' / 'binary').write_bytes(b'inert fixture bytes for ' + name.encode())
+            (app / 'Contents' / 'Current').symlink_to('MacOS')
+            self.apps.append(app)
+        self.materials = (SimpleNamespace(manifest='m1', app_paths=(self.apps[0],)),
+                          SimpleNamespace(manifest='m2', app_paths=(self.apps[1],)))
+        self.config = {'proxies': [{'name': '节点', 'type': 'trojan', 'server': ENDPOINT, 'password': SECRET}],
+                       'rules': ['MATCH,PROXY']}
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        patch = lambda *a, **k: self.stack.enter_context(mock.patch.object(*a, **k))
+        self.verify = patch(preinstall_materials, 'verify_materials', side_effect=self.verified)
+        self.quarantine = {}
+        patch(quarantine_policy, 'read', side_effect=lambda path: self.quarantine.get(Path(path).name, b'0083;0;Fixture;origin'))
+        self.target = self.root / 'job' / 'installers'
+        self.target.parent.mkdir(mode=0o700)
+
+    def cleanup(self):
+        self.assertTrue(self.root.name.startswith('gold-installers-test-'))
+        shutil.rmtree(str(self.root))
+
+    @staticmethod
+    def tree(app):
+        records = []
+        for folder, dirs, files in os.walk(str(app)):
+            for name in sorted(dirs + files):
+                path = Path(folder) / name
+                info = path.lstat()
+                records.append((str(path.relative_to(app)), stat.S_IMODE(info.st_mode),
+                                os.readlink(str(path)) if path.is_symlink() else
+                                path.read_bytes() if path.is_file() else None))
+        return (json.dumps(sorted(records, key=lambda r: r[0]), default=repr), 1, len(records))
+
+    def verified(self, materials):
+        self.assertIs(materials, self.materials)
+        return tuple(SimpleNamespace(apps=[{'name': app.name, 'bundle_tree_sha256': self.tree(app)[0],
+                                             'bundle_bytes': 1, 'bundle_entries': self.tree(app)[2]}])
+                     for m in materials for app in m.app_paths)
+
+    def build(self):
+        with mock.patch('guest_app_artifacts._tree_snapshot', side_effect=lambda app, manifest: self.tree(app)):
+            return oneclick.build_installers(self.target, self.materials, self.config)
+
+    def test_folder_holds_verified_copies_profile_and_note_readable_by_the_guest(self):
+        self.assertEqual(self.build(), self.target)
+        self.verify.assert_called_once()
+        self.assertEqual(stat.S_IMODE(self.target.stat().st_mode), 0o755)
+        self.assertEqual(sorted(p.name for p in self.target.iterdir()),
+                         sorted(['One.app', 'Two.app', oneclick.INSTALLERS_PROFILE, oneclick.INSTALLERS_README]))
+        for app in self.apps:
+            copy = self.target / app.name
+            self.assertEqual(self.tree(copy), self.tree(app))
+            self.assertTrue((copy / 'Contents' / 'Current').is_symlink())
+            self.assertNotEqual(copy.stat().st_ino, app.stat().st_ino)
+        profile = self.target / oneclick.INSTALLERS_PROFILE
+        self.assertEqual(json.loads(profile.read_text(encoding='utf-8')), self.config)
+        self.assertIn('节点', profile.read_text(encoding='utf-8'))  # Readable names, not escapes.
+        note = (self.target / oneclick.INSTALLERS_README).read_text(encoding='utf-8')
+        for words in ('Finder', '应用程序', '订阅', '本地', '虚拟网卡模式', '标记首次设置完成'):
+            self.assertIn(words, note)
+        for path in (profile, self.target / oneclick.INSTALLERS_README):
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
+        self.assertNotIn(SECRET, note)
+
+    def test_copy_mismatch_or_lost_quarantine_stops(self):
+        real = self.verified
+        self.verify.side_effect = lambda materials: tuple(
+            SimpleNamespace(apps=[dict(app, bundle_tree_sha256='0' * 64) for app in r.apps]) for r in real(materials))
+        with self.assertRaisesRegex(oneclick.OneClickError, '^installer-copy-mismatch$'):
+            self.build()
+        self.assertNotEqual(stat.S_IMODE(self.target.stat().st_mode), 0o755)  # Never finished.
+        shutil.rmtree(str(self.target))
+        self.verify.side_effect = self.verified
+        reads = []
+        def read(path):
+            reads.append(Path(path))
+            return b'0083;0;Fixture;origin' if Path(path).parent == self.sources else b'0083;0;Fixture;other'
+        with mock.patch.object(quarantine_policy, 'read', side_effect=read), \
+                self.assertRaisesRegex(oneclick.OneClickError, '^installer-quarantine-mismatch$'):
+            self.build()
+
+    def test_existing_target_and_unvalidated_profile_are_refused(self):
+        self.target.mkdir(mode=0o700)
+        with self.assertRaises(FileExistsError):
+            self.build()
+        self.assertEqual(list(self.target.iterdir()), [])
+        self.verify.reset_mock()
+        with self.assertRaisesRegex(oneclick.OneClickError, 'validated-private-config-required'):
+            oneclick.build_installers(self.root / 'job' / 'other', self.materials, {'rules': []})
+        self.verify.assert_not_called()
+
+    def test_ditto_only_where_cloning_is_unavailable(self):
+        def unsupported(source, target, flags):
+            oneclick.ctypes.set_errno(errno.ENOTSUP)
+            return -1
+        library = SimpleNamespace(clonefile=unsupported)
+        copies = []
+        def ditto(command, **kwargs):
+            self.assertEqual(command[0], '/usr/bin/ditto')
+            copies.append(command[1:])
+            shutil.copytree(command[1], command[2], symlinks=True)
+            return SimpleNamespace(returncode=0)
+        with mock.patch.object(oneclick.ctypes, 'CDLL', return_value=library), \
+                mock.patch.object(oneclick.subprocess, 'run', side_effect=ditto):
+            self.build()
+        self.assertEqual(copies, [[str(app), str(self.target / app.name)] for app in self.apps])
+        def denied(source, target, flags):
+            oneclick.ctypes.set_errno(errno.EACCES)
+            return -1
+        shutil.rmtree(str(self.target))
+        with mock.patch.object(oneclick.ctypes, 'CDLL', return_value=SimpleNamespace(clonefile=denied)), \
+                mock.patch.object(oneclick.subprocess, 'run', side_effect=AssertionError('no fallback')), \
+                self.assertRaisesRegex(oneclick.OneClickError, '^installer-copy-failed$'):
+            self.build()
 
 
 class ExclusiveRenameTests(Fixture):

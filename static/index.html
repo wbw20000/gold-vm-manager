@@ -67,7 +67,7 @@
       <p class="write-warning">原型功能：创建、重建、删除和启动已在开发环境通过面板验证，不代表完整自动初始化或任意环境兼容。首次设置与软件安装仍需手动完成。失败可能保留暂存文件；请先备份重要数据。</p>
       <label class="checkbox-label"><input id="build-setup-ack" type="checkbox"><span>允许复制宿主当前 Clash 节点配置到新 VM 的只读安装材料；不复制 Claude／CCBaga 身份库、钥匙串或浏览器资料。<small>首次需要在 VM 内完成 macOS 设置并运行 setup 安装向导，授权 Clash/Mihomo 核心服务（不含 Verge 图形客户端）、安装软件、检查代理并自行登录 Claude。创建成功不代表这些步骤已完成。</small></span></label>
       </div>
-      <div id="build-erase-warning" class="write-warning" hidden><strong>不可撤销：旧 VM 内的内容将全部丢弃</strong><p>确认后会先准备镜像和新系统，再删除旧磁盘及暂停状态，不保留旧 VM 备份。宿主共享原文件不会删除，但新 VM 的共享配置会清空。远端 token 不会因此撤销，宿主备份也不会自动擦除。</p><label class="checkbox-label"><input id="build-erase-ack" type="checkbox"><span>我确认删除选中的旧 VM 全部内容</span></label><div class="field"><label id="build-confirm-label" for="build-confirm">完整输入旧 VM 名称</label><input id="build-confirm" autocomplete="off" spellcheck="false"></div></div>
+      <div id="build-erase-warning" class="write-warning" hidden><strong>不可撤销：旧 VM 内的内容将全部丢弃</strong><p>确认后会先准备镜像和新系统，再删除旧磁盘及暂停状态，不保留旧 VM 备份。宿主共享原文件不会删除，但新 VM 的共享配置会清空。远端 token 不会因此撤销，宿主备份也不会自动擦除。</p><label class="checkbox-label"><input id="build-erase-ack" type="checkbox"><span>我确认删除选中的旧 VM 全部内容</span></label></div>
       <p id="build-error" class="form-error" role="alert" hidden></p>
       <div class="modal-footer"><button class="button button-secondary dialog-close" type="button">取消</button><button id="build-submit" class="button button-primary" type="submit" disabled>开始新建</button></div>
     </form>
@@ -76,8 +76,6 @@
     <form id="delete-form" novalidate>
       <div class="modal-heading"><h2 id="delete-title">永久删除 VM</h2><button class="icon-button dialog-close" type="button" aria-label="关闭">×</button></div>
       <p id="delete-description" class="write-warning">不可撤销：永久删除选中 VM 的磁盘、配置与暂停状态，不提供撤销或备份。不会删除宿主共享目录原文件；不会撤销远端令牌或清除宿主备份。运行中的 VM 必须先正常关机；本操作不会自动关机或强制停止。</p>
-      <div class="field"><label id="delete-name-label" for="delete-name">完整输入 VM 名称</label><input id="delete-name" autocomplete="off" spellcheck="false" required></div>
-      <label class="checkbox-label"><input id="delete-erase-ack" type="checkbox" required><span>我确认永久抹除这台 VM 的全部内容，且已有需要的备份。</span></label>
       <p id="delete-error" class="form-error" role="alert" hidden></p>
       <div class="modal-footer"><button class="button button-secondary dialog-close" type="button">取消</button><button id="delete-submit" class="button button-danger" type="submit" disabled>永久删除 VM</button></div>
     </form>
@@ -108,7 +106,7 @@
     </form>
   </dialog>
   <dialog id="confirm-dialog" class="modal confirm-modal" aria-labelledby="confirm-title" aria-describedby="confirm-description">
-    <form id="confirm-form" novalidate><div class="modal-heading"><div><div id="confirm-eyebrow" class="eyebrow">PLEASE CONFIRM</div><h2 id="confirm-title">确认操作</h2></div><button class="icon-button dialog-close" type="button" aria-label="关闭对话框">×</button></div><p id="confirm-description" class="modal-description"></p><div id="confirm-input-group" class="field" hidden><label id="confirm-input-label" for="confirm-name">输入虚拟机名称</label><input id="confirm-name" autocomplete="off" spellcheck="false"><small>必须完整匹配，包括大小写；不会自动执行强制操作。</small></div><p id="confirm-error" class="form-error" role="alert" hidden></p><div class="modal-footer"><button class="button button-secondary dialog-close" type="button">取消</button><button id="confirm-submit" class="button button-primary" type="submit">确认</button></div></form>
+    <form id="confirm-form" novalidate><div class="modal-heading"><div><div id="confirm-eyebrow" class="eyebrow">PLEASE CONFIRM</div><h2 id="confirm-title">确认操作</h2></div><button class="icon-button dialog-close" type="button" aria-label="关闭对话框">×</button></div><p id="confirm-description" class="modal-description"></p><p id="confirm-error" class="form-error" role="alert" hidden></p><div class="modal-footer"><button class="button button-secondary dialog-close" type="button">取消</button><button id="confirm-submit" class="button button-primary" type="submit">确认</button></div></form>
   </dialog>
   <dialog id="token-dialog" class="modal" aria-labelledby="token-title" aria-describedby="token-description"><form id="token-form"><div class="modal-heading"><div><div class="eyebrow">LOCAL CONNECTION</div><h2 id="token-title">连接本机服务</h2></div><button class="icon-button dialog-close" type="button" aria-label="关闭对话框">×</button></div><p id="token-description" class="modal-description">请从启动器打开带访问令牌的链接，或在这里手动输入令牌。令牌仅保存在当前标签页的会话中。</p><div class="field"><label for="token-input">访问令牌</label><input id="token-input" type="password" required autocomplete="off" spellcheck="false" placeholder="粘贴本机访问令牌"></div><div class="modal-footer"><button class="button button-secondary dialog-close" type="button">取消</button><button class="button button-primary" type="submit">连接</button></div></form></dialog>
   <div id="toast-region" class="toast-region" role="status" aria-live="polite" aria-atomic="false"></div>

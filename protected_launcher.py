@@ -21,6 +21,10 @@ import unicodedata
 # GOLD_VM_MANAGER_RECOVERY_V1
 
 BASE = Path(__file__).absolute().parent
+# Preinstalled protected environments, validated by their own preinstall_runtime:
+# v2 (apps and a first-login seed written into the disk) and v3 (nothing written;
+# a read-only installers share during first setup). "v2" below means either.
+PROTECTED_VERSIONS = (2, 3)
 HOME = Path.home()
 TART = str(HOME / 'Applications/tart.app/Contents/MacOS/tart')
 VM_ROOT = HOME / '.tart/vms'
@@ -48,7 +52,7 @@ def checked_digest(path):
 
 def build_tart_command(vm_name, network_fd, share_plan, no_graphics=False, recovery=False, *, environment=None,
                        first_setup=False):
-    if environment is not None and environment.get('version') == 2:
+    if environment is not None and environment.get('version') in PROTECTED_VERSIONS:
         from preinstall_runtime import build_tart_command as build_v2
         return build_v2(BASE, environment, vm_name, network_fd, share_plan, no_graphics, recovery,
                         first_setup=first_setup)
@@ -71,7 +75,7 @@ def validate_environment():
     if BASE.resolve(strict=True) != BASE or any(c in str(BASE) for c in ':,\n\r'):
         raise RuntimeError('Unsafe private base')
     meta = json.loads(checked_file(BASE / 'environment.json'))
-    if type(meta.get('version')) is int and meta['version'] == 2:
+    if type(meta.get('version')) is int and meta['version'] in PROTECTED_VERSIONS:
         # Verify the copied v2 support module before importing its validator.
         if checked_digest(BASE / 'preinstall_runtime.py') != meta.get('source_sha256', {}).get('preinstall_runtime.py'):
             raise RuntimeError('V2 runtime source integrity mismatch')
@@ -203,8 +207,12 @@ def run_first_setup(vm_name, share_plan, meta, runtime_env, no_graphics, lock):
     status = {'launcher_pid': os.getpid(), 'state': 'initializing', 'started_unix': time.time(),
               'network_mode': runtime_v2.FIRST_SETUP_NETWORK,
               'policy': 'none: Tart normal network for first setup only',
-              'native_execution_approved': False, 'guest_bootstrap_evidence': 'not_observed',
+              'native_execution_approved': False,
               'desktop_verified': False, 'network_independently_verified': False}
+    if meta['version'] == 2:
+        status['guest_bootstrap_evidence'] = 'not_observed'
+    else:
+        status['installers_share'] = runtime_v2.INSTALLERS_SHARE
     try:
         runtime_v2.validate_bindings(BASE, meta)
         runtime_v2.require_first_setup(BASE)
@@ -213,6 +221,7 @@ def run_first_setup(vm_name, share_plan, meta, runtime_env, no_graphics, lock):
             raise RuntimeError('Startup cancelled; VM not started')
         child = subprocess.Popen(cmd, env=runtime_env, stdin=subprocess.DEVNULL, close_fds=True)
         share_plan.record_launch(child.pid)
+        # v2's status mailbox or v3's read-only installers folder.
         status.update(state='running', tart_pid=child.pid, shared_directory_count=len(share_plan.shares) + 1,
                       sharing_allows_suspend=False, recovery_mode=False, setup_status='first-setup')
         write_status(BASE/'status.json', status)
@@ -250,15 +259,16 @@ def main():
     parser.add_argument('--enable-reviewed-backend-owner-execute', action='store_true',
                         help='V2 only with acknowledgement: make the exact private backend owner-executable; preserve quarantine')
     parser.add_argument('--first-setup-normal-network', action='store_true',
-                        help="V2 only, until first setup is marked finished: run Tart on its normal network, "
-                             "unfiltered, so Setup Assistant can reach Apple before Clash exists; no backend runs")
+                        help="V2/v3 only, until first setup is marked finished: run Tart on its normal network, "
+                             "unfiltered, so Setup Assistant can reach Apple before Clash exists; no backend runs. "
+                             "v3 also shares its installers folder read-only")
     args = parser.parse_args()
     args.management = False  # No guest management port is exposed by this launcher.
     os.umask(0o077)
     private_directory(BASE)
     meta = validate_environment()
     vm_name = meta['vm_name']
-    v2 = meta.get('version') == 2
+    v2 = meta.get('version') in PROTECTED_VERSIONS
     vm_config = Path(meta['vm_config']) if v2 else VM_ROOT / vm_name / 'config.json'
     tart = meta['tart_binding']['path'] if v2 else TART
     runtime_env = ({'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'HOME': str(HOME),
@@ -334,7 +344,7 @@ def main():
     if len(gold) != 1 or gold[0]['Running'] or gold[0]['State'] != 'stopped':
         raise RuntimeError('VM must exist and be stopped; suspended setup resumes are not supported')
     share_plan = prepare_vm_shares(vm_name, BASE, gold[0]['State']) if not args.recovery else None
-    reserved_names = ('setup', 'gold-status') if v2 else ('setup',)
+    reserved_names = ('setup', 'gold-status', 'gold-installers') if v2 else ('setup',)
     if share_plan is not None and any(s['name'].casefold() in reserved_names for s in share_plan.shares):
         raise RuntimeError('A protected runtime share name is reserved')
     endpoints = [tuple(x) for x in cfg['endpoints']]
@@ -372,8 +382,11 @@ def main():
               'state':'initializing','started_unix':time.time()}
     if v2:
         status.update(native_execution_approved=False, backend_execution_acknowledged=True,
-                      backend_startup_pending=True, guest_bootstrap_evidence='not_observed',
-                      desktop_verified=False, network_independently_verified=False)
+                      backend_startup_pending=True, desktop_verified=False, network_independently_verified=False)
+    if meta.get('version') == 2:
+        status['guest_bootstrap_evidence'] = 'not_observed'
+    # v1's setup share or v2's status mailbox; v3 adds none to a protected start.
+    special_shares = 0 if meta.get('version') == 3 else 1
     try:
         if v2:
             runtime_v2.validate_bindings(BASE, meta)
@@ -399,8 +412,9 @@ def main():
         backend_sock.send(b'VFKT')
         backend_sock.setblocking(False)
         host_sock.setblocking(False)
-        # V1 keeps readonly setup. V2 exposes only its owned status mailbox plus
-        # the unchanged validated user-share plan; both remain non-suspendable.
+        # V1 keeps readonly setup. V2 exposes only its owned status mailbox, v3
+        # nothing of its own, plus the unchanged validated user-share plan; all
+        # remain non-suspendable.
         if v2:
             runtime_v2.validate_bindings(BASE, meta)
         cmd = build_tart_command(vm_name, vm_sock.fileno(), share_plan, args.no_graphics, args.recovery,
@@ -414,7 +428,7 @@ def main():
             share_plan.record_launch(child.pid)
         vm_sock.close()
         vm_sock=None
-        status.update(state='starting',tart_pid=child.pid,backend_pid=backend.pid,vm_network_seen=False,shared_directory_count=0 if args.recovery else len(share_plan.shares)+1,sharing_allows_suspend=False,recovery_mode=args.recovery,setup_status='recovery' if args.recovery else ('preinstalled-awaiting-guest-report' if v2 else 'awaiting_user_setup'))
+        status.update(state='starting',tart_pid=child.pid,backend_pid=backend.pid,vm_network_seen=False,shared_directory_count=0 if args.recovery else len(share_plan.shares)+special_shares,sharing_allows_suspend=False,recovery_mode=args.recovery,setup_status='recovery' if args.recovery else ('protected' if meta.get('version') == 3 else 'preinstalled-awaiting-guest-report' if v2 else 'awaiting_user_setup'))
         write_status(BASE/'status.json',status)
         print('Protected network is running; default egress is denied.',flush=True)
         sel=selectors.DefaultSelector()

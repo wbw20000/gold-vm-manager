@@ -291,29 +291,25 @@ def _sign_local(path, entitlements_path=None, expected_entitlements=None):
 
 
 HELPERS_PORTABLE_RECEIPT = 'helpers.portable.json'
-OWNERSHIP_PORTABLE_RECEIPT = 'ownership-helper.portable.json'
 
 
 def _helper_group(group):
-    _need(group in ('runtime', 'ownership'), 'unknown-helper-group')
-    if group == 'runtime':
-        return (('CleanVMInstaller', 'GuestVPNBootstrap'),
-                ('CleanVMInstaller.swift', 'CleanVMInstaller.entitlements.plist', 'GuestVPNBootstrap.swift'),
-                HELPERS_PORTABLE_RECEIPT)
-    return (('GuestOwnershipHelper',), ('GuestOwnershipHelper.swift',), OWNERSHIP_PORTABLE_RECEIPT)
+    # Only the restore helper remains: nothing is compiled for, or run in, the guest.
+    _need(group == 'runtime', 'unknown-helper-group')
+    return (('CleanVMInstaller',), ('CleanVMInstaller.swift', 'CleanVMInstaller.entitlements.plist'),
+            HELPERS_PORTABLE_RECEIPT)
 
 
 def _portable_header(group):
     names, _, _ = _helper_group(group)
     recipes = {}
     for name in names:
-        clean = name == 'CleanVMInstaller'
         recipes[name] = {
             'source': name + '.swift', 'compiler': 'apple-sdk-swiftc', 'sdk': 'macosx',
-            'target': 'arm64-apple-macos13.0', 'swift_version': '6' if clean else '5',
+            'target': 'arm64-apple-macos13.0', 'swift_version': '6',
             'parse_as_library': True, 'optimization': '-O', 'defines': [],
-            'frameworks': ['Virtualization'] if clean else [],
-            'entitlements': {'com.apple.security.virtualization': True} if clean else {},
+            'frameworks': ['Virtualization'],
+            'entitlements': {'com.apple.security.virtualization': True},
             'signature': 'local-ad-hoc', 'timestamp': 'none',
         }
     return {'schema': 1, 'kind': 'gold-local-helper-build', 'group': group,
@@ -410,9 +406,7 @@ def _resolve_helper_group(resource_root, private_build_root, group):
         _need(_enclosing_local_app(root) is None, 'packaged-helpers-missing-no-runtime-compilation')
         for source in sources:
             _read(root / source)
-        if group == 'runtime':
-            return _compile_helpers(private_build_root, root)
-        return (_compile_ownership_helper(private_build_root, root),)
+        return _compile_helpers(private_build_root, root)
     except HostToolError:
         raise
     except Exception:
@@ -420,24 +414,20 @@ def _resolve_helper_group(resource_root, private_build_root, group):
 
 
 def resolve_helpers(resource_root, private_build_root):
-    """Reuse two verified receipt-bound binaries, or compile an explicit source checkout.
+    """Return the CleanVMInstaller Path: a verified receipt-bound binary, or one
+    compiled from an explicit source checkout.
 
     Binary packages need no Swift sources/SDK invocation. An app missing its
-    packaged helpers is rejected rather than compiling at runtime.
+    packaged helper is rejected rather than compiling at runtime.
     """
-    return _resolve_helper_group(resource_root, private_build_root, 'runtime')
-
-
-def resolve_ownership_helper(resource_root, private_build_root):
-    """Return the separately verified metadata helper; never request privileges."""
-    return _resolve_helper_group(resource_root, private_build_root, 'ownership')[0]
+    return _resolve_helper_group(resource_root, private_build_root, 'runtime')[0]
 
 
 def compile_helpers(private_build_root):
-    """Return (CleanVMInstaller Path, production GuestVPNBootstrap Path).
+    """Return (CleanVMInstaller Path,).
 
     Outputs and durable helpers.json live under a NEW unique private directory.
-    No helper is executed. No GOLD_VPN_BOOTSTRAP_FIXTURE compiler define is used.
+    No helper is executed.
     """
     return _compile_helpers(private_build_root, HERE)
 
@@ -447,7 +437,7 @@ def _compile_helpers(private_build_root, source_root):
         prerequisites = source_prerequisites()
         root = _attempt(private_build_root, 'helpers')
         sources = {}
-        for name in ('CleanVMInstaller.swift', 'GuestVPNBootstrap.swift', 'CleanVMInstaller.entitlements.plist'):
+        for name in ('CleanVMInstaller.swift', 'CleanVMInstaller.entitlements.plist'):
             raw = _read(Path(source_root) / name)
             sources[name] = _sha(raw)
             _write(root / name, raw)
@@ -457,73 +447,29 @@ def _compile_helpers(private_build_root, source_root):
         common = ['/usr/bin/xcrun', '--sdk', 'macosx', 'swiftc', '-parse-as-library', '-O',
                   '-target', 'arm64-apple-macos13.0', '-sdk', prerequisites['sdk_path'],
                   '-module-cache-path', str(root / 'module-cache')]
-        clean, guest = root / 'CleanVMInstaller', root / 'GuestVPNBootstrap'
+        clean = root / 'CleanVMInstaller'
         _tool(common + ['-swift-version', '6', str(root / 'CleanVMInstaller.swift'),
                         '-framework', 'Virtualization', '-o', str(clean)], timeout=600, build_directory=root)
-        _tool(common + ['-swift-version', '5', str(root / 'GuestVPNBootstrap.swift'),
-                        '-o', str(guest)], timeout=600, build_directory=root)
-        for path in (clean, guest):
-            _regular(path.lstat())
-            _need(path.stat().st_uid == os.getuid() and bool(path.stat().st_mode & 0o100),
-                  'compiled-helper-not-executable')
-            path.chmod(0o700)  # Restrict only this newly compiled project artifact.
-            _regular(path.lstat(), private=True)
+        _regular(clean.lstat())
+        _need(clean.stat().st_uid == os.getuid() and bool(clean.stat().st_mode & 0o100),
+              'compiled-helper-not-executable')
+        clean.chmod(0o700)  # Restrict only this newly compiled project artifact.
+        _regular(clean.lstat(), private=True)
         _sign_local(clean, root / 'CleanVMInstaller.entitlements.plist', entitlement)
-        _sign_local(guest)
         for name, digest in sources.items():
             _need(_digest(root / name) == digest, 'build-source-changed')
         _write(root / 'helpers.json', _json({
             'schema': 1, 'source_sha256': sources, 'signature': 'local-ad-hoc',
             'notarized': False, 'developer_id_signed': False, 'executed': False,
-            'production_guest_bootstrap': True,
-            'artifacts': {p.name: {'path': str(p), 'sha256': _digest(p)} for p in (clean, guest)},
+            'artifacts': {clean.name: {'path': str(clean), 'sha256': _digest(clean)}},
             'clean_installer_entitlements': entitlement,
         }))
         _emit_portable_receipt(root, 'runtime', sources)
-        return clean, guest
+        return (clean,)
     except HostToolError:
         raise
     except Exception:
         raise HostToolError('helper-build-failed') from None
-
-
-def compile_ownership_helper(private_build_root):
-    """Compile/sign a separate local metadata helper; NEVER authorize or run it.
-
-    OS administrator consent and the helper's restricted operation protocol are
-    parent responsibilities. This API does not request privileges or set set-ID.
-    """
-    return _compile_ownership_helper(private_build_root, HERE)
-
-
-def _compile_ownership_helper(private_build_root, source_root):
-    try:
-        raw = _read(Path(source_root) / 'GuestOwnershipHelper.swift')
-        prerequisites = source_prerequisites()
-        root = _attempt(private_build_root, 'ownership-helper')
-        source, binary = root / 'GuestOwnershipHelper.swift', root / 'GuestOwnershipHelper'
-        _write(source, raw)
-        _tool(['/usr/bin/xcrun', '--sdk', 'macosx', 'swiftc', '-parse-as-library', '-O',
-               '-swift-version', '5', '-target', 'arm64-apple-macos13.0',
-               '-sdk', prerequisites['sdk_path'], '-module-cache-path', str(root / 'module-cache'),
-               str(source), '-o', str(binary)], timeout=600, build_directory=root)
-        _regular(binary.lstat())
-        _need(binary.stat().st_uid == os.getuid() and bool(binary.stat().st_mode & 0o100),
-              'compiled-helper-not-executable')
-        binary.chmod(0o700)  # Never setuid/setgid; ordinary owned project executable.
-        _sign_local(binary)
-        _need(_digest(source) == _sha(raw), 'build-source-changed')
-        _write(root / 'ownership-helper.json', _json({
-            'schema': 1, 'source_sha256': _sha(raw), 'path': str(binary),
-            'sha256': _digest(binary), 'signature': 'local-ad-hoc', 'notarized': False,
-            'entitlements': {}, 'executed': False, 'administrator_authorization_requested': False,
-        }))
-        _emit_portable_receipt(root, 'ownership', {'GuestOwnershipHelper.swift': _sha(raw)})
-        return binary
-    except HostToolError:
-        raise
-    except Exception:
-        raise HostToolError('ownership-helper-build-failed') from None
 
 
 @dataclasses.dataclass(frozen=True)

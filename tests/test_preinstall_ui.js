@@ -159,7 +159,7 @@ test('validate sends raw submission only to fixed local endpoint; create sends o
   await f.n('submit').click();
   const create = f.calls.find(c => c.route.endsWith('/create'));
   assert.deepEqual(create.options.body, { name: 'new VM', cpu: 2, memory_gib: 4, disk_gib: 50, ipsw: 'reviewed', vpn_configuration_id: ID,
-    download_loopback_proxy: null, acknowledge_preinstall: true, acknowledge_network_policy: true, acknowledge_guest_autoconfigure: true });
+    download_loopback_proxy: null, acknowledge_preinstall: true, acknowledge_network_policy: true });
   assert.equal(JSON.stringify(create).includes('PRIVATE-password'), false);
   assert.equal(JSON.stringify(create).includes(UUID), false);
   assert.deepEqual(f.busyEvents, [true, false]); assert.equal(f.jobs.length, 1);
@@ -195,7 +195,7 @@ test('one explicit final button authorizes listed changes, never an implicit for
   assert.equal(payload.acknowledge_normalization, true);
   assert.equal(payload.acknowledge_preinstall, true);
   assert.equal(payload.acknowledge_network_policy, true);
-  assert.equal(payload.acknowledge_guest_autoconfigure, true);
+  assert.equal('acknowledge_guest_autoconfigure' in payload, false, 'nothing is configured inside the guest any more');
   assert.equal(f.n('normalization-note').hidden, true);
 });
 
@@ -388,7 +388,7 @@ test('a waiting job still allows the background preflight and an explicit path v
     assert.equal(f.calls.length, 2);
     await f.n('submit').click();
     assert.deepEqual(f.calls[2], { route: '/api/preinstall/resume', options: { method: 'POST', timeout: 30000,
-      body: { job_id: JOB_ID, vpn_configuration_id: ID, acknowledge_network_policy: true, acknowledge_guest_autoconfigure: true,
+      body: { job_id: JOB_ID, vpn_configuration_id: ID, acknowledge_network_policy: true,
         ...(normalization ? { acknowledge_normalization: true } : {}) } } });
     assert.deepEqual(f.queueModes, [{ resumed: true, deferred: false }]);
     assert.deepEqual(f.jobs, [waitingJob({ phase: 'vpn_resume_queued' })]);
@@ -451,7 +451,7 @@ test('shared folders keep management actions but offer no host Claude command', 
 test('all active preinstall phases and existing offline recovery lock VM actions and builds', () => {
   const sandbox = { state: {}, preinstallBusy: false };
   vm.createContext(sandbox); vm.runInContext(declaration('buildActive'), sandbox);
-  for (const phase of ['acquiring', 'installing', 'preinstalling', 'awaiting_vpn_configuration', 'vpn_resume_queued', 'resuming_vpn', 'configuring_vpn', 'verifying', 'publishing']) {
+  for (const phase of ['acquiring', 'installing', 'awaiting_vpn_configuration', 'vpn_resume_queued', 'resuming_vpn', 'preparing_runtime', 'publishing']) {
     sandbox.state.build_job = { mode: 'preinstall', phase }; assert.equal(sandbox.buildActive(), true, phase);
   }
   sandbox.state.build_job = { phase: 'failed', recovery_required: true }; assert.equal(sandbox.buildActive(), true);
@@ -470,7 +470,7 @@ test('waiting build status offers only the matching continuation and disables it
   for (const name of ['waitingVpnJob', 'openWaitingVpnConfiguration', 'renderBuildJob']) vm.runInContext(declaration(name), sandbox);
   sandbox.renderBuildJob();
   assert.equal(region.hidden, false);
-  assert.match(region.children.map(n => n.text).join(' '), /系统和应用已装好.*尚未配置客机网络.*尚未发布或启动/);
+  assert.match(region.children.map(n => n.text).join(' '), /系统已恢复.*尚未配置客机网络.*尚未发布或启动/);
   const continuation = region.children.filter(n => n.click);
   assert.deepEqual(continuation.map(n => n.text), ['继续配置 VPN']); assert.deepEqual(opened, []);
   await continuation[0].click(); assert.deepEqual(opened, [JOB_ID]);
@@ -490,7 +490,7 @@ test('waiting build status offers only the matching continuation and disables it
   }
 });
 
-test('failed material preparation never instructs the user to grant administrator access', () => {
+test('failed material preparation never mentions administrator access', () => {
   const region = { children: [], classList: { toggle() {} }, replaceChildren() { this.children = []; }, append(...v) { this.children.push(...v); } };
   const sandbox = { state: { build_job: { mode: 'preinstall', name: 'gg1', phase: 'failed',
     failed_phase: 'acquiring', failure_code: 'unsafe-tar-path', system_restored: false, message: '旧授权提示' } },
@@ -500,8 +500,7 @@ test('failed material preparation never instructs the user to grant administrato
   sandbox.renderBuildJob();
   const text = region.children.map(n => n.text).join(' ');
   assert.match(text, /材料准备失败.*Tart.*尚未创建虚拟磁盘/);
-  assert.match(text, /此阶段不涉及管理员授权/);
-  assert.doesNotMatch(text, /亲自确认|旧授权提示/);
+  assert.doesNotMatch(text, /管理员授权|亲自完成|旧授权提示/);
 });
 
 test('published/static-written job phases never claim connected VPN or automatically start a VM', () => {
@@ -509,11 +508,11 @@ test('published/static-written job phases never claim connected VPN or automatic
   const sandbox = { state: {}, selectedVM: 'other', $: () => region, el: (tag, cls, text) => ({ tag, text }),
     button: () => { throw new Error('No automatic startup action'); } };
   vm.createContext(sandbox); vm.runInContext(declaration('renderBuildJob'), sandbox);
-  for (const phase of ['acquiring', 'preinstalling', 'configuring_vpn', 'verifying', 'publishing', 'awaiting_first_desktop_acceptance', 'awaiting_system_authorization', 'failed']) {
+  for (const phase of ['acquiring', 'preparing_runtime', 'publishing', 'awaiting_first_desktop_acceptance', 'failed']) {
     sandbox.state.build_job = { mode: 'preinstall', phase, name: 'new VM', vpn: { config_written: true }, progress: null };
     sandbox.renderBuildJob();
     const text = region.children.map(n => n.text).join(' ');
-    assert.match(text, /一键预装/); assert.match(text, /不代表 VPN 已连通/); assert.match(text, /亲自确认/);
+    assert.match(text, /一键预装/); assert.match(text, /不代表 VPN 已连通/); assert.match(text, /亲自完成/);
   }
   assert.doesNotMatch(source, /\/api\/vms\/.*\/action|action:\s*['"]start|source_vm|acknowledge_erase/);
 });
@@ -525,37 +524,32 @@ function jobRegion() {
 function renderFailedJob(job, extra = {}) {
   const region = jobRegion();
   const buttons = [];
-  const sandbox = Object.assign({ state: { build_job: job }, selectedVM: '', connected: true, authorizationBusy: false, $: () => region,
+  const sandbox = Object.assign({ state: { build_job: job }, selectedVM: '', connected: true, $: () => region,
     el: (tag, cls, text) => ({ tag, cls, text }),
     button: (text, cls, click, disabled) => { const item = { text, click, disabled }; buttons.push(item); return item; } }, extra);
   vm.createContext(sandbox);
-  for (const name of ['pausedAuthorization', 'renderBuildJob']) vm.runInContext(declaration(name), sandbox);
+  vm.runInContext(declaration('renderBuildJob'), sandbox);
   sandbox.renderBuildJob();
   return { text: region.children.map(n => n.text).filter(Boolean).join('\n'), buttons: buttons.map(b => ({ text: b.text, disabled: b.disabled })) };
 }
 
 test('failed preinstall card names the failed step, explains the reason and keeps the raw codes', () => {
   const { text, buttons } = renderFailedJob({ id: JOB_ID, mode: 'preinstall', name: 'backup1', phase: 'failed',
-    failed_phase: 'failed_retained', failed_step: 'authorized-ownership-apply', failure_code: 'offline-vpn-failed-retained',
-    failure_reason: 'system-authorization-interaction-not-allowed', recovery_required: true, published: false,
+    failed_phase: 'preparing_runtime', failure_code: 'installer-copy-mismatch', recovery_required: true, published: false,
     message: '预装未完成；保留所有暂存文件，不自动覆盖重试。请查看失败步骤。' });
-  assert.match(text, /失败步骤：写入属主（需管理员授权）/);
-  assert.match(text, /原因：系统未能显示管理员授权窗口/);
-  assert.match(text, /代码：offline-vpn-failed-retained \/ system-authorization-interaction-not-allowed/);
+  assert.match(text, /失败步骤：准备首次设置文件夹与受保护启动（preparing_runtime）/);
+  assert.match(text, /原因：复制后的应用与已核验的原件不一致/);
+  assert.match(text, /代码：installer-copy-mismatch/);
   assert.match(text, /不代表 VPN 已连通/);
+  assert.doesNotMatch(text, /管理员授权|属主/);
   assert.equal(JSON.stringify(buttons), JSON.stringify([{ text: '归档此失败任务（保留暂存盘）', disabled: false }]));
 });
 
-test('failure details fall back to phase labels, keep helper exit numbers and never invent a reason', () => {
+test('failure details fall back to phase labels and never invent a reason', () => {
   let view = renderFailedJob({ id: JOB_ID, mode: 'preinstall', name: 'n1', phase: 'failed', failed_phase: 'installing',
     failure_code: 'apple-restore-not-complete', recovery_required: true });
   assert.match(view.text, /失败步骤：离线安装系统（installing）/);
   assert.match(view.text, /代码：apple-restore-not-complete/);
-  view = renderFailedJob({ id: JOB_ID, mode: 'preinstall', name: 'n2', phase: 'failed', failed_phase: 'failed_retained',
-    failed_step: 'authorized-ownership-apply', failure_code: 'offline-vpn-failed-retained',
-    failure_reason: 'system-authorization-helper-exit-3', recovery_required: true });
-  assert.match(view.text, /属主助手拒绝执行/);
-  assert.match(view.text, /system-authorization-helper-exit-3/);
   view = renderFailedJob({ id: JOB_ID, mode: 'preinstall', name: 'n3', phase: 'failed', failed_phase: 'mystery_phase',
     failure_code: 'unheard-of-code', recovery_required: false });
   assert.match(view.text, /失败步骤：mystery_phase/);
@@ -571,24 +565,7 @@ test('failure details fall back to phase labels, keep helper exit numbers and ne
   assert.doesNotMatch(appSource.slice(appSource.indexOf('function renderBuildJob'), appSource.indexOf('function openBuild')), /innerHTML/);
 });
 
-test('native ownership failures render exact public categories; generic, unknown and prefix collisions stay unclassified', () => {
-  const reason = n => renderFailedJob({ id: JOB_ID, mode: 'preinstall', name: 'fixture', phase: 'failed',
-    failed_step: 'authorized-ownership-apply', failure_code: 'offline-vpn-failed-retained',
-    failure_reason: `system-authorization-helper-exit-${n}`, recovery_required: true, published: false });
-  for (const [n, expected] of [[20,'调用参数'],[21,'授权票据'],[22,'独占写锁'],[23,'客机初始状态'],[24,'APFS 数据卷'],
-    [25,'目标路径集合'],[26,'符号链接'],[27,'权限模式'],[28,'属主或属组'],[29,'访问控制项'],[30,'哈希'],[31,'一次性操作标记'],[32,'部分变更']]) {
-    const view = reason(n);
-    assert.ok(view.text.includes(expected));
-    assert.ok(view.text.includes(`代码：offline-vpn-failed-retained / system-authorization-helper-exit-${n}`));
-    assert.equal(view.buttons.length, 1);
-    assert.match(view.buttons[0].text, /归档/);
-  }
-  assert.match(reason(2).text, /无法从这次记录确定具体检查/);
-  assert.match(reason(280).text, /属主助手拒绝执行/);
-  assert.doesNotMatch(reason(280).text, /目标文件的属主或属组/);
-});
-
-test('archiving a failed job needs the exact VM name and sends only the job id and name', async () => {
+test('archiving a failed job is one click and sends only the job id and name', async () => {
   const nodes = new Map();
   const node = (id) => {
     if (!nodes.has(id)) nodes.set(id, { id, value: '', hidden: false, disabled: false, textContent: '', className: '', required: false,
@@ -600,7 +577,7 @@ test('archiving a failed job needs the exact VM name and sends only the job id a
     api: async (route, options) => { calls.push([route, options.method, options.body]); return { ok: true, stage_retained: true }; },
     refresh: async () => { calls.push(['refresh']); }, toast: () => {}, showError: (id, message) => { throw new Error(message); } };
   vm.createContext(sandbox);
-  for (const name of ['openArchiveJob', 'confirmSubmitDisabled', 'submitConfirm']) vm.runInContext(declaration(name), sandbox);
+  for (const name of ['openArchiveJob', 'submitConfirm']) vm.runInContext(declaration(name), sandbox);
   const job = { id: JOB_ID, mode: 'preinstall', name: 'backup1', phase: 'failed', recovery_required: true, published: false };
   sandbox.openArchiveJob(Object.assign({}, job, { recovery_required: false }));
   assert.equal(node('confirm-dialog').open, false, 'only locked failed jobs can be archived');
@@ -608,97 +585,20 @@ test('archiving a failed job needs the exact VM name and sends only the job id a
   assert.equal(node('confirm-dialog').open, true);
   assert.match(node('confirm-description').textContent, /\.gold-manager-staging/);
   assert.match(node('confirm-description').textContent, /不会删除/);
-  assert.equal(node('confirm-input-group').hidden, false);
-  assert.equal(node('confirm-submit').disabled, true);
-  node('confirm-name').value = 'backup1 ';
-  assert.equal(sandbox.confirmSubmitDisabled(), true);
-  node('confirm-name').value = 'backup1';
-  assert.equal(sandbox.confirmSubmitDisabled(), false, 'the failed job lock itself must not block its own archive');
+  assert.equal(node('confirm-submit').disabled, false, 'no typed name: the button itself confirms');
   await sandbox.submitConfirm({ preventDefault() {} });
   assert.equal(JSON.stringify(calls[0]), JSON.stringify(['/api/preinstall/archive', 'POST', { job_id: JOB_ID, confirm_name: 'backup1' }]));
   assert.equal(node('confirm-dialog').open, false);
-  sandbox.confirmContext = { type: 'action', id: 'gold', action: 'force-stop', typed: true };
-  node('confirm-name').value = 'gold';
-  assert.equal(sandbox.confirmSubmitDisabled(), true, 'other dangerous actions stay blocked while a job is locked');
-  assert.match(appSource, /addEventListener\('input', \(\) => \{ if \(confirmContext\?\.typed\) \$\('confirm-submit'\)\.disabled = confirmSubmitDisabled\(\); \}\)/);
 });
 
-const PAUSED_RETRY = { operation: 'apply', reason: 'system-authorization-user-cancelled', attempt: 1, max_attempts: 3,
-  expires_at: '2026-11-18T23:30:00+00:00' };
-const pausedJob = (changes = {}) => Object.assign({ id: JOB_ID, mode: 'preinstall', name: 'backup1',
-  phase: 'awaiting_system_authorization', authorization_retry: PAUSED_RETRY, message: '等待你的选择' }, changes);
-const retryButtons = (view) => view.buttons.filter(b => ['重新请求管理员授权', '放弃（保留现场）'].includes(b.text));
-
-test('a refused administrator prompt pauses with an explicit retry or abandon choice', () => {
-  let view = renderFailedJob(pausedJob());
-  assert.match(view.text, /写入属主的管理员授权未完成：管理员授权窗口被取消/);
-  assert.match(view.text, /root 助手没有运行/);
-  assert.match(view.text, /第 1 次（最多 3 次）/);
-  assert.match(view.text, /按失败处理并保留现场/);
-  assert.equal(JSON.stringify(retryButtons(view)),
-    JSON.stringify([{ text: '重新请求管理员授权', disabled: false }, { text: '放弃（保留现场）', disabled: false }]));
-  view = renderFailedJob(pausedJob({ authorization_retry: Object.assign({}, PAUSED_RETRY,
-    { operation: 'verify', reason: 'system-authorization-authorization-denied', attempt: 2 }) }));
-  assert.match(view.text, /复核属主的管理员授权未完成：.*用户名或密码不正确/);
-  assert.match(view.text, /第 2 次（最多 3 次）/);
-  view = renderFailedJob(pausedJob({ authorization_retry: Object.assign({}, PAUSED_RETRY, { reason: 'system-authorization-unheard-of' }) }));
-  assert.match(view.text, /system-authorization-unheard-of/, 'an unmapped reason still shows its fixed code');
-  view = renderFailedJob(pausedJob(), { connected: false });
-  assert.deepEqual(retryButtons(view).map(b => b.disabled), [true, true]);
-  view = renderFailedJob(pausedJob(), { authorizationBusy: true });
-  assert.deepEqual(retryButtons(view).map(b => b.disabled), [true, true]);
-  for (const changes of [{ phase: 'interrupted' }, { phase: 'failed', recovery_required: true }, { authorization_retry: undefined },
-    { authorization_retry: Object.assign({}, PAUSED_RETRY, { attempt: '1' }) },
-    { authorization_retry: Object.assign({}, PAUSED_RETRY, { operation: 'chown' }) }, { mode: 'create' }]) {
-    assert.equal(retryButtons(renderFailedJob(pausedJob(changes))).length, 0, JSON.stringify(changes));
+test('no dialog asks to type a VM name, and the retired administrator pause is gone', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'static', 'index.html'), 'utf8');
+  for (const id of ['confirm-name', 'confirm-input-group', 'delete-name', 'delete-erase-ack', 'build-confirm']) {
+    assert.doesNotMatch(html, new RegExp(`id="${id}"`), id);
+    assert.doesNotMatch(appSource, new RegExp(`'${id}'`), id);
   }
-});
-
-test('retry posts the exact decision once; abandon asks for confirmation before failing the job', async () => {
-  const nodes = new Map();
-  const node = (id) => {
-    if (!nodes.has(id)) nodes.set(id, { id, value: '', hidden: false, disabled: false, textContent: '', className: '', required: false,
-      open: false, showModal() { this.open = true; }, close() { this.open = false; }, focus() {}, querySelectorAll() { return []; } });
-    return nodes.get(id);
-  };
-  const calls = [];
-  let release;
-  const sandbox = { $: node, connected: true, confirmContext: null, confirmBusy: false, authorizationBusy: false, buildActive: () => true,
-    api: async (route, options) => { calls.push([route, options.method, options.body]); if (release) await new Promise((r) => { release = r; }); return { ok: true, decision: options.body.decision }; },
-    refresh: async () => { calls.push(['refresh']); }, toast: () => {}, showError: (id, message) => { throw new Error(message); } };
-  vm.createContext(sandbox);
-  for (const name of ['pausedAuthorization', 'decideAuthorization', 'openAbandonAuthorization', 'confirmSubmitDisabled', 'submitConfirm']) {
-    vm.runInContext(declaration(name), sandbox);
-  }
-  await sandbox.decideAuthorization(pausedJob(), 'retry');
-  assert.equal(JSON.stringify(calls), JSON.stringify([['/api/preinstall/authorization', 'POST',
-    { job_id: JOB_ID, attempt: 1, decision: 'retry' }], ['refresh']]));
-  assert.equal(sandbox.authorizationBusy, false);
-  calls.length = 0;
-  release = () => {};
-  const pending = sandbox.decideAuthorization(pausedJob(), 'retry');
-  await sandbox.decideAuthorization(pausedJob(), 'retry');
-  assert.equal(calls.length, 1, 'a second click while the first is in flight sends nothing');
-  release(); await pending; release = null;
-  calls.length = 0;
-  for (const job of [pausedJob({ phase: 'failed' }), pausedJob({ authorization_retry: undefined })]) {
-    await sandbox.decideAuthorization(job, 'retry');
-    sandbox.openAbandonAuthorization(job);
-  }
-  await sandbox.decideAuthorization(pausedJob(), 'abandon');
-  assert.equal(calls.length, 0, 'abandon is never sent without the confirmation dialog');
-  assert.equal(node('confirm-dialog').open, false);
-  sandbox.openAbandonAuthorization(pausedJob());
-  assert.equal(node('confirm-dialog').open, true);
-  assert.equal(node('confirm-input-group').hidden, true);
-  assert.match(node('confirm-description').textContent, /按失败处理/);
-  assert.match(node('confirm-description').textContent, /归档/);
-  assert.equal(sandbox.confirmSubmitDisabled(), false, 'the paused job itself must not block its own choice');
-  await sandbox.submitConfirm({ preventDefault() {} });
-  assert.equal(JSON.stringify(calls[0]), JSON.stringify(['/api/preinstall/authorization', 'POST',
-    { job_id: JOB_ID, attempt: 1, decision: 'abandon' }]));
-  assert.equal(node('confirm-dialog').open, false);
-  assert.doesNotMatch(appSource.slice(appSource.indexOf('function pausedAuthorization'), appSource.indexOf('function openBuild')), /innerHTML/);
+  assert.doesNotMatch(appSource, /\/api\/preinstall\/authorization|pausedAuthorization|authorization_retry/);
+  assert.match(appSource, /body: \{ confirm_name: id, acknowledge_erase: true \}/);
 });
 
 test('a material failure names the product, explains the transfer cause and keeps the code', () => {
@@ -709,8 +609,7 @@ test('a material failure names the product, explains the transfer cause and keep
   assert.match(view.text, /失败项目：CCBaga/);
   assert.match(view.text, /原因：30 秒内没有收到/);
   assert.match(view.text, /代码：download-timeout/);
-  assert.match(view.text, /此阶段不涉及管理员授权/);
-  assert.doesNotMatch(view.text, /亲自确认/);
+  assert.doesNotMatch(view.text, /管理员授权|亲自完成/);
   view = failed({ failure_code: 'download-connection-lost', failed_product: 'clashVergeRev' });
   assert.match(view.text, /失败项目：Clash Verge/);
   assert.match(view.text, /连接被中断/);
@@ -723,21 +622,13 @@ test('a material failure names the product, explains the transfer cause and keep
 });
 
 test('the job card says whether application materials were reused or downloaded', () => {
-  const job = (source) => ({ id: JOB_ID, mode: 'preinstall', name: 'bb2', phase: 'preinstalling', materials_source: source });
+  const job = (source) => ({ id: JOB_ID, mode: 'preinstall', name: 'bb2', phase: 'acquiring', materials_source: source });
   assert.match(renderFailedJob(job('reused')).text, /应用材料：复用本机已校验的缓存（本次已重新完整校验）/);
   assert.match(renderFailedJob(job('downloaded')).text, /应用材料：本次重新下载/);
   assert.doesNotMatch(renderFailedJob(job('elsewhere')).text, /应用材料/);
 });
 
-test('a failure while re-attaching with ownership enabled is named as its own step', () => {
-  const { text } = renderFailedJob({ id: JOB_ID, mode: 'preinstall', name: 'bb1', phase: 'failed', failed_phase: 'failed_retained',
-    failed_step: 'owners-on-reattach', failure_code: 'offline-vpn-failed-retained',
-    failure_reason: 'seed-changed-before-ownership-apply', recovery_required: true });
-  assert.match(text, /失败步骤：以启用所有权方式重新挂载（owners-on-reattach）/);
-  assert.match(text, /代码：offline-vpn-failed-retained \/ seed-changed-before-ownership-apply/);
-});
-
-test('first setup starts on the normal network with its own named consent; marking it finished switches to protected starts', async () => {
+test('first setup starts on the normal network with its own one-click consent; marking it finished switches to protected starts', async () => {
   const nodes = new Map();
   const node = (id) => {
     if (!nodes.has(id)) nodes.set(id, { id, value: '', hidden: false, disabled: false, textContent: '', className: '', required: false,
@@ -745,14 +636,14 @@ test('first setup starts on the normal network with its own named consent; marki
     return nodes.get(id);
   };
   const calls = [];
-  let current = { id: 'gold', state: 'stopped', preinstalled: { first_setup_pending: true } };
+  let current = { id: 'gold', state: 'stopped', preinstalled: { first_setup_pending: true, installers_share: true } };
   const sandbox = { $: node, connected: true, confirmContext: null, confirmBusy: false, lastActionError: '', busyVMs: new Set(),
     buildActive: () => false, locked: () => false, vmById: () => current, render: () => {},
     api: async (route, options) => { calls.push(JSON.stringify([route, options.method, options.body])); return { ok: true, message: 'ok' }; },
     refresh: async () => {}, toast: () => {}, showError: (id, message) => { throw new Error(message); } };
   vm.createContext(sandbox);
   vm.runInContext(appSource.match(/^ {2}const ACTION_LABELS = .*;$/m)[0].replace('const ', 'var '), sandbox);
-  for (const name of ['openActionConfirm', 'confirmSubmitDisabled', 'submitConfirm', 'runAction']) vm.runInContext(declaration(name), sandbox);
+  for (const name of ['openActionConfirm', 'submitConfirm', 'runAction']) vm.runInContext(declaration(name), sandbox);
   const submit = () => sandbox.submitConfirm({ preventDefault() {} });
 
   sandbox.openActionConfirm('gold', 'start');
@@ -760,14 +651,16 @@ test('first setup starts on the normal network with its own named consent; marki
   assert.match(node('confirm-description').textContent, /普通网络/);
   assert.match(node('confirm-description').textContent, /真实 IP/);
   assert.match(node('confirm-description').textContent, /标记首次设置完成/);
+  assert.match(node('confirm-description').textContent, /gold-installers/);
+  assert.match(node('confirm-description').textContent, /用 Finder 把应用拖进「应用程序」/);
+  assert.doesNotMatch(node('confirm-description').textContent, /输入/);
   assert.equal(node('confirm-submit').textContent, '用普通网络启动首次设置');
-  assert.equal(node('confirm-input-group').hidden, false);
-  node('confirm-name').value = 'gold';
+  assert.equal(node('confirm-submit').disabled, false, 'one click confirms; no typed name');
   await submit();
   assert.equal(calls.pop(), JSON.stringify(['/api/vms/gold/action', 'POST', { action: 'start', confirm_name: 'gold', first_setup_normal_network: true }]));
   assert.equal(node('confirm-dialog').open, false);
 
-  // A stale or forged call can never mix the two consents or skip the typed name.
+  // A stale or forged call can never mix the two consents or target another VM.
   for (const args of [['gold', true, false], ['gold', true, true], ['gold ', false, true], [undefined, false, true]]) {
     assert.equal(await sandbox.runAction('gold', 'start', args[0], args[1], args[2]), false, JSON.stringify(args));
   }
@@ -776,17 +669,15 @@ test('first setup starts on the normal network with its own named consent; marki
   sandbox.openActionConfirm('gold', 'finish-first-setup');
   assert.match(node('confirm-description').textContent, /不能撤销/);
   assert.match(node('confirm-description').textContent, /连上节点/);
-  assert.equal(node('confirm-input-group').hidden, true);
   await submit();
   assert.equal(calls.pop(), JSON.stringify(['/api/vms/gold/action', 'POST', { action: 'finish-first-setup' }]));
 
-  current = { id: 'gold', state: 'stopped', preinstalled: { first_setup_pending: false } };
+  current = { id: 'gold', state: 'stopped', preinstalled: { first_setup_pending: false, installers_share: true } };
   sandbox.openActionConfirm('gold', 'finish-first-setup');
   assert.equal(node('confirm-dialog').open, false, 'nothing to mark once first setup is finished');
   sandbox.openActionConfirm('gold', 'start');
   assert.equal(node('confirm-submit').textContent, '同意尝试受保护启动');
-  assert.doesNotMatch(node('confirm-description').textContent, /普通网络启动首次设置/);
-  node('confirm-name').value = 'gold';
+  assert.doesNotMatch(node('confirm-description').textContent, /普通网络启动首次设置|输入/);
   await submit();
   assert.equal(calls.pop(), JSON.stringify(['/api/vms/gold/action', 'POST', { action: 'start', confirm_name: 'gold', acknowledge_reviewed_unsigned_backend: true }]));
   assert.equal(await sandbox.runAction('gold', 'start', 'gold', false, true), false, 'no normal network once first setup is finished');
@@ -796,4 +687,22 @@ test('first setup starts on the normal network with its own named consent; marki
   assert.match(card, /标记首次设置完成…/);
   assert.match(card, /首次设置 · 普通网络，未过滤/);
   assert.match(card, /network\.normal_network/);
+  assert.match(card, /gold-installers/);
+});
+
+test('an older preinstalled VM keeps its own first-setup wording without the installers folder', () => {
+  const nodes = new Map();
+  const node = (id) => {
+    if (!nodes.has(id)) nodes.set(id, { id, value: '', hidden: false, disabled: false, textContent: '', className: '', required: false,
+      open: false, showModal() { this.open = true; }, close() { this.open = false; }, focus() {}, querySelectorAll() { return []; } });
+    return nodes.get(id);
+  };
+  const sandbox = { $: node, connected: true, confirmContext: null, locked: () => false, buildActive: () => false,
+    vmById: () => ({ id: 'bb1', state: 'stopped', preinstalled: { first_setup_pending: true, installers_share: false } }) };
+  vm.createContext(sandbox);
+  vm.runInContext(appSource.match(/^ {2}const ACTION_LABELS = .*;$/m)[0].replace('const ', 'var '), sandbox);
+  vm.runInContext(declaration('openActionConfirm'), sandbox);
+  sandbox.openActionConfirm('bb1', 'start');
+  assert.match(node('confirm-description').textContent, /自动导入节点/);
+  assert.doesNotMatch(node('confirm-description').textContent, /gold-installers/);
 });

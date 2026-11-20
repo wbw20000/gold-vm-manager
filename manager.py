@@ -33,7 +33,7 @@ import oneclick
 import vpn_store
 
 APP = 'gold-vm-manager'
-VERSION = '1.3.0'
+VERSION = '1.4.0'
 VPN_VALIDATE_PATH = '/api/preinstall/vpn/validate'
 # Cover JSON escaping for the 256 KiB input limit without raising other routes' caps.
 VPN_VALIDATE_MAX_WIRE = 6 * 256 * 1024 + 16384
@@ -42,7 +42,10 @@ PREINSTALL_PHASE_FIELDS = frozenset(('id', 'mode', 'name', 'phase', 'pid', 'prog
     'guest_started', 'desktop_verified', 'host_credentials_copied', 'user_vpn_configuration_supplied',
     'vpn_configuration_staged', 'vpn_connected', 'network_independently_verified', 'published',
     'needs_host_security_authorization', 'recovery_required', 'failure_code', 'failed_phase',
-    'failed_step', 'failure_reason', 'authorization_retry', 'failed_product', 'materials_source'))
+    'failed_step', 'failure_reason', 'failed_product', 'materials_source'))
+# Preinstalled protected environments: v2 wrote apps and a first-login seed into
+# the guest disk; v3 writes nothing there and shares installers during first setup.
+PROTECTED_VERSIONS = (2, 3)
 HOME = Path.home()
 STATE_DIR = HOME / 'Library/Application Support/GoldVMManager'
 CONFIG_PATH = STATE_DIR / 'config.json'
@@ -254,15 +257,6 @@ class Controller:
                 raise AppError('未归档。只能归档已结束、未发布、未挂载且名称完全一致的失败预装任务；暂存盘未改动。',
                                'archive_rejected', 409) from None
 
-    def decide_preinstall_authorization(self, payload):
-        # No "busy" check: a preinstall worker is running by definition.
-        with self.lock:
-            try:
-                return oneclick.authorization_decision(payload, state_dir=STATE_DIR)
-            except (ValueError, OSError, subprocess.SubprocessError):
-                raise AppError('未提交。只能在授权暂停、等待你选择时提交一次；请刷新状态后再试。',
-                               'authorization_decision_rejected', 409) from None
-
     def pick_ipsw(self, payload):
         if payload != {}:
             raise AppError('镜像选择请求格式错误')
@@ -370,7 +364,7 @@ class Controller:
         command = r.stdout.strip()
         argv = process_identity.arguments(pid)
         meta = self._environment(vm)
-        if meta.get('version') == 2:
+        if meta.get('version') in PROTECTED_VERSIONS:
             binding = meta.get('tart_binding')
             tart = binding.get('path') if type(binding) is dict and meta.get('vm_name') == vm else None
         else:
@@ -390,18 +384,24 @@ class Controller:
         except (ValueError, OSError, RuntimeError) as error:
             raise AppError('上次共享挂载记录不可读：' + str(error)[:160], 'invalid_launch_record', 409) from None
 
-    def _preinstalled_status(self, base, runtime):
-        # Guest mailbox is untrusted evidence from one purpose-built private share.
-        # It must never elevate guest claims to a verified connection or desktop.
+    def _preinstalled_status(self, base, runtime, environment):
+        # v3 writes nothing into the guest: the person installs from the read-only
+        # installers share. v2's guest mailbox is untrusted evidence from one
+        # purpose-built private share; it never elevates guest claims to a
+        # verified connection or desktop.
         from preinstall_runtime import read_guest_status, first_setup_pending, RuntimePreparationError
         try:
             pending = first_setup_pending(base)
         except RuntimePreparationError:
             pending = None  # Reported as an error; no start chooses a network for it.
-        result = {'first_setup_pending': pending, 'configuration_staged': True, 'configuration': 'not_observed',
+        installers = environment.get('version') == 3
+        result = {'first_setup_pending': pending, 'installers_share': installers,
+                  'configuration_staged': not installers, 'configuration': 'not_observed',
                   'application': 'not_observed', 'system_authorization': 'user_action_may_be_required',
                   'host_authorization_pending': runtime.get('state') in (None, 'awaiting_host_authorization'),
                   'desktop_verified': False, 'vpn_connected': False, 'network_independently_verified': False}
+        if installers:
+            return result
         try:
             seed = private_json(base / 'vpn-seed-receipt.json', {})
             report = read_guest_status(base, seed.get('receipt_token'))
@@ -437,9 +437,6 @@ class Controller:
         build = self.build_status()
         if build and build.get('mode') == 'preinstall':
             build = {k: v for k, v in build.items() if k in PREINSTALL_PHASE_FIELDS}
-            retry = lifecycle.public_authorization_retry(build.pop('authorization_retry', None))
-            if retry is not None and build.get('phase') == 'awaiting_system_authorization':
-                build['authorization_retry'] = retry
         vms = []
         with self.lock:
             for child_vm, process in list(self.children.items()):
@@ -478,7 +475,7 @@ class Controller:
                 except AppError:
                     environment = {}
                     error = '启动环境记录不可读；不会自动启动。'
-                preinstalled = environment.get('version') == 2
+                preinstalled = environment.get('version') in PROTECTED_VERSIONS
                 setup_active = managed_environment and not preinstalled
                 try:
                     profile = setup_profile.validate(environment.get('setup_profile'))
@@ -486,7 +483,7 @@ class Controller:
                     profile = setup_profile.validate()
                     error = '初始化模板无效，请重新选择，不自动执行'
                 recovery_mode = runtime.get('recovery_mode') is True and vm_state == 'running'
-                preinstall_status = self._preinstalled_status(base, runtime) if preinstalled else None
+                preinstall_status = self._preinstalled_status(base, runtime, environment) if preinstalled else None
                 if preinstall_status is not None and preinstall_status['first_setup_pending'] is None:
                     error = '首次设置记录（network-mode.json）异常；不会启动，请检查私有运行目录。'
                 pause_supported = vm not in ISOLATED_VMS and not managed_environment and not effective_shares(active)
@@ -613,7 +610,7 @@ class Controller:
                           'finish-first-setup'):
             raise AppError('不支持此 VM 操作')
         if action in ('force-stop', 'discard-state', 'recovery-start') and payload.get('confirm_name') != vm:
-            raise AppError('请输入完整 VM 名称以确认可能丢失未保存内容的操作', 'confirmation_required')
+            raise AppError('请在对话框里确认可能丢失未保存内容的操作', 'confirmation_required')
         with self.lock:
             if vm in self.operations or self.build_busy(vm):
                 raise AppError('此 VM 正在执行操作', 'busy', 409)
@@ -622,7 +619,8 @@ class Controller:
                 raise AppError('VM 不存在', 'missing_vm', 404)
             state = item['State']
             base = self._vm(vm)
-            preinstalled = self._environment(vm).get('version') == 2
+            environment = self._environment(vm)
+            preinstalled = environment.get('version') in PROTECTED_VERSIONS
             launch_ack = False
             first_setup = False
             if 'acknowledge_reviewed_unsigned_backend' in payload and (not preinstalled or action != 'start'):
@@ -638,7 +636,7 @@ class Controller:
                     if (state != 'stopped' or payload.get('confirm_name') != vm
                             or payload.get('first_setup_normal_network') is not True
                             or 'acknowledge_reviewed_unsigned_backend' in payload):
-                        raise AppError('首次设置使用普通网络：请确认这一点并输入完整 VM 名称；不会自动启动。',
+                        raise AppError('首次设置使用普通网络：请在对话框里确认；不会自动启动。',
                                        'first_setup_confirmation_required', 409)
                     first_setup = True
                 else:
@@ -646,7 +644,7 @@ class Controller:
                         raise AppError('首次设置已完成，之后只走受保护启动，不再使用普通网络。', 'first_setup_finished', 409)
                     if (state != 'stopped' or payload.get('confirm_name') != vm
                             or payload.get('acknowledge_reviewed_unsigned_backend') is not True):
-                        raise AppError('请确认完整 VM 名称和此台 VM 的后端执行提示；不会自动启动。', 'host_authorization_required', 409)
+                        raise AppError('请在对话框里确认这台 VM 的后端执行提示；不会自动启动。', 'host_authorization_required', 409)
                 self._require_preinstall_publication(vm, base)
                 launch_ack = True
             if action == 'recovery-start':
@@ -691,7 +689,8 @@ class Controller:
                 (vm, action, True, True) if first_setup else (vm, action, True) if launch_ack else (vm, action)))
             worker.start()
             if first_setup:
-                return {'ok': True, 'message': '正在用普通网络启动首次设置；这次不经过网络过滤'}
+                return {'ok': True, 'message': '正在用普通网络启动首次设置；这次不经过网络过滤'
+                        + ('，并挂只读安装文件夹 gold-installers' if environment.get('version') == 3 else '')}
             return {'ok': True, 'message': {'start': '正在启动或恢复 VM', 'pause': '正在保存暂停状态',
                     'shutdown': '已请求正常关机，请留意客机提示（macOS 可能需要确认）',
                     'force-stop': '正在强制停止 VM', 'discard-state': '正在丢弃已确认的暂停状态',
@@ -781,7 +780,9 @@ class Controller:
                         raise AppError('受保护启动器提前退出；没有使用无保护网络回退。请查看应用日志。', 'launcher_exited', 500)
                     if self.inventory(fresh=True).get(vm, {}).get('State') == 'running':
                         self.event(vm, action, '恢复模式已启动，未附加宿主共享目录' if action == 'recovery-start'
-                                   else 'VM 已运行：首次设置使用普通网络，未经过网络过滤' if first_setup
+                                   else 'VM 已运行：首次设置使用普通网络，未经过网络过滤' + (
+                                       '；安装文件夹在客机「My Shared Files」里的 gold-installers'
+                                       if self._environment(vm).get('version') == 3 else '') if first_setup
                                    else 'VM 已运行，保留原网络防护')
                         return
                     time.sleep(0.3)
@@ -962,8 +963,6 @@ class Handler(BaseHTTPRequestHandler):
                 value = self.server.controller.resume_preinstall(payload)
             elif path == '/api/preinstall/archive':
                 value = self.server.controller.archive_preinstall(payload)
-            elif path == '/api/preinstall/authorization':
-                value = self.server.controller.decide_preinstall_authorization(payload)
             elif path == '/api/build':
                 value = self.server.controller.create_build(payload)
             elif path == '/api/pick-ipsw':

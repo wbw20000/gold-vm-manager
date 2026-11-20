@@ -34,7 +34,7 @@ class CleanVMInstallerReadOnlyTests(unittest.TestCase):
             temporary.cleanup()
 
         cls.addClassCleanup(cleanup)
-        cls.helper, _ = host_tools.compile_helpers(cls.build)
+        (cls.helper,) = host_tools.compile_helpers(cls.build)
 
     def invoke(self, *args):
         # Positive allowlist prevents future tests accidentally running create/latest.

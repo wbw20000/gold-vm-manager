@@ -21,7 +21,6 @@
   let confirmContext = null;
   let dialogBusy = false;
   let confirmBusy = false;
-  let authorizationBusy = false;
   let lastActionError = '';
   let nativePickerBusy = false;
   let deleteContext = null;
@@ -147,7 +146,7 @@
     $('preinstall-new').disabled = !connected || !preinstallUI || buildActive();
     preinstallUI?.update();
     if (buildContext) updateBuildForm();
-    if (confirmContext && ['action', 'remove'].includes(confirmContext.type)) $('confirm-submit').disabled = confirmBusy || buildActive() || Boolean(confirmContext.typed && $('confirm-name').value !== confirmContext.id);
+    if (confirmContext && ['action', 'remove'].includes(confirmContext.type)) $('confirm-submit').disabled = confirmBusy || buildActive();
     const banner = $('connection-banner');
     banner.hidden = connected;
     banner.replaceChildren();
@@ -254,8 +253,10 @@
     if (vm.preinstalled) {
       const imported = vm.preinstalled.configuration === 'imported';
       const manual = vm.preinstalled.configuration === 'manual_recovery_required';
-      if (firstSetup) panel.append(el('p', 'machine-notice', '首次设置使用普通网络，设置助理可以连上 Apple。进入桌面后确认 Clash Verge 已连上节点，再点「标记首次设置完成」；之后每次都受保护启动。'));
-      panel.append(el('p', 'machine-notice', imported ? '客机报告：已导入配置。系统授权和连通性尚未验收。' : manual ? '客机报告：未覆盖已有资料，请在客机中检查配置。' : '私有配置已布置；首次登录后导入，尚无客机回执。'));
+      const installers = vm.preinstalled.installers_share === true;
+      if (firstSetup && installers) panel.append(el('p', 'machine-notice', '首次设置使用普通网络，并在客机 Finder「My Shared Files」里挂只读文件夹 gold-installers。按里面「先读我.txt」用 Finder 安装 4 个应用、在 Clash Verge 导入节点并打开虚拟网卡模式；确认连上节点后关机，再点「标记首次设置完成」。之后每次都受保护启动。'));
+      else if (firstSetup) panel.append(el('p', 'machine-notice', '首次设置使用普通网络，设置助理可以连上 Apple。进入桌面后确认 Clash Verge 已连上节点，再点「标记首次设置完成」；之后每次都受保护启动。'));
+      if (!installers) panel.append(el('p', 'machine-notice', imported ? '客机报告：已导入配置。系统授权和连通性尚未验收。' : manual ? '客机报告：未覆盖已有资料，请在客机中检查配置。' : '私有配置已布置；首次登录后导入，尚无客机回执。'));
     }
     if (vm.state === 'missing') panel.append(el('p', 'machine-notice', '本机未找到这台虚拟机，请检查磁盘位置。'));
     if (vm.recovery_mode) panel.append(el('p', 'machine-notice', '恢复模式 · 不挂载宿主共享目录，请在客机内完成密码恢复。'));
@@ -410,14 +411,14 @@
       return false;
     }
     if (action === 'recovery-start' && (!vm.recovery_supported || vm.state !== 'stopped' || confirmName !== id)) {
-      toast('恢复启动仅适用于支持恢复模式且已关机的虚拟机，并须输入完整 VM 名称确认。', true);
+      toast('恢复启动仅适用于支持恢复模式且已关机的虚拟机，并须在对话框里确认。', true);
       return false;
     }
     if (action === 'start' && vm.preinstalled) {
       const pending = vm.preinstalled.first_setup_pending === true;
       const consented = pending ? firstSetup && !backendAcknowledged : backendAcknowledged && !firstSetup;
       if (!consented || confirmName !== id || vm.state !== 'stopped') {
-        toast(pending ? '请在首次设置对话框确认使用普通网络和完整 VM 名称。' : '请在受保护启动对话框确认后端提示和完整 VM 名称。', true);
+        toast(pending ? '请在首次设置对话框里确认使用普通网络。' : '请在受保护启动对话框里确认后端提示。', true);
         return false;
       }
     }
@@ -448,30 +449,27 @@
     if ((backend || firstSetup) && vm.state !== 'stopped') return;
     if (action === 'finish-first-setup' && vm.preinstalled?.first_setup_pending !== true) return;
     const dangerous = backend || firstSetup || action === 'force-stop' || action === 'discard-state' || action === 'recovery-start';
-    confirmContext = { type: 'action', id, action, typed: dangerous, backend, firstSetup };
+    // One click in the dialog confirms; the request still names this exact VM.
+    confirmContext = { type: 'action', id, action, dangerous, backend, firstSetup };
     $('confirm-title').textContent = `${ACTION_LABELS[action]} ${id}？`;
-    $('confirm-description').textContent = firstSetup ? '首次设置使用普通网络：这次启动不经过网络过滤，客机直接使用本机网络，Apple 等服务会看到本机的真实 IP；这样设置助理才能连上 Apple。不运行网络后端，也不需要后端授权。进入桌面后，Clash Verge 会自动导入节点；按提示授权它的服务，确认已经连上节点后，再点「标记首次设置完成」。之后每次启动都走受保护启动。请输入完整 VM 名称确认。' : action === 'finish-first-setup' ? '请先在客机里确认 Clash Verge 已连上节点。标记后，之后每次启动都走受保护启动：客机只能连到你的 VPN 节点，Clash 没连上时客机没有网络。此标记不能撤销；如果 VM 正在运行，这次运行仍是普通网络，关机后生效。' : backend ? '网络后端 gvproxy 取自 Podman 官方安装包（Red Hat 签名、经 Apple 公证、固定 SHA-256），不安装 Podman。输入完整 VM 名称并点击「同意尝试受保护启动」，即允许仅为本机这份私有副本设置所有者执行位，并请求 macOS 正常执行。较早预装的 VM 会先换用这份签名版后端并更新受保护启动文件，首次可能需要下载约 77 MB；磁盘和网络过滤规则不变。不会清除隔离属性或关闭系统保护；如被 macOS 拒绝则不启动，也不改用普通网络。首次系统设置、账号及服务授权仍需亲自完成。' : action === 'recovery-start' ? '仅为找回这台虚拟机遗忘的本地登录密码而进入 macOS 恢复模式。保留现有磁盘、数据与 VM 身份，不创建新身份，不抹除、不重建，也不清除钥匙串。本次恢复启动挂载的宿主共享目录为零。你需要亲自在虚拟机窗口内完成恢复，可能需要 FileVault 恢复密钥或 Apple Account。不要向模型提供任何密码、恢复密钥或账号凭据。此操作仅启动恢复模式，不保证能重设密码。请输入完整 VM 名称确认。' : action === 'shutdown' ? '向客机发送正常关机请求，不会强制终止进程。客机可能弹出确认窗口，请在虚拟机内完成确认；发送请求不等于已关机。' : action === 'force-stop' ? '将立即终止虚拟机，未保存的工作可能永久丢失。请优先使用正常关机。此操作不会删除虚拟机或主机共享目录。' : '将丢弃保存的运行状态，暂停时未保存的工作可能永久丢失。此操作不会删除虚拟机磁盘或主机共享目录；随后需重新启动。';
-    $('confirm-input-group').hidden = !dangerous;
-    $('confirm-input-label').textContent = `请输入「${id}」以确认`;
-    $('confirm-name').value = '';
-    $('confirm-name').required = dangerous;
+    const installersNote = vm.preinstalled?.installers_share === true
+      ? '客机 Finder 的「My Shared Files」里会出现只读文件夹 gold-installers，装着 4 个应用、节点配置和说明：用 Finder 把应用拖进「应用程序」，在 Clash Verge 导入节点并打开虚拟网卡模式，确认已经连上节点后关机，再点「标记首次设置完成」。之后每次启动都走受保护启动，这个文件夹也不再出现。'
+      : '进入桌面后，Clash Verge 会自动导入节点；按提示授权它的服务，确认已经连上节点后，再点「标记首次设置完成」。之后每次启动都走受保护启动。';
+    $('confirm-description').textContent = firstSetup ? '首次设置使用普通网络：这次启动不经过网络过滤，客机直接使用本机网络，Apple 等服务会看到本机的真实 IP；这样设置助理才能连上 Apple。不运行网络后端，也不需要后端授权。' + installersNote : action === 'finish-first-setup' ? '请先在客机里确认 Clash Verge 已连上节点。标记后，之后每次启动都走受保护启动：客机只能连到你的 VPN 节点，Clash 没连上时客机没有网络。此标记不能撤销；如果 VM 正在运行，这次运行仍是普通网络，关机后生效。' : backend ? '网络后端 gvproxy 取自 Podman 官方安装包（Red Hat 签名、经 Apple 公证、固定 SHA-256），不安装 Podman。点击「同意尝试受保护启动」，即允许仅为本机这份私有副本设置所有者执行位，并请求 macOS 正常执行。较早预装的 VM 会先换用这份签名版后端并更新受保护启动文件，首次可能需要下载约 77 MB；磁盘和网络过滤规则不变。不会清除隔离属性或关闭系统保护；如被 macOS 拒绝则不启动，也不改用普通网络。首次系统设置、账号及服务授权仍需亲自完成。' : action === 'recovery-start' ? '仅为找回这台虚拟机遗忘的本地登录密码而进入 macOS 恢复模式。保留现有磁盘、数据与 VM 身份，不创建新身份，不抹除、不重建，也不清除钥匙串。本次恢复启动挂载的宿主共享目录为零。你需要亲自在虚拟机窗口内完成恢复，可能需要 FileVault 恢复密钥或 Apple Account。不要向模型提供任何密码、恢复密钥或账号凭据。此操作仅启动恢复模式，不保证能重设密码。' : action === 'shutdown' ? '向客机发送正常关机请求，不会强制终止进程。客机可能弹出确认窗口，请在虚拟机内完成确认；发送请求不等于已关机。' : action === 'force-stop' ? '将立即终止虚拟机，未保存的工作可能永久丢失。请优先使用正常关机。此操作不会删除虚拟机或主机共享目录。' : '将丢弃保存的运行状态，暂停时未保存的工作可能永久丢失。此操作不会删除虚拟机磁盘或主机共享目录；随后需重新启动。';
     $('confirm-submit').textContent = firstSetup ? '用普通网络启动首次设置' : backend ? '同意尝试受保护启动' : ACTION_LABELS[action];
     $('confirm-submit').className = dangerous ? 'button button-danger' : 'button button-primary';
-    $('confirm-submit').disabled = dangerous;
+    $('confirm-submit').disabled = false;
     $('confirm-error').hidden = true;
     $('confirm-dialog').showModal();
-    if (dangerous) $('confirm-name').focus();
   }
 
   function openRemove(id, shareId) {
     const vm = vmById(id);
     const share = sharesOf(vm).find((s) => s.id === shareId);
     if (!share || locked(vm)) return;
-    confirmContext = { type: 'remove', id, shareId, baseKey: configKey(sharesOf(vm)), typed: false };
+    confirmContext = { type: 'remove', id, shareId, baseKey: configKey(sharesOf(vm)) };
     $('confirm-title').textContent = '移除共享目录？';
     $('confirm-description').textContent = `仅从 ${id} 的共享配置中移除「${share.name}」。不会删除主机目录或其中的文件。运行或暂停期间，原挂载会持续到下次冷启动。`;
-    $('confirm-input-group').hidden = true;
-    $('confirm-name').required = false;
     $('confirm-submit').textContent = '仅移除共享';
     $('confirm-submit').className = 'button button-primary';
     $('confirm-submit').disabled = false;
@@ -617,47 +615,30 @@
   function openArchiveJob(job) {
     if (!connected || !job || job.mode !== 'preinstall' || job.phase !== 'failed' || job.recovery_required !== true
       || job.published === true || typeof job.id !== 'string' || typeof job.name !== 'string' || !job.name) return;
-    confirmContext = { type: 'archive-job', id: job.name, jobId: job.id, typed: true };
+    confirmContext = { type: 'archive-job', id: job.name, jobId: job.id };
     $('confirm-title').textContent = `归档失败任务 ${job.name}？`;
     $('confirm-description').textContent = `只移除这条失败任务的锁定记录，之后可以用新名称重新预装。不会删除、移动、续接或发布暂存盘：它仍保留在 ~/.tart/.gold-manager-staging/${job.id}，会继续占用磁盘空间，需要时请人工核对后自行删除。不会启动任何 VM。`;
-    $('confirm-input-group').hidden = false;
-    $('confirm-input-label').textContent = `请输入「${job.name}」以确认`;
-    $('confirm-name').value = '';
-    $('confirm-name').required = true;
     $('confirm-submit').textContent = '归档失败任务';
     $('confirm-submit').className = 'button button-danger';
-    $('confirm-submit').disabled = true;
+    $('confirm-submit').disabled = false;
     $('confirm-error').hidden = true;
     $('confirm-dialog').showModal();
-    $('confirm-name').focus();
-  }
-
-  function confirmSubmitDisabled() {
-    const context = confirmContext;
-    if (!context?.typed) return Boolean(confirmBusy);
-    // The failed job's own lock must not block archiving that job.
-    return Boolean(confirmBusy || (context.type !== 'archive-job' && buildActive()) || $('confirm-name').value !== context.id);
   }
 
   async function submitConfirm(event) {
     event.preventDefault();
     const context = confirmContext;
     if (!context || confirmBusy) return;
-    if (context.typed && $('confirm-name').value !== context.id) { showError('confirm-error', `请输入完整的 ${context.id}，不要添加空格。`); return; }
     confirmBusy = true;
     $('confirm-submit').disabled = true;
     $('confirm-dialog').querySelectorAll('.dialog-close').forEach((item) => { item.disabled = true; });
     $('confirm-error').hidden = true;
     try {
       if (context.type === 'action') {
-        const done = await runAction(context.id, context.action, context.typed ? $('confirm-name').value : undefined, context.backend === true, context.firstSetup === true);
+        const done = await runAction(context.id, context.action, context.dangerous ? context.id : undefined, context.backend === true, context.firstSetup === true);
         if (!done) { showError('confirm-error', lastActionError || '操作未完成，请刷新状态后核对；不要重复执行危险操作。'); return; }
-      } else if (context.type === 'abandon-authorization') {
-        await api('/api/preinstall/authorization', { method: 'POST', body: { job_id: context.jobId, attempt: context.attempt, decision: 'abandon' } });
-        toast('已放弃本次授权；任务将按失败处理，暂存盘保留。');
-        await refresh(true);
       } else if (context.type === 'archive-job') {
-        await api('/api/preinstall/archive', { method: 'POST', body: { job_id: context.jobId, confirm_name: $('confirm-name').value } });
+        await api('/api/preinstall/archive', { method: 'POST', body: { job_id: context.jobId, confirm_name: context.id } });
         toast('已归档失败任务；暂存盘仍保留，可以用新名称重新预装。');
         await refresh(true);
       } else {
@@ -668,7 +649,7 @@
     } catch (error) { showError('confirm-error', error.message); }
     finally {
       confirmBusy = false;
-      $('confirm-submit').disabled = Boolean(context.typed && $('confirm-name').value !== context.id);
+      $('confirm-submit').disabled = false;
       $('confirm-dialog').querySelectorAll('.dialog-close').forEach((item) => { item.disabled = false; });
     }
   }
@@ -740,7 +721,7 @@
 
   function updateDeleteForm() {
     const vm = vmById(deleteContext?.id);
-    $('delete-submit').disabled = deleteBusy || !vm || locked(vm) || buildActive() || !['stopped', 'suspended'].includes(vm.state) || $('delete-name').value !== deleteContext?.id || !$('delete-erase-ack').checked;
+    $('delete-submit').disabled = deleteBusy || !vm || locked(vm) || buildActive() || !['stopped', 'suspended'].includes(vm.state);
   }
 
   function openDelete(id) {
@@ -749,19 +730,17 @@
     deleteContext = { id };
     $('delete-form').reset();
     $('delete-title').textContent = `永久删除 ${id}？`;
-    $('delete-name-label').textContent = `完整输入「${id}」确认永久删除`;
     $('delete-error').hidden = true;
     if (!['stopped', 'suspended'].includes(vm.state)) showError('delete-error', '这台 VM 必须先正常关机后才能删除。请取消并在客机内完成关机；不会自动强制停止。');
     updateDeleteForm();
     $('delete-dialog').showModal();
-    $('delete-name').focus();
   }
 
   function buildActive() {
     const job = state?.build_job;
     return Boolean((typeof preinstallBusy !== 'undefined' && preinstallBusy) || job?.recovery_required || job?.offline_preinstall?.active || job?.vpn_configuration?.active
       || (job?.mode === 'preinstall' && !job.published && ['awaiting_offline_preinstall', 'awaiting_first_desktop_acceptance'].includes(job.phase)))
-      || ['queued', 'preflight', 'downloading', 'inspecting', 'acquiring', 'installing', 'preinstalling', 'awaiting_vpn_configuration', 'vpn_resume_queued', 'resuming_vpn', 'configuring_vpn', 'awaiting_system_authorization', 'verifying', 'preparing_runtime', 'publishing', 'provisioning', 'committing', 'deleting'].includes(job?.phase);
+      || ['queued', 'preflight', 'downloading', 'inspecting', 'acquiring', 'installing', 'awaiting_vpn_configuration', 'vpn_resume_queued', 'resuming_vpn', 'preparing_runtime', 'publishing', 'provisioning', 'committing', 'deleting'].includes(job?.phase);
   }
 
   function waitingVpnJob() {
@@ -773,44 +752,6 @@
     const job = waitingVpnJob();
     if (!connected || preinstallBusy || !job || job.id !== id || job.name !== name) return;
     return preinstallUI?.openResume(id);
-  }
-
-  // A refused macOS prompt that never ran the root helper pauses the job with
-  // the disk still mounted; only the user's explicit choice continues it.
-  function pausedAuthorization(job) {
-    const retry = job && job.mode === 'preinstall' && job.phase === 'awaiting_system_authorization' ? job.authorization_retry : null;
-    if (!retry || typeof retry !== 'object' || !['apply', 'verify'].includes(retry.operation) || typeof retry.reason !== 'string'
-      || !Number.isInteger(retry.attempt) || !Number.isInteger(retry.max_attempts) || typeof job.id !== 'string') return null;
-    return retry;
-  }
-
-  async function decideAuthorization(job, decision) {
-    // Abandon goes only through the confirmation dialog (submitConfirm).
-    const retry = pausedAuthorization(job);
-    if (decision !== 'retry' || !retry || !connected || authorizationBusy) return;
-    authorizationBusy = true;
-    try {
-      await api('/api/preinstall/authorization', { method: 'POST', body: { job_id: job.id, attempt: retry.attempt, decision: 'retry' } });
-      toast('已重新请求管理员授权，请留意 macOS 弹出的授权窗口。');
-    } catch (error) { toast(error.message, true); }
-    finally { authorizationBusy = false; }
-    await refresh(true);
-  }
-
-  function openAbandonAuthorization(job) {
-    const retry = pausedAuthorization(job);
-    if (!retry || !connected) return;
-    confirmContext = { type: 'abandon-authorization', id: job.name, jobId: job.id, attempt: retry.attempt, typed: false };
-    $('confirm-title').textContent = `放弃 ${job.name} 的管理员授权？`;
-    $('confirm-description').textContent = '任务会按失败处理：暂存盘和已写入的私有配置原样保留，之后不能续接，只能归档后用新名称重新预装。如果只是误点了取消，请关闭此窗口，改点「重新请求管理员授权」。';
-    $('confirm-input-group').hidden = true;
-    $('confirm-name').value = '';
-    $('confirm-name').required = false;
-    $('confirm-submit').textContent = '放弃并保留现场';
-    $('confirm-submit').className = 'button button-danger';
-    $('confirm-submit').disabled = false;
-    $('confirm-error').hidden = true;
-    $('confirm-dialog').showModal();
   }
 
   function renderBuildJob() {
@@ -829,17 +770,17 @@
     }
     const labels = { queued: '已排队', preflight: '前置检查', downloading: '下载恢复镜像', inspecting: '检查镜像', installing: '离线安装系统', provisioning: '准备软件与防护', committing: '发布新环境', awaiting_user_setup: '等待客机初始设置', failed: '任务未完成', interrupted: '任务已中断' };
     labels.awaiting_offline_preinstall = '系统已恢复 · 应用未预装 · 未启动';
-    labels.awaiting_first_desktop_acceptance = '完整应用已离线预装 · 未启动 · 待首次桌面验收';
+    labels.awaiting_first_desktop_acceptance = '未启动 · 待首次设置';
     labels.deleted = '已删除';
     labels.deleting = '正在删除';
-    Object.assign(labels, { acquiring: '获取经审核原始材料', preinstalling: '离线预装 4 个完整 App',
-      awaiting_vpn_configuration: '系统和应用已装好 · 等待配置 VPN', vpn_resume_queued: '继续配置 VPN 已排队', resuming_vpn: '继续配置 VPN',
-      configuring_vpn: '准备私有节点配置与首次登录导入', verifying: '核验原始应用与保护策略', preparing_runtime: '绑定并核对受保护启动环境', publishing: '发布新 VM · 不自动启动', awaiting_system_authorization: '等待真人系统与服务授权' });
+    Object.assign(labels, { acquiring: '获取经审核原始材料',
+      awaiting_vpn_configuration: '系统已恢复 · 等待配置 VPN', vpn_resume_queued: '继续配置 VPN 已排队', resuming_vpn: '继续配置 VPN',
+      preparing_runtime: '准备首次设置文件夹与受保护启动', publishing: '发布新 VM · 不自动启动' });
     const materialFailure = job.mode === 'preinstall' && job.phase === 'failed' && job.failed_phase === 'acquiring' && job.system_restored === false;
     let message = job.message || '';
     if (materialFailure) {
       labels.failed = '材料准备失败';
-      message = (['unsafe-tar-path', 'invalid-tart-license-member'].includes(job.failure_code) ? 'Tart 安装包的路径未通过检查。' : '原始材料下载或校验未完成。') + '尚未创建虚拟磁盘，此阶段不涉及管理员授权。已保留下载，不自动重试。';
+      message = (['unsafe-tar-path', 'invalid-tart-license-member'].includes(job.failure_code) ? 'Tart 安装包的路径未通过检查。' : '原始材料下载或校验未完成。') + '尚未创建虚拟磁盘。已保留下载，不自动重试。';
     }
     region.append(el('strong', '', `${job.mode === 'preinstall' ? '一键预装' : job.mode === 'offline_validate' ? '仅安装 VM' : job.mode === 'delete' ? '删除' : job.mode === 'rebuild' ? '重建' : '新建'} ${job.name || ''} · ${labels[job.phase] || job.phase}`), el('span', '', message));
     const own = (map, key) => typeof key === 'string' && Object.prototype.hasOwnProperty.call(map, key);
@@ -871,63 +812,21 @@
       region.append(el('span', '', '尚未配置客机网络；VM 尚未发布或启动。完成此任务前不能开始其他 VM 操作。'));
       if (waitingVpnJob()) region.append(button('继续配置 VPN', 'text-button', () => openWaitingVpnConfiguration(job.id, job.name),
         !connected || preinstallBusy || !preinstallUI, 'continue-preinstall-vpn'));
-    } else if (job.mode === 'preinstall' && !materialFailure) region.append(el('span', '', '发布或写入配置不代表 VPN 已连通。首次开机、系统与服务授权、账号登录及桌面实测仍需你亲自确认。'));
-    const paused = job.phase === 'awaiting_system_authorization' && job.authorization_retry ? pausedAuthorization(job) : null;
-    if (paused) {
-      const refusals = { 'system-authorization-user-cancelled': '管理员授权窗口被取消。',
-        'system-authorization-authorization-denied': '管理员授权未通过（用户名或密码不正确）。',
-        'system-authorization-interaction-not-allowed': '系统没能显示管理员授权窗口（当前不允许交互），请确认屏幕已解锁、管理器在前台。' };
-      const until = Date.parse(paused.expires_at);
-      const deadline = Number.isFinite(until) ? `；${new Date(until).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })} 前未选择将按失败处理并保留现场` : '；超时未选择将按失败处理并保留现场';
-      region.append(el('span', 'build-job-failure', `${paused.operation === 'verify' ? '复核属主' : '写入属主'}的管理员授权未完成：${refusals[paused.reason] || paused.reason}`));
-      region.append(el('span', '', `root 助手没有运行，磁盘保持原样等待你的选择，不会自动再弹窗。已请求第 ${paused.attempt} 次（最多 ${paused.max_attempts} 次）${deadline}。`));
-      region.append(button('重新请求管理员授权', 'text-button', () => decideAuthorization(job, 'retry'), !connected || authorizationBusy));
-      region.append(button('放弃（保留现场）', 'text-button', () => openAbandonAuthorization(job), !connected || authorizationBusy));
-    }
+    } else if (job.mode === 'preinstall' && !materialFailure) region.append(el('span', '', '发布不代表 VPN 已连通。首次设置、安装应用、导入节点、服务授权和账号登录都需要你在客机里亲自完成。'));
     if (job.mode === 'preinstall' && job.phase === 'failed' && !materialFailure) {
       // Fixed codes only; the backend never forwards native output, paths or node data.
-      const steps = { preflight: '前置检查', 'readonly-app-baseline': '只读核对已装应用', 'writing-private-seed': '写入私有 VPN 首次登录配置',
-        'owners-on-reattach': '以启用所有权方式重新挂载', 'authorized-ownership-apply': '写入属主（需管理员授权）', 'independent-readonly-bytes': '独立只读复核写入内容',
-        'authorized-readonly-persistent-owners': '复核属主（需管理员授权）' };
       const reasons = {
-        'system-authorization-preflight-rejected': '授权前的本地校验未通过（属主助手签名、摘要或票据不符），所以没有弹出管理员授权窗口。',
-        'system-authorization-launch-failed': '无法启动系统授权程序，没有弹出管理员授权窗口。',
-        'system-authorization-interaction-not-allowed': '系统未能显示管理员授权窗口（当前进程不允许交互）。请在已登录的前台桌面会话中打开管理器再新建任务。',
-        'system-authorization-user-cancelled': '管理员授权窗口被取消。',
-        'system-authorization-authorization-denied': '管理员授权未通过（用户名或密码不正确）。',
-        'system-authorization-authorization-error': '系统授权服务返回错误（见代码中的编号）。',
-        'system-authorization-helper-exit': '已获得管理员授权，但属主助手拒绝执行或执行失败（见代码中的退出码）。',
-        'system-authorization-timeout': '等待管理员授权超时。',
-        'system-authorization-unknown-failure': '管理员授权或属主助手失败，原因未能识别。',
-        'guest-ownership-validation-failed': '属主校验未通过，已停止，未继续写入。',
+        'installer-copy-failed': '把应用复制到首次设置文件夹失败（例如本机磁盘空间不足）。',
+        'installer-copy-mismatch': '复制后的应用与已核验的原件不一致，已停止。',
+        'installer-quarantine-mismatch': '复制后的应用缺少下载来源标记，已停止。',
+        'runtime-preparation-failed': '准备受保护启动环境失败。',
         'internal-error': '内部检查出现意外错误；已保留现场。',
       };
-      // Helper exit status is an exact, versioned numeric category, not an NSError or a path.
-      // An older helper only returned 2; never infer which specific check failed in that job.
-      const helperReasons = {
-        '2': '助手只记录了通用退出码 2，无法从这次记录确定具体检查。请保留暂存盘。',
-        '20': '助手的调用参数或管理员运行身份不符合要求。',
-        '21': '授权票据或其绑定的暂存文件身份未通过校验。',
-        '22': '未能确认原预装进程仍持有同一份配置文件的独占写锁。',
-        '23': '暂存任务、恢复记录或客机初始状态不符合写入或复核条件。',
-        '24': '未能确认挂载的是这块客机的 APFS 数据卷，或其所有权、读写状态不符。',
-        '25': '无法核对完整的目标路径集合，或实际文件清单与票据不符。',
-        '26': '应用校验回执或符号链接关系未通过校验。',
-        '27': '目标文件身份、类型、大小或权限模式未通过校验。',
-        '28': '目标文件的属主或属组不符，或其元数据在校验后发生了变化；保留现场，不重放票据。',
-        '29': '无法确认文件或目录没有额外的访问控制项（ACL）。',
-        '30': '文件内容读取、长度或哈希校验失败。',
-        '31': '一次性操作标记或授权回执检查、写入失败；不要重放此票据。',
-        '32': '系统未能完成属主修改；不能假定磁盘没有发生部分变更。',
-      };
       const stepKey = job.failed_step || job.failed_phase;
-      const stepLabel = steps[job.failed_step] || (job.failed_step ? '' : labels[job.failed_phase]) || '';
+      const stepLabel = job.failed_step ? '' : labels[job.failed_phase] || '';
       region.append(el('span', 'build-job-failure', `失败步骤：${stepKey ? (stepLabel ? `${stepLabel}（${stepKey}）` : stepKey) : '未记录'}`));
       const reasonCode = job.failure_reason || job.failure_code || '';
-      const reasonKey = Object.keys(reasons).find((key) => reasonCode === key || reasonCode.startsWith(`${key}-`));
-      const helperExit = /^system-authorization-helper-exit-([1-9][0-9]*)$/.exec(reasonCode);
-      const detail = helperExit && helperReasons[helperExit[1]];
-      region.append(el('span', 'build-job-failure', `原因：${detail || (reasonKey ? reasons[reasonKey] : '未归类，请按下方代码排查；不会自动重试。')}`));
+      region.append(el('span', 'build-job-failure', `原因：${own(reasons, reasonCode) ? reasons[reasonCode] : '未归类，请按下方代码排查；不会自动重试。'}`));
       region.append(el('span', 'build-job-failure', `代码：${[job.failure_code, job.failure_reason].filter(Boolean).join(' / ') || '未记录'}`));
       if (job.recovery_required === true && job.published !== true) {
         region.append(button('归档此失败任务（保留暂存盘）', 'text-button', () => openArchiveJob(job), !connected));
@@ -955,7 +854,6 @@
     $('build-memory').max = String(state.host?.memory_gib || 4);
     $('build-keep-name').hidden = !source;
     $('build-erase-warning').hidden = !source;
-    $('build-confirm-label').textContent = `完整输入「${source || ''}」确认删除`;
     $('build-offline-notice').hidden = !offline;
     $('build-legacy-setup').hidden = offline;
     if (offline) $('build-image-mode').value = 'local';
@@ -981,7 +879,7 @@
     const validName = name.length > 0 && name.length <= 64 && name.trim() === name && name.normalize('NFC') === name && /^[\p{L}\p{N} _-]+$/u.test(name) && !/^[.-]/.test(name);
     const valid = resources && validName && (offline ? $('build-offline-ack').checked : $('build-setup-ack').checked) &&
       ($('build-image-mode').value !== 'local' || $('build-ipsw').value.startsWith('/')) &&
-      (!source || ($('build-erase-ack').checked && $('build-confirm').value === source && ['stopped', 'suspended'].includes(vmById(source)?.state)));
+      (!source || ($('build-erase-ack').checked && ['stopped', 'suspended'].includes(vmById(source)?.state)));
     $('build-submit').disabled = buildBusy || !connected || buildActive() || !valid;
   }
 
@@ -1001,7 +899,7 @@
       catch (error) { showError('build-error', error.message); return; }
       body.acknowledge_setup = $('build-setup-ack').checked;
     }
-    if (source) Object.assign(body, { source_vm: source, confirm_name: $('build-confirm').value, acknowledge_erase: $('build-erase-ack').checked });
+    if (source) Object.assign(body, { source_vm: source, confirm_name: source, acknowledge_erase: $('build-erase-ack').checked });
     buildBusy = true;
     $('build-dialog').querySelectorAll('input,select,button').forEach((item) => { item.disabled = true; });
     $('build-error').hidden = true;
@@ -1041,7 +939,8 @@
     $('delete-error').hidden = true;
     render();
     try {
-      const result = await api(`/api/vms/${encodeURIComponent(id)}/delete`, { method: 'POST', body: { confirm_name: $('delete-name').value, acknowledge_erase: $('delete-erase-ack').checked } });
+      // Clicking the red button in this dialog is the confirmation; the request names this exact VM.
+      const result = await api(`/api/vms/${encodeURIComponent(id)}/delete`, { method: 'POST', body: { confirm_name: id, acknowledge_erase: true } });
       toast(result.message || '删除请求已发送，请等待本机服务确认。');
       $('delete-dialog').close();
       await refresh();
@@ -1110,7 +1009,6 @@
   $('pick-directory').addEventListener('click', pickDirectory);
   $('share-form').addEventListener('submit', submitShare);
   $('confirm-form').addEventListener('submit', submitConfirm);
-  $('confirm-name').addEventListener('input', () => { if (confirmContext?.typed) $('confirm-submit').disabled = confirmSubmitDisabled(); });
   ['share-name', 'share-mode', 'share-enabled', 'write-ack'].forEach((id) => $(id).addEventListener('input', updateShareForm));
   $('share-path').addEventListener('input', () => { $('write-ack').checked = false; updateShareForm(); });
   $('token-form').addEventListener('submit', async (event) => {

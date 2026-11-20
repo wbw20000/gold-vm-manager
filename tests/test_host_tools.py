@@ -315,21 +315,22 @@ class HostToolFixtures(unittest.TestCase):
         self.assertNotEqual(app, result.app_path)
         self.assertEqual((app / 'Contents' / 'MacOS' / 'tart').stat().st_ino, before.st_ino)
 
-    def test_compiler_outputs_two_paths_production_only_and_exact_entitlement(self):
+    def test_compiler_outputs_only_the_restore_helper_with_its_exact_entitlement(self):
         with mock.patch.object(tools, 'source_prerequisites', return_value={'sdk_path': str(self.sdk)}):
-            clean, guest = tools.compile_helpers(self.root / 'build')
-        self.assertEqual((clean.name, guest.name), ('CleanVMInstaller', 'GuestVPNBootstrap'))
-        self.assertEqual(clean.parent, guest.parent)
+            (clean,) = tools.compile_helpers(self.root / 'build')
+        self.assertEqual(clean.name, 'CleanVMInstaller')
         self.assertEqual(stat.S_IMODE(clean.stat().st_mode), 0o700)
+        self.assertEqual(sorted(p.name for p in clean.parent.iterdir() if not p.name.startswith(('module-cache', '.'))),
+                         ['CleanVMInstaller', 'CleanVMInstaller.entitlements.plist', 'CleanVMInstaller.swift',
+                          'helpers.json', tools.HELPERS_PORTABLE_RECEIPT])
         receipt = json.loads((clean.parent / 'helpers.json').read_text())
         self.assertFalse(receipt['notarized'])
         self.assertFalse(receipt['developer_id_signed'])
         self.assertFalse(receipt['executed'])
-        self.assertTrue(receipt['production_guest_bootstrap'])
+        self.assertEqual(set(receipt['artifacts']), {'CleanVMInstaller'})
         compile_commands = [c[0][0] for c in self.native.call_args_list if 'swiftc' in c[0][0]]
-        self.assertEqual(len(compile_commands), 2)
+        self.assertEqual(len(compile_commands), 1)
         self.assertFalse(any('-D' in command for command in compile_commands))
-        self.assertFalse(any('GOLD_VPN_BOOTSTRAP_FIXTURE' in command for command in compile_commands))
         self.assertEqual(receipt['clean_installer_entitlements'], {'com.apple.security.virtualization': True})
 
     def test_compiler_retries_have_distinct_owned_directories(self):
@@ -384,19 +385,20 @@ class HostToolFixtures(unittest.TestCase):
         for name in install_app.EXAMPLE_FILES:
             self.assertTrue((payload / 'examples' / name).is_file())
         self.assertTrue((payload / 'CleanVMInstaller').exists())
-        self.assertTrue((payload / 'GuestVPNBootstrap').exists())
-        self.assertTrue((payload / 'GuestOwnershipHelper').exists())
-        self.assertIn('guest_ownership.py', install_app.FILES)
-        self.assertEqual(set(result['portable_helper_receipts']),
-                         {tools.HELPERS_PORTABLE_RECEIPT, tools.OWNERSHIP_PORTABLE_RECEIPT})
+        # Nothing is built for, or copied into, the guest any more.
+        for name in ('GuestVPNBootstrap', 'GuestOwnershipHelper', 'GuestVPNBootstrap.swift', 'GuestOwnershipHelper.swift',
+                     'guest_ownership.py', 'guest_vpn_seed.py', 'offline_vpn.py', 'offline_preinstall.py'):
+            self.assertFalse((payload / name).exists(), name)
+        self.assertEqual(set(result['helper_entitlements']), {'CleanVMInstaller'})
+        self.assertEqual(set(result['portable_helper_receipts']), {tools.HELPERS_PORTABLE_RECEIPT})
         for name, expected_hash in result['portable_helper_receipts'].items():
             self.assertEqual(hashlib.sha256((payload / name).read_bytes()).hexdigest(), expected_hash)
             self.assertNotIn(str(self.root), (payload / name).read_text())
         self.assertFalse(result['notarized'])
         self.assertFalse(result['launched'])
         info = plistlib.loads((output / 'Contents' / 'Info.plist').read_bytes())
-        self.assertEqual(info['CFBundleShortVersionString'], '1.3.0')
-        self.assertEqual(info['CFBundleVersion'], '6')
+        self.assertEqual(info['CFBundleShortVersionString'], '1.4.0')
+        self.assertEqual(info['CFBundleVersion'], '7')
         self.assertTrue(Path(result['package_receipt']).is_file())
         self.assertNotIn('evidence', str(result['package_receipt']))
         commands = [c[0][0] for c in self.native.call_args_list]
@@ -417,7 +419,7 @@ class HostToolFixtures(unittest.TestCase):
             with self.assertRaises(Exception):
                 install_app.package_app(self.root / 'new.app', self.root / 'build')
         self.assertIn('oneclick.py', install_app.FILES)
-        self.assertIn('offline_vpn.py', install_app.FILES)
+        self.assertIn('preinstall_runtime.py', install_app.FILES)
         self.assertFalse((self.root / 'new.app').exists())
         self.assertFalse((self.root / 'build').exists())
 
@@ -533,59 +535,36 @@ class HostToolFixtures(unittest.TestCase):
         for forbidden in ('HTTPS_PROXY', 'RUBYOPT', 'DYLD_INSERT_LIBRARIES'):
             self.assertNotIn(forbidden, env)
 
-    def test_ownership_helper_is_separate_build_never_privilege_request(self):
-        source = self.source_fixture()
-        with mock.patch.object(tools, 'HERE', source), \
-             mock.patch.object(tools, 'source_prerequisites', return_value={'sdk_path': str(self.sdk)}):
-            binary = tools.compile_ownership_helper(self.root / 'build')
-        self.assertEqual(binary.name, 'GuestOwnershipHelper')
-        self.assertEqual(stat.S_IMODE(binary.stat().st_mode), 0o700)
-        receipt = json.loads((binary.parent / 'ownership-helper.json').read_text())
-        self.assertFalse(receipt['notarized'])
-        self.assertFalse(receipt['administrator_authorization_requested'])
-        self.assertFalse(receipt['executed'])
-        self.assertEqual(receipt['entitlements'], {})
-        commands = [call[0][0] for call in self.native.call_args_list]
-        self.assertTrue(all(argv[0] in ('/usr/bin/xcrun', '/usr/bin/codesign') for argv in commands))
-        self.no_spawn.assert_not_called()
-        self.no_run.assert_not_called()
-
     def portable_fixture(self, packaged=False):
         source = self.source_fixture()
         with mock.patch.object(tools, 'source_prerequisites', return_value={'sdk_path': str(self.sdk)}):
-            clean, guest = tools._compile_helpers(self.root / 'build', source)
-            ownership = tools._compile_ownership_helper(self.root / 'build', source)
+            (clean,) = tools._compile_helpers(self.root / 'build', source)
         resource = self.root / 'portable'
         if packaged:
             resource = self.root / 'Portable.app' / 'Contents' / 'Resources' / 'app'
         resource.mkdir(mode=0o700, parents=True)
-        for binary in (clean, guest, ownership):
-            target = resource / binary.name
-            target.write_bytes(binary.read_bytes())
-            target.chmod(0o700)
-        for parent, name in ((clean.parent, tools.HELPERS_PORTABLE_RECEIPT),
-                             (ownership.parent, tools.OWNERSHIP_PORTABLE_RECEIPT)):
-            (resource / name).write_bytes((parent / name).read_bytes())
-            (resource / name).chmod(0o600)
+        target = resource / clean.name
+        target.write_bytes(clean.read_bytes())
+        target.chmod(0o700)
+        name = tools.HELPERS_PORTABLE_RECEIPT
+        (resource / name).write_bytes((clean.parent / name).read_bytes())
+        (resource / name).chmod(0o600)
         self.native.reset_mock()
         return resource
 
     def test_resolve_portable_helpers_without_sources_or_sdk_compilation(self):
         resource = self.portable_fixture(packaged=True)
         with mock.patch.object(tools, 'source_prerequisites', side_effect=AssertionError('no SDK lookup')), \
-             mock.patch.object(tools, '_compile_helpers', side_effect=AssertionError('no runtime compile')), \
-             mock.patch.object(tools, '_compile_ownership_helper', side_effect=AssertionError('no runtime compile')):
-            clean, guest = tools.resolve_helpers(resource, self.root / 'unused-build')
-            ownership = tools.resolve_ownership_helper(resource, self.root / 'unused-build')
-        self.assertEqual((clean.name, guest.name, ownership.name),
-                         ('CleanVMInstaller', 'GuestVPNBootstrap', 'GuestOwnershipHelper'))
+             mock.patch.object(tools, '_compile_helpers', side_effect=AssertionError('no runtime compile')):
+            clean = tools.resolve_helpers(resource, self.root / 'unused-build')
+        self.assertEqual(clean, resource / 'CleanVMInstaller')
         self.assertFalse((self.root / 'unused-build').exists())
         self.assertFalse(list(resource.glob('*.swift')))
         self.assertTrue(all(call[0][0][0] in ('/usr/bin/codesign', '/usr/bin/lipo')
                             for call in self.native.call_args_list))
         verified = [call[0][0][-1] for call in self.native.call_args_list if '--verify' in call[0][0]]
         self.assertIn(str(resource.parents[2]), verified)
-        for name in (tools.HELPERS_PORTABLE_RECEIPT, tools.OWNERSHIP_PORTABLE_RECEIPT):
+        for name in (tools.HELPERS_PORTABLE_RECEIPT,):
             record = (resource / name).read_text()
             self.assertNotIn(str(self.root), record)
             self.assertNotIn('sdk_path', record)
@@ -594,11 +573,9 @@ class HostToolFixtures(unittest.TestCase):
     def test_resolve_source_checkout_compiles_without_global_here_override(self):
         source = self.source_fixture()
         with mock.patch.object(tools, 'source_prerequisites', return_value={'sdk_path': str(self.sdk)}):
-            pair = tools.resolve_helpers(source, self.root / 'build')
-            ownership = tools.resolve_ownership_helper(source, self.root / 'build')
-        self.assertEqual(len(pair), 2)
-        self.assertTrue((pair[0].parent / tools.HELPERS_PORTABLE_RECEIPT).is_file())
-        self.assertTrue((ownership.parent / tools.OWNERSHIP_PORTABLE_RECEIPT).is_file())
+            clean = tools.resolve_helpers(source, self.root / 'build')
+        self.assertEqual(clean.name, 'CleanVMInstaller')
+        self.assertTrue((clean.parent / tools.HELPERS_PORTABLE_RECEIPT).is_file())
 
     def test_resolve_refuses_unreceipted_binary_even_with_complete_sources(self):
         source = self.source_fixture()
@@ -606,15 +583,11 @@ class HostToolFixtures(unittest.TestCase):
         with mock.patch.object(tools, '_compile_helpers', side_effect=AssertionError('must not fallback')):
             with self.assertRaisesRegex(tools.HostToolError, 'complete-helper-binaries-and-portable-receipt-required'):
                 tools.resolve_helpers(source, self.root / 'build')
-        (source / 'GuestOwnershipHelper').write_bytes(b'inert unreceipted binary')
-        with mock.patch.object(tools, '_compile_ownership_helper', side_effect=AssertionError('must not fallback')):
-            with self.assertRaisesRegex(tools.HostToolError, 'complete-helper-binaries-and-portable-receipt-required'):
-                tools.resolve_ownership_helper(source, self.root / 'build')
         self.assertFalse((self.root / 'build').exists())
 
     def test_resolve_rejects_changed_binary_instead_of_adopting_or_compiling(self):
         resource = self.portable_fixture()
-        (resource / 'GuestVPNBootstrap').write_bytes(b'changed binary')
+        (resource / 'CleanVMInstaller').write_bytes(b'changed binary')
         with mock.patch.object(tools, '_compile_helpers', side_effect=AssertionError('must not fallback')):
             with self.assertRaisesRegex(tools.HostToolError, 'packaged-helper-hash-mismatch'):
                 tools.resolve_helpers(resource, self.root / 'unused')
@@ -624,7 +597,7 @@ class HostToolFixtures(unittest.TestCase):
         resource = self.portable_fixture()
         path = resource / tools.HELPERS_PORTABLE_RECEIPT
         value = json.loads(path.read_text())
-        value['recipes']['GuestVPNBootstrap']['defines'] = ['GOLD_VPN_BOOTSTRAP_FIXTURE']
+        value['recipes']['CleanVMInstaller']['defines'] = ['FIXTURE_DEFINE']
         path.write_bytes(tools._json(value))
         with self.assertRaisesRegex(tools.HostToolError, 'portable-helper-build-recipe-mismatch'):
             tools.resolve_helpers(resource, self.root / 'unused')
@@ -634,7 +607,7 @@ class HostToolFixtures(unittest.TestCase):
 
     def test_portable_receipt_crosschecks_any_present_source(self):
         resource = self.portable_fixture()
-        (resource / 'GuestVPNBootstrap.swift').write_bytes(b'changed source')
+        (resource / 'CleanVMInstaller.swift').write_bytes(b'changed source')
         with self.assertRaisesRegex(tools.HostToolError, 'packaged-helper-source-mismatch'):
             tools.resolve_helpers(resource, self.root / 'unused')
 
@@ -644,12 +617,11 @@ class HostToolFixtures(unittest.TestCase):
         resource.mkdir(mode=0o700, parents=True)
         for name in install_app.SOURCE_FILES:
             (resource / name).write_bytes((source / name).read_bytes())
-        with mock.patch.object(tools, '_compile_helpers', side_effect=AssertionError('no packaged compile')), \
-             mock.patch.object(tools, '_compile_ownership_helper', side_effect=AssertionError('no packaged compile')):
+        with mock.patch.object(tools, '_compile_helpers', side_effect=AssertionError('no packaged compile')):
             with self.assertRaisesRegex(tools.HostToolError, 'packaged-helpers-missing-no-runtime-compilation'):
                 tools.resolve_helpers(resource, self.root / 'unused')
-            with self.assertRaisesRegex(tools.HostToolError, 'packaged-helpers-missing-no-runtime-compilation'):
-                tools.resolve_ownership_helper(resource, self.root / 'unused')
+        self.assertFalse(hasattr(tools, 'resolve_ownership_helper'))
+        self.assertFalse(hasattr(tools, 'compile_ownership_helper'))
 
     def test_native_failure_keeps_exact_private_compiler_diagnostic(self):
         build = self.root / 'diagnostic-build'

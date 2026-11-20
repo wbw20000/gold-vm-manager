@@ -1,8 +1,13 @@
-"""Explicit v2 preparation: no backend/Tart/VM execution, only native xattr policy.
+"""Explicit v2/v3 preparation: no backend/Tart/VM execution, only native xattr policy.
 
 No host profiles, legacy setup payload, downloaded execution, NAT fallback, native
-signature override or import-time I/O. Parent owns material/native trust and guest
-installation; receipts here bind bytes, not semantic or independent verification.
+signature override or import-time I/O. Parent owns material/native trust.
+
+v3 (2026-11-20) never writes into the guest disk. It binds a host-private,
+parent-built installers folder that is shared read-only during first setup
+only; the person installs the apps and the Clash profile there with Finder and
+the GUI. v2 environments (apps and a first-login seed written into the disk,
+plus a guest status mailbox) stay valid; receipts there bind bytes only.
 """
 import hashlib
 import ipaddress
@@ -22,9 +27,6 @@ GV_SHA256 = '45881c33400a14c4c50d4ed7e814b69a60248aa0d78e9b541e879edc05346a85'
 _LEGACY_GV_SHA256 = 'e2a6825ba789fe588828b418c09aaf16525dec6d8cb2d16c94e72535dd4606be'
 BACKEND_ASSESSMENT = 'developer-id-notarized-HYSCB8KRL2'
 _UNNOTARIZED_ASSESSMENT = 'reviewed-sha256-only-adhoc-no-usable-native-signature'
-# What a refresh keeps and still requires intact; everything else in the
-# manifest is replaced from the current checkout and the pinned backend.
-_KEPT = ('policy.json', 'preinstall-receipt.json', 'vpn-seed-receipt.json')
 PACKET_SHA256 = '3feded0b8521c8c1f71b880731c18b53f00df64162e114b7c6936474851da10a'
 HERE = Path(__file__).absolute().parent
 _SOURCE_NAMES = {
@@ -32,15 +34,29 @@ _SOURCE_NAMES = {
     'share_support.py': 'runtime_shares.py', 'managed_registry.py': 'managed_registry.py',
     'preinstall_runtime.py': 'preinstall_runtime.py', 'quarantine_policy.py': 'quarantine_policy.py',
 }
-_MANIFEST = frozenset(_SOURCE_NAMES) | {
-    'gvproxy-darwin', 'policy.json', 'preinstall-receipt.json', 'vpn-seed-receipt.json'}
-_META_KEYS = frozenset({
+_COMMON_MANIFEST = frozenset(_SOURCE_NAMES) | {'gvproxy-darwin', 'policy.json'}
+_COMMON_META_KEYS = frozenset({
     'version', 'vm_name', 'vm_config', 'vm_config_sha256', 'vm_config_identity', 'tart_home', 'ecid', 'guest_mac',
     'source_sha256', 'tart_binding', 'backend_quarantine_sha256',
     'needs_host_security_authorization', 'native_execution_approved', 'backend_assessment',
-    'private_config_sha256', 'preinstall_receipt_sha256', 'vpn_seed_receipt_sha256',
-    'guest_status_identity', 'guest_status_share', 'setup_active',
+    'private_config_sha256', 'setup_active',
 })
+_V2_RECEIPTS = ('preinstall-receipt.json', 'vpn-seed-receipt.json')
+# Per version: (manifest names, metadata keys, names a refresh keeps and still
+# requires intact). Everything else in the manifest is replaced from the current
+# checkout and the pinned backend.
+_LAYOUTS = {
+    2: (_COMMON_MANIFEST | set(_V2_RECEIPTS),
+        _COMMON_META_KEYS | {'preinstall_receipt_sha256', 'vpn_seed_receipt_sha256',
+                             'guest_status_identity', 'guest_status_share'},
+        ('policy.json',) + _V2_RECEIPTS),
+    3: (_COMMON_MANIFEST, _COMMON_META_KEYS | {'installers_identity'}, ('policy.json',)),
+}
+# v3 only: the parent-built folder of verified apps, Clash profile and a note,
+# shared read-only while first setup is pending and never again afterwards.
+INSTALLERS_NAME = 'installers'
+INSTALLERS_SHARE = 'gold-installers'
+RESERVED_SHARES = ('setup', 'gold-status', INSTALLERS_SHARE)
 _MAX_RECORD = 4 * 1024 * 1024
 # Host-only record outside the reviewed manifest. Absent: first setup is still
 # pending and runs on Tart's normal network (owner's decision, 2026-11-19), so
@@ -284,24 +300,27 @@ def _quarantine_kept(path, meta):
             and _quarantine(path) is not None)
 
 
-def _receipt_bytes(path):
-    raw, _ = _read(path)
-    _need(type(_parse(raw)) is dict, 'private-receipt-object-required')
-    return raw
+def _installers_info(path):
+    info = path.lstat()
+    # 0755 inside the 0700 environment: still host-private, and readable by the
+    # guest user whatever UID Setup Assistant gives it.
+    _need(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
+          and stat.S_IMODE(info.st_mode) == 0o755, 'installers-directory-required')
+    return info
 
 
 def prepare_environment(vm_name, vm_config, destination_private_base, *, published_vm_config,
-                        private_config, endpoints, gvproxy_path, tart_path,
-                        preinstall_receipt, vpn_seed_receipt):
-    """Prepare before publication, never launch or grant host authorization.
+                        private_config, endpoints, gvproxy_path, tart_path, installers):
+    """Prepare a v3 environment before publication; never launch or grant host authorization.
 
     vm_config is the existing staged private config. published_vm_config is the
     explicit future <Tart home>/vms/<vm_name>/config.json, absent unless identical
     to vm_config. Same-filesystem directory publication must retain its inode.
     Call BEFORE acquiring a POSIX config publication lock: reading/closing the
     config here must never release a lock already held by the parent process.
-    Receipts are explicit private JSON paths; private_config is the unchanged
-    vpn_config dictionary, never a host profile or implicit source selector.
+    private_config is the unchanged vpn_config dictionary, never a host profile
+    or implicit source selector. installers is the parent's finished 0755 folder
+    on the same filesystem; it is moved, not copied, into the environment.
     """
     try:
         vm_name = _name(vm_name)
@@ -313,8 +332,9 @@ def prepare_environment(vm_name, vm_config, destination_private_base, *, publish
         mac, ecid = _vm_identity(vm_raw)
         endpoints = _endpoints(endpoints)
         config_sha = _private_config(private_config, endpoints)
-        receipts = {'preinstall-receipt.json': _receipt_bytes(preinstall_receipt),
-                    'vpn-seed-receipt.json': _receipt_bytes(vpn_seed_receipt)}
+        installers = _path(installers)
+        installers_info = _installers_info(installers)
+        _directory(installers.parent)
         backend, backend_info = _verified_backend(gvproxy_path)
         source_q = _quarantine(_path(gvproxy_path))
         _need(bool(source_q), 'backend-source-quarantine-required')
@@ -327,9 +347,6 @@ def prepare_environment(vm_name, vm_config, destination_private_base, *, publish
         _need(not base.exists(), 'destination-must-be-new')
         base.mkdir(mode=0o700)
         _sync(base.parent)
-        mailbox = base / 'guest-status'
-        mailbox.mkdir(mode=0o700)
-        _sync(base)
         for name, raw in sources.items():
             _write(base / name, raw, 0o700 if name == 'launcher.py' else 0o600)
         # Preserve only an already-present owner execute bit. Preparing material
@@ -340,11 +357,14 @@ def prepare_environment(vm_name, vm_config, destination_private_base, *, publish
         _need(_sha(copied_backend) == _sha(backend), 'copied-backend-mismatch')
         _preserve_quarantine(_path(gvproxy_path), base / 'gvproxy-darwin', source_q)
         _write(base / 'policy.json', _json({'guest_mac': mac, 'endpoints': endpoints}))
-        for name, raw in receipts.items():
-            _write(base / name, raw)
-        manifest = {name: _sha(_read(base / name, cap=64 * 1024 * 1024)[0]) for name in _MANIFEST}
+        os.rename(str(installers), str(base / INSTALLERS_NAME))
+        _sync(installers.parent)
+        _sync(base)
+        moved = _installers_info(base / INSTALLERS_NAME)
+        _need(_identity(moved) == _identity(installers_info), 'installers-directory-changed')
+        manifest = {name: _sha(_read(base / name, cap=64 * 1024 * 1024)[0]) for name in _LAYOUTS[3][0]}
         meta = {
-            'version': 2, 'vm_name': vm_name, 'vm_config': str(published),
+            'version': 3, 'vm_name': vm_name, 'vm_config': str(published),
             'vm_config_sha256': _sha(vm_raw), 'vm_config_identity': _identity(vm_info),
             'tart_home': str(tart_home),
             'ecid': ecid, 'guest_mac': mac, 'source_sha256': manifest,
@@ -352,21 +372,17 @@ def prepare_environment(vm_name, vm_config, destination_private_base, *, publish
             'needs_host_security_authorization': True, 'native_execution_approved': False,
             'backend_assessment': BACKEND_ASSESSMENT,
             'private_config_sha256': config_sha,
-            'preinstall_receipt_sha256': manifest['preinstall-receipt.json'],
-            'vpn_seed_receipt_sha256': manifest['vpn-seed-receipt.json'],
-            'guest_status_identity': _identity(mailbox.stat()),
-            'guest_status_share': 'gold-status', 'setup_active': False,
+            'installers_identity': _identity(moved), 'setup_active': False,
         }
         _write(base / 'environment.json', _json(meta))
         _validate_environment(base, meta, staged_vm_config=vm_config)
         _need(published == vm_config or not published.exists(), 'published-config-appeared')
-        return {'version': 2, 'base': str(base), 'launcher': str(base / 'launcher.py'),
+        return {'version': 3, 'base': str(base), 'launcher': str(base / 'launcher.py'),
                 'metadata_path': str(base / 'environment.json'),
-                'status': 'awaiting_host_authorization', 'endpoint_count': len(endpoints),
+                'status': 'awaiting_first_setup', 'endpoint_count': len(endpoints),
                 'needs_host_security_authorization': True, 'native_execution_approved': False,
                 'backend_requires_executable_permission': not bool(backend_info.st_mode & stat.S_IXUSR),
-                'guest_bootstrap_evidence': 'not_observed', 'desktop_verified': False,
-                'network_independently_verified': False}
+                'desktop_verified': False, 'network_independently_verified': False}
     except RuntimePreparationError:
         raise
     except Exception:
@@ -374,7 +390,7 @@ def prepare_environment(vm_name, vm_config, destination_private_base, *, publish
 
 
 def validate_environment(base, meta=None):
-    """Validate a published v2 only; no staging override at the launch boundary."""
+    """Validate a published v2/v3 only; no staging override at the launch boundary."""
     return _validate_environment(base, meta)
 
 
@@ -384,30 +400,33 @@ def _validate_environment(base, meta=None, staged_vm_config=None, *, refreshable
         stored = _parse(_read(base / 'environment.json')[0])
         _need(meta is None or _json(meta) == _json(stored), 'environment-metadata-changed')
         meta = stored
-        _need(type(meta) is dict and set(meta) == _META_KEYS and type(meta['version']) is int
-              and meta['version'] == 2 and meta['setup_active'] is False,
+        _need(type(meta) is dict and type(meta.get('version')) is int and meta['version'] in _LAYOUTS,
               'invalid-v2-environment')
+        names, keys, kept = _LAYOUTS[meta['version']]
+        _need(set(meta) == keys and meta['setup_active'] is False, 'invalid-v2-environment')
         name = _name(meta['vm_name'])
         _need(meta['needs_host_security_authorization'] is True
               and meta['native_execution_approved'] is False
               and meta['backend_assessment'] in ((BACKEND_ASSESSMENT, _UNNOTARIZED_ASSESSMENT)
                                                  if refreshable else (BACKEND_ASSESSMENT,)),
               'invalid-backend-authorization-contract')
-        _need(type(meta['source_sha256']) is dict and set(meta['source_sha256']) == _MANIFEST,
+        _need(type(meta['source_sha256']) is dict and set(meta['source_sha256']) == names,
               'incomplete-v2-source-manifest')
         _need(not (base / 'setup').exists() and not (base / 'setup').is_symlink(),
               'legacy-setup-refused')
         for name, expected in meta['source_sha256'].items():
-            if refreshable and name not in _KEPT:
+            if refreshable and name not in kept:
                 continue
             raw, _ = _read(base / name, cap=64 * 1024 * 1024)
             _need(_sha(raw) == expected, 'environment-source-integrity-mismatch')
         _need(meta['source_sha256']['packet_policy.py'] == PACKET_SHA256,
               'reviewed-policy-digest-mismatch')
-        _need(meta['preinstall_receipt_sha256'] == meta['source_sha256']['preinstall-receipt.json']
-              and meta['vpn_seed_receipt_sha256'] == meta['source_sha256']['vpn-seed-receipt.json']
-              and type(meta['private_config_sha256']) is str
+        _need(type(meta['private_config_sha256']) is str
               and re.fullmatch('[0-9a-f]{64}', meta['private_config_sha256']), 'invalid-private-receipt-pins')
+        if meta['version'] == 2:
+            _need(meta['preinstall_receipt_sha256'] == meta['source_sha256']['preinstall-receipt.json']
+                  and meta['vpn_seed_receipt_sha256'] == meta['source_sha256']['vpn-seed-receipt.json'],
+                  'invalid-private-receipt-pins')
         _validate_bindings(base, meta, staged_vm_config, backend=not refreshable)
         return meta
     except RuntimePreparationError:
@@ -417,7 +436,7 @@ def _validate_environment(base, meta=None, staged_vm_config=None, *, refreshable
 
 
 def validate_bindings(base, meta):
-    """Recheck published Tart/config, pinned backend/quarantine and owned mailbox."""
+    """Recheck published Tart/config, pinned backend/quarantine and the v2 mailbox or v3 installers."""
     try:
         return _validate_bindings(base, meta)
     except RuntimePreparationError:
@@ -446,11 +465,14 @@ def _validate_bindings(base, meta, staged_vm_config=None, *, backend=True):
         raw, _ = _verified_backend(base / 'gvproxy-darwin')
         _need(_sha(raw) == meta['source_sha256']['gvproxy-darwin'], 'backend-binding-changed')
         _need(_quarantine_kept(base / 'gvproxy-darwin', meta), 'backend-quarantine-changed')
-    status_directory(base, meta)
+    if meta['version'] == 2:
+        status_directory(base, meta)
+    else:
+        installers_directory(base, meta)
 
 
 def validate_environment_for_refresh(base):
-    """Only what refresh_environment keeps: VM/Tart bindings, policy, receipts, mailbox."""
+    """Only what a refresh keeps: VM/Tart bindings, policy, v2 receipts and mailbox or v3 installers."""
     return _validate_environment(base, refreshable=True)
 
 
@@ -581,7 +603,7 @@ def environment_needs_refresh(base):
     Raises if anything a refresh keeps has changed; that is never repaired.
     """
     meta = validate_environment_for_refresh(base)
-    if meta['backend_assessment'] == _UNNOTARIZED_ASSESSMENT:
+    if meta['version'] == 2 and meta['backend_assessment'] == _UNNOTARIZED_ASSESSMENT:
         _need(meta['source_sha256']['gvproxy-darwin'] == _LEGACY_GV_SHA256,
               'unknown-legacy-backend-pin')
         return True
@@ -624,11 +646,20 @@ def refresh_environment(base, gvproxy_path):
 
 
 def status_directory(base, meta):
+    _need(meta.get('version') == 2, 'guest-status-unavailable')
     base = _directory(base)
     mailbox = _directory(base / 'guest-status')
     _need(meta['guest_status_share'] == 'gold-status'
           and _identity(mailbox.stat()) == meta['guest_status_identity'], 'guest-status-directory-changed')
     return mailbox
+
+
+def installers_directory(base, meta):
+    """v3 only: the same folder that was bound at preparation, still 0755 and owned."""
+    _need(meta.get('version') == 3, 'installers-unavailable')
+    path = _path(_directory(base) / INSTALLERS_NAME)
+    _need(_identity(_installers_info(path)) == meta['installers_identity'], 'installers-directory-changed')
+    return path
 
 
 def require_backend_authorization(meta, acknowledged):
@@ -685,10 +716,14 @@ def build_tart_command(base, meta, vm_name, network_fd, share_plan, no_graphics=
         command.append('--recovery')
     else:
         _need(share_plan is not None, 'user-share-plan-required')
-        _need(not any(s['name'].casefold() in ('setup', 'gold-status') for s in share_plan.shares),
+        _need(not any(s['name'].casefold() in RESERVED_SHARES for s in share_plan.shares),
               'reserved-share-name')
-        mailbox = status_directory(base, meta)
-        command.append('--dir=gold-status:' + str(mailbox))  # The only special RW share.
+        if meta['version'] == 2:
+            mailbox = status_directory(base, meta)
+            command.append('--dir=gold-status:' + str(mailbox))  # v2's only special RW share.
+        elif first_setup:
+            # v3 first setup only; never mounted for a protected start.
+            command.append('--dir=' + INSTALLERS_SHARE + ':' + str(installers_directory(base, meta)) + ':ro')
         command.extend(share_plan.arguments)
     if no_graphics:
         command.append('--no-graphics')
@@ -696,7 +731,7 @@ def build_tart_command(base, meta, vm_name, network_fd, share_plan, no_graphics=
 
 
 def read_guest_status(base, receipt_token):
-    """Bounded constant-only untrusted self-report; NEVER independent success."""
+    """v2 only: bounded constant-only untrusted self-report; NEVER independent success."""
     try:
         _need(type(receipt_token) is str and re.fullmatch('[0-9a-f]{64}', receipt_token),
               'invalid-receipt-token')

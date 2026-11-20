@@ -57,6 +57,7 @@ class RuntimeTests(unittest.TestCase):
             'type': 'trojan', 'server': '8.8.8.8', 'port': 443,
             'password': SECRET, 'sni': 'vpn.example.com'}]})
         self.quarantines = {str(self.backend): Q}
+        self.jobs = 0
         # Scoped source helper injection only. Production digest constants stay intact.
         self.pin = self.stack.enter_context(mock.patch.object(runtime, '_verified_backend', side_effect=self.fixture_backend))
         self.stack.enter_context(mock.patch.object(runtime, '_quarantine', side_effect=lambda p: self.quarantines.get(str(p))))
@@ -89,14 +90,49 @@ class RuntimeTests(unittest.TestCase):
         if expected is not None:
             self.quarantines[str(target)] = expected
 
+    def new_installers(self):
+        """A folder as oneclick.build_installers leaves it: 0755 inside a private job directory."""
+        self.jobs += 1
+        job = self.root / ('job-%d' % self.jobs)
+        job.mkdir(mode=0o700)
+        folder = job / 'installers'
+        folder.mkdir(mode=0o700)
+        (folder / 'inert.fixture').write_text('inert fixture; never a real app')
+        folder.chmod(0o755)
+        return folder
+
     def prepare(self, **changes):
         values = dict(vm_name=self.name, vm_config=self.config, published_vm_config=self.config,
                       destination_private_base=self.base,
                       private_config=self.vpn.private_config, endpoints=self.vpn.endpoints,
-                      gvproxy_path=self.backend, tart_path=self.tart,
-                      preinstall_receipt=self.preinstall, vpn_seed_receipt=self.seed_receipt)
+                      gvproxy_path=self.backend, tart_path=self.tart)
         values.update(changes)
+        if 'installers' not in values:
+            values['installers'] = self.new_installers()
         return runtime.prepare_environment(**values)
+
+    def prepare_v2(self, **changes):
+        """The v2 layout that builds before 2026-11-20 published (bb1): private receipts
+        and a guest mailbox, no installers folder."""
+        result = self.prepare(**changes)
+        meta = self.meta()
+        installers = self.base / runtime.INSTALLERS_NAME
+        self.assertEqual(installers.resolve(strict=True), self.expected_root / 'environment' / 'installers')
+        shutil.rmtree(str(installers))
+        mailbox = self.base / 'guest-status'
+        mailbox.mkdir(mode=0o700)
+        for name, source in (('preinstall-receipt.json', self.preinstall), ('vpn-seed-receipt.json', self.seed_receipt)):
+            (self.base / name).write_bytes(source.read_bytes())
+            (self.base / name).chmod(0o600)
+            meta['source_sha256'][name] = hashlib.sha256(source.read_bytes()).hexdigest()
+        del meta['installers_identity']
+        meta.update(version=2, preinstall_receipt_sha256=meta['source_sha256']['preinstall-receipt.json'],
+                    vpn_seed_receipt_sha256=meta['source_sha256']['vpn-seed-receipt.json'],
+                    guest_status_identity=[mailbox.stat().st_dev, mailbox.stat().st_ino],
+                    guest_status_share='gold-status')
+        (self.base / 'environment.json').write_bytes(runtime._json(meta))
+        runtime.validate_environment(self.base)
+        return result
 
     def meta(self):
         return json.loads((self.base / 'environment.json').read_text())
@@ -106,10 +142,10 @@ class RuntimeTests(unittest.TestCase):
         with mock.patch.object(launcher, 'BASE', self.base):
             return launcher.build_tart_command(self.name, 42, plan, environment=self.meta(), **options)
 
-    def test_prepare_public_result_no_credentials_no_process_and_v2_validation(self):
+    def test_prepare_public_result_no_credentials_no_process_and_v3_validation(self):
         result = self.prepare()
-        self.assertEqual(result['version'], 2)
-        self.assertEqual(result['status'], 'awaiting_host_authorization')
+        self.assertEqual(result['version'], 3)
+        self.assertEqual(result['status'], 'awaiting_first_setup')
         self.assertTrue(result['needs_host_security_authorization'])
         self.assertFalse(result['native_execution_approved'])
         self.assertFalse(result['desktop_verified'])
@@ -118,9 +154,24 @@ class RuntimeTests(unittest.TestCase):
         self.assertNotIn(TOKEN, json.dumps(result))
         self.assertNotIn('8.8.8.8', json.dumps(result))
         with mock.patch.object(launcher, 'BASE', self.base):
-            self.assertEqual(launcher.validate_environment()['version'], 2)
+            self.assertEqual(launcher.validate_environment()['version'], 3)
         self.run.assert_not_called()
         self.spawn.assert_not_called()
+
+    def test_published_v2_environment_still_validates_through_the_same_launcher(self):
+        self.prepare_v2()
+        with mock.patch.object(launcher, 'BASE', self.base):
+            meta = launcher.validate_environment()
+        self.assertEqual(meta['version'], 2)
+        self.assertEqual(set(meta['source_sha256']), runtime._LAYOUTS[2][0])
+        self.assertEqual(runtime.status_directory(self.base, meta), self.base / 'guest-status')
+        with self.assertRaisesRegex(runtime.RuntimePreparationError, 'installers-unavailable'):
+            runtime.installers_directory(self.base, meta)
+        for version in (1, 4, True):
+            changed = dict(meta, version=version)
+            self.put(self.base / 'environment.json', changed)
+            with self.subTest(version=version), self.assertRaises(runtime.RuntimePreparationError):
+                runtime.validate_environment(self.base)
 
     def test_no_legacy_setup_material_or_raw_private_config(self):
         self.prepare()
@@ -130,19 +181,25 @@ class RuntimeTests(unittest.TestCase):
         self.assertFalse(any(p.suffix == '.dmg' for p in self.base.iterdir()))
         meta = self.meta()
         self.assertFalse(meta['setup_active'])
-        self.assertEqual(set(meta['source_sha256']), runtime._MANIFEST)
+        self.assertEqual(set(meta['source_sha256']), runtime._LAYOUTS[3][0])
+        self.assertNotIn('guest-status', names)
+        self.assertNotIn('preinstall-receipt.json', names)
+        self.assertIn('installers', names)
         self.assertNotIn(SECRET, json.dumps(meta))
         self.assertEqual(meta['private_config_sha256'], runtime._sha(runtime._json(self.vpn.private_config)))
         policy = json.loads((self.base / 'policy.json').read_text())
         self.assertEqual(policy, {'guest_mac': '02:aa:bb:cc:dd:ee', 'endpoints': [list(v) for v in self.vpn.endpoints]})
 
-    def test_files_and_mailbox_are_private_and_source_exec_not_added(self):
+    def test_files_are_private_installers_readable_and_source_exec_not_added(self):
         self.prepare()
         for path in self.base.iterdir():
+            if path.name == runtime.INSTALLERS_NAME:
+                continue
             mode = stat.S_IMODE(path.stat().st_mode)
             self.assertIn(mode, (0o600, 0o700))
             self.assertEqual(mode & 0o077, 0)
-        self.assertEqual(stat.S_IMODE((self.base / 'guest-status').stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(self.base.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE((self.base / 'installers').stat().st_mode), 0o755)
         self.assertEqual(stat.S_IMODE((self.base / 'gvproxy-darwin').stat().st_mode), 0o600)
         with self.assertRaisesRegex(runtime.RuntimePreparationError, 'backend-not-executable'):
             runtime.backend_is_executable(self.base)
@@ -199,7 +256,7 @@ class RuntimeTests(unittest.TestCase):
 
     def older_environment(self, backend_present=False):
         """As left by builds that pinned the unnotarized gvproxy (bb1's case: copy gone)."""
-        self.prepare()
+        self.prepare_v2()
         meta = self.meta()
         launcher_copy = b'# GOLD_VM_MANAGER_SHARES_V1\n# GOLD_VM_MANAGER_RECOVERY_V1\n# older launcher copy\n'
         (self.base / 'launcher.py').write_bytes(launcher_copy)
@@ -215,7 +272,7 @@ class RuntimeTests(unittest.TestCase):
 
     def test_refresh_moves_an_older_environment_to_the_signed_backend(self):
         old = self.older_environment()
-        kept = {name: (self.base / name).read_bytes() for name in runtime._KEPT}
+        kept = {name: (self.base / name).read_bytes() for name in runtime._LAYOUTS[2][2]}
         mailbox = (self.base / 'guest-status').stat().st_ino
         lookup, preserve = self.inode_quarantines()
         with mock.patch.object(runtime, '_quarantine', side_effect=lookup), \
@@ -232,7 +289,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual({key for key in meta if meta[key] != old[key]}, {'source_sha256', 'backend_assessment'})
         self.assertEqual(meta['backend_assessment'], runtime.BACKEND_ASSESSMENT)
         self.assertEqual((self.base / 'launcher.py').read_bytes(), (runtime.HERE / 'protected_launcher.py').read_bytes())
-        self.assertEqual({name: (self.base / name).read_bytes() for name in runtime._KEPT}, kept)
+        self.assertEqual({name: (self.base / name).read_bytes() for name in runtime._LAYOUTS[2][2]}, kept)
         self.assertEqual((self.base / 'guest-status').stat().st_ino, mailbox)
         self.assertEqual(stat.S_IMODE((self.base / 'gvproxy-darwin').stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE((self.base / 'launcher.py').stat().st_mode), 0o700)
@@ -248,7 +305,7 @@ class RuntimeTests(unittest.TestCase):
         other.chmod(0o600)
         with self.assertRaisesRegex(runtime.RuntimePreparationError, 'reviewed-backend-digest-mismatch'):
             runtime.refresh_environment(self.base, other)
-        for name in runtime._KEPT:
+        for name in runtime._LAYOUTS[2][2]:
             path = self.base / name
             original = path.read_bytes()
             with self.subTest(name=name):
@@ -277,9 +334,9 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual((self.base / 'environment.json').read_bytes(), before)
         self.assertIsNone(self.quarantines[str(copy)])
 
-    def signed_environment_with_older_code(self):
+    def signed_environment_with_older_code(self, v2=True):
         """A current signed environment whose launcher copy predates this build (bb1 after 602adc1)."""
-        self.prepare()
+        self.prepare_v2() if v2 else self.prepare()
         meta = self.meta()
         older = b'# GOLD_VM_MANAGER_SHARES_V1\n# GOLD_VM_MANAGER_RECOVERY_V1\n# launcher before first-setup support\n'
         (self.base / 'launcher.py').write_bytes(older)
@@ -289,7 +346,7 @@ class RuntimeTests(unittest.TestCase):
 
     def test_source_refresh_gives_an_intact_environment_only_this_builds_code(self):
         old = self.signed_environment_with_older_code()
-        kept = {name: (self.base / name).read_bytes() for name in ('gvproxy-darwin',) + runtime._KEPT}
+        kept = {name: (self.base / name).read_bytes() for name in ('gvproxy-darwin',) + runtime._LAYOUTS[2][2]}
         backend_inode = (self.base / 'gvproxy-darwin').stat().st_ino
         mailbox = (self.base / 'guest-status').stat().st_ino
         self.assertTrue(runtime.environment_sources_outdated(self.base))
@@ -309,6 +366,17 @@ class RuntimeTests(unittest.TestCase):
         self.assertFalse([p.name for p in self.base.iterdir() if p.name.startswith('.')])
         self.run.assert_not_called()
         self.spawn.assert_not_called()
+
+    def test_source_refresh_keeps_a_v3_installers_folder(self):
+        old = self.signed_environment_with_older_code(v2=False)
+        installers = (self.base / 'installers').stat().st_ino
+        self.assertFalse(runtime.environment_needs_refresh(self.base))
+        self.assertTrue(runtime.refresh_sources(self.base))
+        meta = runtime.validate_environment(self.base)
+        self.assertEqual({key for key in meta if meta[key] != old[key]}, {'source_sha256'})
+        self.assertEqual((self.base / 'installers').stat().st_ino, installers)
+        self.assertEqual(meta['installers_identity'], old['installers_identity'])
+        self.assertFalse(runtime.refresh_environment(self.base, self.backend))
 
     def test_source_refresh_never_repairs_a_changed_or_legacy_environment(self):
         self.signed_environment_with_older_code()
@@ -370,7 +438,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertFalse([p.name for p in self.base.iterdir() if p.name.startswith('.')])
 
     def test_first_setup_command_uses_normal_network_with_mailbox_and_user_shares(self):
-        self.prepare()
+        self.prepare_v2()
         plan = SimpleNamespace(shares=[{'name': 'data'}], arguments=['--dir=data:/fixture/user-data:ro'])
         with mock.patch.object(launcher, 'BASE', self.base):
             command = launcher.build_tart_command(self.name, None, plan, environment=self.meta(), first_setup=True)
@@ -385,6 +453,20 @@ class RuntimeTests(unittest.TestCase):
                                                 first_setup=True)
             with self.assertRaisesRegex(runtime.RuntimePreparationError, 'invalid-v2-launch-binding'):
                 launcher.build_tart_command(self.name, None, plan, environment=self.meta())
+
+    def test_v3_first_setup_shares_installers_read_only_and_protected_starts_never_do(self):
+        self.prepare()
+        plan = SimpleNamespace(shares=[{'name': 'data'}], arguments=['--dir=data:/fixture/user-data:ro'])
+        with mock.patch.object(launcher, 'BASE', self.base):
+            command = launcher.build_tart_command(self.name, None, plan, environment=self.meta(), first_setup=True)
+            protected = launcher.build_tart_command(self.name, 42, plan, environment=self.meta())
+        self.assertEqual(command[:4], [str(self.tart), 'run', self.name, '--no-clipboard'])
+        self.assertFalse(any(arg.startswith('--net') for arg in command))
+        self.assertEqual([arg for arg in command if arg.startswith('--dir=')],
+                         ['--dir=gold-installers:' + str(self.base / 'installers') + ':ro', '--dir=data:/fixture/user-data:ro'])
+        self.assertEqual([arg for arg in protected if arg.startswith('--dir=')], ['--dir=data:/fixture/user-data:ro'])
+        self.assertIn('--net-fd=42', protected)
+        self.assertFalse(any('gold-status' in arg or 'guest-status' in arg for arg in command + protected))
 
     def first_setup_launch(self, *flags):
         self.run.side_effect = None
@@ -405,7 +487,7 @@ class RuntimeTests(unittest.TestCase):
         return result, plan, child, stopped
 
     def test_first_setup_launch_runs_tart_on_its_normal_network_and_never_the_backend(self):
-        self.prepare()
+        self.prepare_v2()
         result, plan, child, stopped = self.first_setup_launch()
         self.assertEqual(result, 0)
         self.assertEqual(self.spawn.call_count, 1)  # Tart only; the backend is never executed.
@@ -425,6 +507,20 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE((self.base / 'gvproxy-darwin').stat().st_mode), 0o600)
         self.assertEqual(self.quarantines[str(self.base / 'gvproxy-darwin')], Q)
         self.assertTrue(runtime.first_setup_pending(self.base))  # Only the person marks it finished.
+
+    def test_v3_first_setup_launch_mounts_the_installers_folder_and_never_the_backend(self):
+        self.prepare()
+        result, plan, child, stopped = self.first_setup_launch()
+        self.assertEqual(result, 0)
+        self.assertEqual(self.spawn.call_count, 1)
+        argv = self.spawn.call_args[0][0]
+        self.assertIn('--dir=gold-installers:' + str(self.base / 'installers') + ':ro', argv)
+        self.assertFalse(any('gold-status' in arg for arg in argv))
+        status = json.loads((self.base / 'status.json').read_text())
+        self.assertEqual((status['state'], status['installers_share'], status['shared_directory_count']),
+                         ('guest-exited', 'gold-installers', 1))
+        self.assertNotIn('guest_bootstrap_evidence', status)
+        self.assertEqual(stopped, [child])
 
     def test_first_setup_launch_refused_once_finished_or_mixed_with_backend_or_recovery(self):
         self.prepare()
@@ -483,27 +579,61 @@ class RuntimeTests(unittest.TestCase):
                 self.prepare(endpoints=[endpoint])
         self.assertFalse(self.base.exists())
 
-    def test_private_receipts_are_copied_and_hashed_not_semantically_trusted(self):
+    def test_installers_folder_is_moved_in_and_bound_not_copied(self):
+        folder = self.new_installers()
+        before = folder.stat()
+        self.prepare(installers=folder)
+        moved = self.base / 'installers'
+        self.assertFalse(os.path.lexists(str(folder)))
+        self.assertEqual(moved.stat().st_ino, before.st_ino)
+        self.assertEqual((moved / 'inert.fixture').read_text(), 'inert fixture; never a real app')
+        meta = self.meta()
+        self.assertEqual(meta['installers_identity'], [before.st_dev, before.st_ino])
+        self.assertNotIn('preinstall_receipt_sha256', meta)
+        self.assertNotIn('guest_status_share', meta)
+        self.assertFalse(meta['native_execution_approved'])
+        self.assertEqual(runtime.installers_directory(self.base, meta), moved)
+        with self.assertRaisesRegex(runtime.RuntimePreparationError, 'guest-status-unavailable'):
+            runtime.status_directory(self.base, meta)
+        with self.assertRaisesRegex(runtime.RuntimePreparationError, 'guest-status-unavailable'):
+            runtime.read_guest_status(self.base, TOKEN)
+
+    def test_changed_or_private_installers_folder_fails_closed(self):
         self.prepare()
         meta = self.meta()
-        self.assertEqual((self.base / 'preinstall-receipt.json').read_bytes(), self.preinstall.read_bytes())
-        self.assertEqual(meta['preinstall_receipt_sha256'], hashlib.sha256(self.preinstall.read_bytes()).hexdigest())
-        self.assertEqual(meta['vpn_seed_receipt_sha256'], hashlib.sha256(self.seed_receipt.read_bytes()).hexdigest())
-        self.assertFalse(meta['native_execution_approved'])
+        folder = self.base / 'installers'
+        folder.chmod(0o700)
+        with self.assertRaisesRegex(runtime.RuntimePreparationError, 'installers-directory-required'):
+            runtime.validate_bindings(self.base, meta)
+        folder.chmod(0o755)
+        self.assertEqual(folder.resolve(strict=True), self.expected_root / 'environment' / 'installers')
+        shutil.rmtree(str(folder))
+        folder.mkdir(mode=0o755)
+        folder.chmod(0o755)
+        with self.assertRaisesRegex(runtime.RuntimePreparationError, 'installers-directory-changed'):
+            runtime.validate_environment(self.base)
 
-    def test_nonprivate_or_symlink_receipt_refused(self):
-        self.preinstall.chmod(0o644)
-        with self.assertRaisesRegex(runtime.RuntimePreparationError, 'private-file-required'):
-            self.prepare()
-        self.preinstall.chmod(0o600)
-        alias = self.root / 'alias.json'
-        alias.symlink_to(self.preinstall)
+    def test_unshareable_private_or_symlinked_installers_refused(self):
+        folder = self.new_installers()
+        for mode in (0o700, 0o775, 0o777):
+            folder.chmod(mode)
+            with self.subTest(mode=oct(mode)), \
+                    self.assertRaisesRegex(runtime.RuntimePreparationError, 'installers-directory-required'):
+                self.prepare(installers=folder)
+        folder.chmod(0o755)
+        alias = self.root / 'alias-installers'
+        alias.symlink_to(folder)
         with self.assertRaisesRegex(runtime.RuntimePreparationError, 'symlink'):
-            self.prepare(preinstall_receipt=alias)
+            self.prepare(installers=alias)
+        with self.assertRaises(runtime.RuntimePreparationError):
+            self.prepare(installers=self.root / 'absent-installers')
+        folder.parent.chmod(0o755)
+        with self.assertRaisesRegex(runtime.RuntimePreparationError, 'private-directory-required'):
+            self.prepare(installers=folder)
         self.assertFalse(self.base.exists())
 
     def test_tampered_source_copy_manifest_or_private_receipt_refused(self):
-        self.prepare()
+        self.prepare_v2()
         (self.base / 'preinstall-receipt.json').write_bytes(b'{}')
         with self.assertRaisesRegex(runtime.RuntimePreparationError, 'integrity'):
             runtime.validate_environment(self.base)
@@ -544,7 +674,7 @@ class RuntimeTests(unittest.TestCase):
             runtime.validate_environment(self.base)
 
     def test_v2_command_has_only_owned_rw_mailbox_and_validated_user_shares(self):
-        self.prepare()
+        self.prepare_v2()
         command = self.command(shares=[{'name': 'data'}], arguments=['--dir=data:/fixture/user-data:ro'], no_graphics=True)
         self.assertEqual(command[:4], [str(self.tart), 'run', self.name, '--net-fd=42'])
         self.assertIn('--dir=gold-status:' + str(self.base / 'guest-status'), command)
@@ -555,7 +685,7 @@ class RuntimeTests(unittest.TestCase):
 
     def test_reserved_mailbox_and_setup_names_casefolded(self):
         self.prepare()
-        for name in ('gold-status', 'GoLd-StAtUs', 'setup', 'SETUP'):
+        for name in ('gold-status', 'GoLd-StAtUs', 'setup', 'SETUP', 'gold-installers', 'Gold-Installers'):
             with self.subTest(name=name), self.assertRaisesRegex(runtime.RuntimePreparationError, 'reserved-share-name'):
                 self.command(shares=[{'name': name}])
 
@@ -568,7 +698,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn('--net-fd=42', command)
 
     def test_mailbox_permission_change_fails_closed(self):
-        self.prepare()
+        self.prepare_v2()
         (self.base / 'guest-status').chmod(0o755)
         with self.assertRaisesRegex(runtime.RuntimePreparationError, 'private-directory-required'):
             self.command()
@@ -780,7 +910,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertFalse(status['desktop_verified'])
 
     def test_guest_report_never_becomes_independent_desktop_or_network_proof(self):
-        self.prepare()
+        self.prepare_v2()
         value = {'schema_version': 1, 'evidence': 'guest_reported', 'configuration': 'imported',
                  'application': 'opened', 'system_authorization': 'user_action_may_be_required',
                  'connection_check': 'not_run', 'host_independently_verified': False}
@@ -793,7 +923,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertNotIn(TOKEN, json.dumps(result))
 
     def test_guest_report_absent_and_forged_success(self):
-        self.prepare()
+        self.prepare_v2()
         self.assertEqual(runtime.read_guest_status(self.base, TOKEN)['evidence'], 'not_observed')
         self.put(self.base / 'guest-status' / (TOKEN + '.json'), {'host_independently_verified': True})
         with self.assertRaisesRegex(runtime.RuntimePreparationError, 'invalid-guest-self-report'):
@@ -803,7 +933,7 @@ class RuntimeTests(unittest.TestCase):
                 runtime.read_guest_status(self.base, token)
 
     def test_guest_report_symlink_not_followed(self):
-        self.prepare()
+        self.prepare_v2()
         (self.base / 'guest-status' / (TOKEN + '.json')).symlink_to(self.seed_receipt)
         with self.assertRaisesRegex(runtime.RuntimePreparationError, 'symlink'):
             runtime.read_guest_status(self.base, TOKEN)
@@ -880,7 +1010,7 @@ class RuntimeTests(unittest.TestCase):
         result = self.prepare(vm_name=name, vm_config=source, published_vm_config=published)
         self.assertFalse(published.exists())
         self.assertTrue(source.exists())
-        self.assertEqual(result['status'], 'awaiting_host_authorization')
+        self.assertEqual(result['status'], 'awaiting_first_setup')
         meta = self.meta()
         self.assertEqual(meta['vm_config'], str(published))
         self.assertEqual(meta['vm_config_identity'], [before.st_dev, before.st_ino])
@@ -915,8 +1045,7 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             runtime.prepare_environment(self.name, self.config, self.base,
                 private_config=self.vpn.private_config, endpoints=self.vpn.endpoints,
-                gvproxy_path=self.backend, tart_path=self.tart,
-                preinstall_receipt=self.preinstall, vpn_seed_receipt=self.seed_receipt)
+                gvproxy_path=self.backend, tart_path=self.tart, installers=self.new_installers())
 
     def test_errors_do_not_return_private_input_or_exception_text(self):
         with mock.patch.object(runtime, '_quarantine', side_effect=ValueError(SECRET)):

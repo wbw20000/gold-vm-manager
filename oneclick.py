@@ -1,13 +1,20 @@
-"""Fresh-only user-driven preinstallation. No host profile import or auto first boot.
+"""Fresh-only user-driven VM creation. No host profile import or auto first boot.
 
-A single inherited lifecycle flock covers acquisition through publication. Disk
-writers retain their own generation/config locks. Failures keep their artifacts;
-neither a failed job nor a half-published transaction is automatically replayed.
+Restores a clean macOS and never writes into the guest disk. The verified apps
+and the Clash profile go into a read-only folder that is shared only while first
+setup is pending; the person installs them in the guest with Finder and the GUI
+(owner's decision, 2026-11-20: copying apps in from the host made macOS run them
+from a temporary translocated path, which Clash Verge refuses).
+
+A single inherited lifecycle flock covers acquisition through publication.
+Failures keep their artifacts; neither a failed job nor a half-published
+transaction is automatically replayed.
 """
 import argparse
 import ctypes
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import errno
 import fcntl
 import hashlib
 import json
@@ -30,7 +37,7 @@ HERE = Path(__file__).resolve().parent
 MODE = 'preinstall'
 ID = re.compile(r'[0-9a-f]{32}\Z')
 ACTIVE = lifecycle.PREINSTALL_ACTIVE
-ACKS = ('acknowledge_preinstall', 'acknowledge_network_policy', 'acknowledge_guest_autoconfigure')
+ACKS = ('acknowledge_preinstall', 'acknowledge_network_policy')
 KEYS = frozenset(('name', 'cpu', 'memory_gib', 'disk_gib', 'ipsw', 'vpn_configuration_id',
                   'download_loopback_proxy', 'acknowledge_normalization', 'defer_vpn') + ACKS)
 RESUME_KEYS = frozenset(('job_id', 'vpn_configuration_id', 'acknowledge_normalization') + ACKS[1:])
@@ -41,7 +48,24 @@ MIB = 1024 ** 2
 MATERIAL_LABELS = {'ccbaga': 'CCBaga', 'clashVergeRev': 'Clash Verge', 'claudeDesktop': 'Claude Desktop'}
 _MATERIAL_STAGES = {'quarantining': '正在为 {} 标记下载来源', 'extracting': '正在解包 {}',
                     'verifying': '正在校验 {} 的签名与公证', 'revalidating': '正在重新校验已缓存的 {}'}
-STAGE_FILES = ('disk.img', 'config.json', 'nvram.bin', '.clean-vm-installer.complete.json', '.offline-preinstall.complete.json')
+STAGE_FILES = ('disk.img', 'config.json', 'nvram.bin', '.clean-vm-installer.complete.json')
+# The read-only first-setup folder (see build_installers).
+INSTALLERS_PROFILE = 'Clash 节点配置.yaml'
+INSTALLERS_README = '先读我.txt'
+INSTALLERS_NOTE = """首次设置用的安装文件（只读，只在首次设置期间出现）
+
+1. 安装应用：在 Finder 里同时选中这里的 4 个应用（CCBaga-A、CCBaga-B、Clash Verge、Claude），
+   拖到 Finder 左侧边栏的「应用程序」。
+   一定要用 Finder 拖。不要在这里直接双击打开，也不要用终端复制：那样 macOS 会把应用放到临时目录里运行，
+   Clash Verge 会拒绝启动。
+2. 打开「应用程序」里的 Clash Verge。macOS 提示这是从互联网下载的应用时，选「打开」。
+3. 导入节点：在 Clash Verge 左侧点「订阅」，点「新建」，类型选「本地」，点「选择文件」，
+   选这个文件夹里的「Clash 节点配置.yaml」，再点「保存」。然后点一下新出现的订阅，让它处于使用中。
+4. 在 Clash Verge 的「设置」里打开「虚拟网卡模式」，按提示安装系统服务并输入你的管理员密码。
+5. 用浏览器打开任意网站，确认能通过节点上网。
+6. 在客机里正常关机，回到 Gold VM 管理器，点「标记首次设置完成…」。
+   之后每次启动都受保护，客机只能连到你的节点，这个文件夹也不再出现。
+"""
 
 
 class OneClickError(ValueError):
@@ -166,18 +190,15 @@ def capabilities():
     except Exception:
         prerequisites = {'status': 'missing-or-unavailable', 'notarized': False}
         prerequisites_ready = False
-    required = ('offline_vpn.py', 'guest_ownership.py', 'vpn_store.py', 'preinstall_runtime.py')
+    required = ('vpn_store.py', 'preinstall_runtime.py', 'preinstall_materials.py')
     complete = all((HERE / name).is_file() for name in required)
     # Compiled app resources are checked again by resolve_helpers at use, not trusted here.
-    source_or_bundle = all((HERE / name).is_file() for name in
-                           ('CleanVMInstaller', 'GuestVPNBootstrap', 'GuestOwnershipHelper')) or all(
-                           (HERE / name).is_file() for name in
-                           ('CleanVMInstaller.swift', 'GuestVPNBootstrap.swift', 'GuestOwnershipHelper.swift'))
+    source_or_bundle = (HERE / 'CleanVMInstaller').is_file() or (HERE / 'CleanVMInstaller.swift').is_file()
     checks = [
         {'id': 'platform', 'ready': platform['ready'], 'message': '仅支持已审查的 Apple Silicon / macOS 26.6.2 磁盘格式'},
-        {'id': 'implementation', 'ready': complete and source_or_bundle, 'message': '完整预装与首次登录组件必须齐备'},
+        {'id': 'implementation', 'ready': complete and source_or_bundle, 'message': '系统恢复与受保护启动组件必须齐备'},
         {'id': 'prerequisites', 'ready': prerequisites_ready, 'message': '需可用的系统 Python、Ruby/Psych 与 Apple 命令行开发工具'},
-        {'id': 'system-authorizations', 'ready': True, 'message': '需本人完成宿主文件归属授权、首次系统设置及客机服务授权'},
+        {'id': 'system-authorizations', 'ready': True, 'message': '需本人在客机里完成首次系统设置、安装应用、导入节点和服务授权'},
     ]
     # source_prerequisites is a diagnostic report, not authorization to execute downloaded tools.
     return {'ready': all(c['ready'] for c in checks), 'checks': checks,
@@ -186,8 +207,9 @@ def capabilities():
                              for m in reviewed_manifests() for a in m.expected_apps],
             'source_prerequisites': prerequisites,
             'limitations': ['下载/复制失败保留材料，不自动续传或覆盖重试。',
-                            '首次设置另行确认，使用普通网络（不经过滤），由你标记完成；之后每次启动都受保护，网络后端 gvproxy 取自 Podman 官方安装包（Red Hat 签名、已公证，不安装 Podman），保留隔离属性，由 macOS 自行核验。',
-                            '配置导入、系统授权、桌面验收和 VPN 连通分别记录；未提供真实节点不能验收连通。']}
+                            '不往客机磁盘写任何东西。首次设置另行确认，使用普通网络（不经过滤），并挂一个只读文件夹，里面是核验过的 4 个应用和节点配置，由你在客机里用 Finder 安装、在 Clash 里导入。',
+                            '确认 Clash 连上节点后由你标记首次设置完成；之后每次启动都受保护，网络后端 gvproxy 取自 Podman 官方安装包（Red Hat 签名、已公证，不安装 Podman），保留隔离属性，由 macOS 自行核验。',
+                            '系统设置、应用安装、节点导入和 VPN 连通都没有自动验收；未提供真实节点不能验收连通。']}
 
 
 def examples():
@@ -231,7 +253,7 @@ def start(payload, *, state_dir=None, tart_home=None):
         registry.write_private(jobdir / 'request.json', d)
         initial = {'id': jid, 'mode': MODE, 'name': d['name'], 'source_vm': None,
                    'phase': 'queued', 'pid': None, 'progress': None, 'started_at': _now(), 'updated_at': _now(),
-                   'message': '已接收完整预装请求；不会读取宿主节点资料、替换旧 VM 或自动首次启动。',
+                   'message': '已接收预装请求；不会读取宿主节点资料、替换旧 VM 或自动首次启动。',
                    'old_deleted': False, 'system_restored': False, 'applications_preinstalled': False,
                    'credentials_copied': False, 'host_credentials_copied': False,
                    'user_vpn_configuration_supplied': not defer, 'vpn_configuration_staged': False,
@@ -303,7 +325,6 @@ def _deferred_checkpoint(c, record, current):
           and record.get('mode') == current.get('mode') == MODE and record.get('source_vm') is None
           and record.get('source_identity') is None and record.get('name') == current.get('name')
           and current.get('stage_path') == str(c.stage) and current.get('system_restored') is True
-          and current.get('applications_preinstalled') is True
           and all(current.get(k) is False for k in ('published', 'guest_started', 'desktop_verified',
                   'host_credentials_copied', 'credentials_copied', 'vpn_configuration_staged', 'vpn_connected'))
           and not current.get('recovery_required') and not current.get('vpn_configuration')
@@ -353,7 +374,7 @@ def resume(payload, *, state_dir=None, tart_home=None):
               'explicit-normalization-consent-required')
         vpn_store.claim_configuration(c.state, details['vpn_configuration_id'], c.job_id)
         registry.write_private(marker, details)
-        result = _job_update(c, RESUME_QUEUED, '已接收 VPN 配置；重新核验同一暂存盘，不再安装系统或软件。',
+        result = _job_update(c, RESUME_QUEUED, '已接收 VPN 配置；重新核验同一暂存盘，不再恢复系统或下载。',
                              user_vpn_configuration_supplied=True)
         try:
             with (c.jobdir / 'vpn-worker.log').open('x') as log:
@@ -391,8 +412,7 @@ class NativeServices:
         registry.private_dir(c.state / 'host-materials')
         registry.private_dir(c.state / 'tools')
         registry.private_dir(c.jobdir / 'build')
-        self.installer, self.bootstrap = host_tools.resolve_helpers(HERE, c.jobdir / 'build')
-        self.ownership = host_tools.resolve_ownership_helper(HERE, c.jobdir / 'build')
+        self.installer = host_tools.resolve_helpers(HERE, c.jobdir / 'build')
         def progress(value):
             fraction = value.completed_bytes / value.total_bytes if value.total_bytes else None
             update('acquiring', '正在获取固定版本公开材料（' + value.spec_key + '）；不连接 VPN 节点。', fraction)
@@ -479,8 +499,6 @@ class NativeServices:
             _need(q is not None and _qhash(q) == value['backend_quarantine'] and list(_stamp(path)) == value['backend_stamp'],
                   'deferred-backend-quarantine-changed')
             self.backend = SimpleNamespace(executable_path=path)
-        _, self.bootstrap = host_tools.resolve_helpers(HERE, c.jobdir / 'build')
-        self.ownership = host_tools.resolve_ownership_helper(HERE, c.jobdir / 'build')
         self.materials = MaterialManager(c.state / 'application-materials').load(value['applications'])
 
     def restore(self, request, update):
@@ -541,36 +559,85 @@ class NativeServices:
         _require_reviewed_restore_build(registry.read_private(c.stage / '.clean-vm-installer.complete.json'))
         _new_identity(c.stage, c.tart_home / 'vms')
 
-    def preinstall(self, request, update):
-        from offline_preinstall import preinstall_stage
-        c = self.context
-        return preinstall_stage(state_dir=c.state, tart_home=c.tart_home, job_id=c.job_id,
-                                name=request['name'], materials=self.materials,
-                                evidence_dir=c.jobdir / 'application-preinstall', acknowledge_write=True,
-                                lifecycle_lock_fd=c.lock_fd)
-
-    def configure(self, request, stored, update):
-        from offline_vpn import configure_preinstalled_stage
-        c = self.context
-        return configure_preinstalled_stage(state_dir=c.state, tart_home=c.tart_home, job_id=c.job_id,
-                                            name=request['name'], private_config=stored.private_config,
-                                            bootstrap_helper_path=self.bootstrap, ownership_helper_path=self.ownership,
-                                            materials=self.materials, acknowledge_write=True,
-                                            acknowledge_system_authorization=True, lifecycle_lock_fd=c.lock_fd)
-
     def runtime(self, request, stored, update):
         from preinstall_runtime import prepare_environment
         c = self.context
         registry.private_dir(c.base.parent)
+        installers = c.jobdir / 'installers'
+        update('preparing_runtime', '正在准备首次设置用的只读文件夹：复核 4 个应用并复制，写入节点配置；不往客机磁盘写入。')
+        build_installers(installers, self.materials, stored.private_config)
+        update('preparing_runtime', '绑定受保护启动环境；不启动网络后端或 VM。')
         return prepare_environment(request['name'], c.stage / 'config.json', c.base,
                                    published_vm_config=c.tart_home / 'vms' / request['name'] / 'config.json',
                                    private_config=stored.private_config, endpoints=stored.endpoints,
                                    gvproxy_path=Path(self.backend.executable_path), tart_path=self.tart.executable_path,
-                                   preinstall_receipt=c.stage / '.offline-preinstall.complete.json',
-                                   vpn_seed_receipt=c.stage / '.offline-vpn.complete.json')
+                                   installers=installers)
 
     def publish(self, request, update):
         return publish_fresh(self.context, request, update)
+
+
+def _clone(source, target):
+    """APFS clone of a whole bundle: bytes, modes, internal links and extended
+    attributes (the download quarantine included). ditto only where cloning is
+    unavailable; the caller compares the result either way."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    function = getattr(libc, 'clonefile', None)
+    if function is not None:
+        function.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32]
+        function.restype = ctypes.c_int
+        if function(os.fsencode(str(source)), os.fsencode(str(target)), 1) == 0:  # CLONE_NOFOLLOW
+            return
+        _need(ctypes.get_errno() in (errno.EXDEV, errno.ENOTSUP, errno.EOPNOTSUPP)
+              and not os.path.lexists(target), 'installer-copy-failed')
+    result = subprocess.run(['/usr/bin/ditto', str(source), str(target)], stdin=subprocess.DEVNULL,
+                            capture_output=True, timeout=1800, env={'PATH': '/usr/bin:/bin', 'LANG': 'C'})
+    _need(result.returncode == 0, 'installer-copy-failed')
+
+
+def _write_shared(path, raw):
+    """A new 0644 file: readable by the guest user whatever its UID."""
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        view = memoryview(raw)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fchmod(fd, 0o644)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def build_installers(target, materials, private_config):
+    """Build the read-only first-setup folder at a new path: the 4 verified apps,
+    the Clash profile and a short note. Nothing is installed or executed.
+
+    The sources are verified again here (signature, notarization, quarantine and
+    tree digest); each copy must match its source's verified tree and quarantine.
+    The profile is the unchanged validated private configuration as JSON, which
+    is also YAML. The finished folder is 0755 for the read-only guest share.
+    """
+    import guest_app_artifacts as artifacts
+    import quarantine_policy
+    from preinstall_materials import verify_materials
+    target = registry.safe_path(Path(target), False)
+    _need(type(private_config) is dict and type(private_config.get('proxies')) is list, 'validated-private-config-required')
+    receipts = verify_materials(materials)
+    trees = {app['name']: (app['bundle_tree_sha256'], app['bundle_bytes'], app['bundle_entries'])
+             for receipt in receipts for app in receipt.apps}
+    target.mkdir(mode=0o700)
+    for material in materials:
+        for app in material.app_paths:
+            copy = target / app.name
+            _clone(app, copy)
+            _need(artifacts._tree_snapshot(copy, material.manifest) == trees[app.name], 'installer-copy-mismatch')
+            _need(quarantine_policy.read(copy) == quarantine_policy.read(app), 'installer-quarantine-mismatch')
+    profile = json.dumps(private_config, ensure_ascii=False, indent=2, allow_nan=False) + '\n'
+    _write_shared(target / INSTALLERS_PROFILE, profile.encode('utf-8'))
+    _write_shared(target / INSTALLERS_README, INSTALLERS_NOTE.encode('utf-8'))
+    registry.sync_directory(target)
+    os.chmod(str(target), 0o755)
+    return target
 
 
 def _new_identity(stage, vm_root):
@@ -624,49 +691,27 @@ def _rename_exclusive(source, destination):
 
 
 def _require_detached(image):
-    from offline_disk import decode
+    from offline_volume import parse_plist
     r = subprocess.run(['/usr/bin/hdiutil', 'info', '-plist'], stdin=subprocess.DEVNULL,
                        capture_output=True, timeout=30, env=_env(registry.HOME, image.parents[3]))
-    _need(r.returncode == 0, 'disk-detach-could-not-be-confirmed')
-    rows = decode(r.stdout).get('images')
+    _need(r.returncode == 0 and len(r.stdout) <= 4 * MIB, 'disk-detach-could-not-be-confirmed')
+    inventory = parse_plist(r.stdout)
+    _need(type(inventory) is dict, 'invalid-disk-attachment-inventory')
+    rows = inventory.get('images')
     _need(type(rows) is list and all(type(row) is dict and type(row.get('image-path')) is str for row in rows),
           'invalid-disk-attachment-inventory')
     _need(all(Path(row['image-path']).resolve() != image for row in rows), 'publication-disk-still-attached')
 
 
-def _publication_acceptance(c, request, meta):
-    from offline_vpn import _recorded_rows
+def _publication_acceptance(c, request):
     state = registry.read_private(c.state / 'build-current.json')
     _need(type(state) is dict and state.get('id') == c.job_id and state.get('name') == request['name']
           and state.get('mode') == MODE and state.get('phase') == 'publishing'
           and state.get('source_vm') is None and state.get('stage_path') == str(c.stage)
-          and all(state.get(k) is True for k in ('system_restored', 'applications_preinstalled', 'vpn_configuration_staged'))
+          and state.get('system_restored') is True
           and all(state.get(k) is False for k in ('guest_started', 'desktop_verified', 'published')),
           'publication-acceptance-missing')
-    for filename, key, yes, no in (
-        ('.offline-preinstall.complete.json', 'preinstall_receipt_sha256',
-         ('applications_preinstalled', 'readonly_remount_verified', 'final_detach_confirmed',
-          'vm_config_and_nvram_unchanged', 'image_file_identity_and_size_unchanged'),
-         ('guest_started', 'desktop_verified', 'published', 'credentials_copied')),
-        ('.offline-vpn.complete.json', 'vpn_seed_receipt_sha256',
-         ('applications_preinstalled', 'vpn_configuration_staged', 'persistent_ownership_verified', 'readonly_payload_verified',
-          'readonly_remount_verified', 'final_detach_confirmed', 'config_unchanged', 'nvram_unchanged'),
-         ('guest_started', 'desktop_verified', 'published', 'host_credentials_copied', 'vpn_connected')),
-    ):
-        path = c.stage / filename
-        record = registry.read_private(path)
-        _need(type(record) is dict and type(record.get('schema')) is int and record['schema'] == 1
-              and record.get('job_id') == c.job_id and record.get('name') == request['name']
-              and record.get('stage_path') == str(c.stage)
-              and type(record.get('operation_id')) is str and ID.fullmatch(record['operation_id'])
-              and all(record.get(k) is True for k in yes) and all(record.get(k) is False for k in no)
-              and lifecycle.fingerprint(path) == meta[key], 'independent-readonly-acceptance-required')
-        if filename == '.offline-preinstall.complete.json':
-            _recorded_rows(record)
-        else:
-            _need(type(record.get('receipt_token')) is str and re.fullmatch('[0-9a-f]{64}', record['receipt_token'])
-                  and record.get('image_file_stamp') == list(_stamp(c.stage / 'disk.img')),
-                  'vpn-acceptance-disk-binding-mismatch')
+    # Never written into: the restored disk must not have been started either.
     for name in ('state.vzvmsave', 'state.bin', 'savedstate', 'saved-state.bin', 'suspend.bin', 'control.sock'):
         _need(not os.path.lexists(c.stage / name), 'previously-started-stage')
 
@@ -697,7 +742,7 @@ def publish_fresh(c, request, update):
                   and 0 < len(raw) <= 1048576 and hashlib.sha256(raw).hexdigest() == meta['vm_config_sha256'],
                   'config-changed-before-publish')
             _require_reviewed_restore_build(registry.read_private(c.stage / '.clean-vm-installer.complete.json'))
-            _publication_acceptance(c, request, meta)
+            _publication_acceptance(c, request)
             _require_detached(c.stage / 'disk.img')
             key = _name_key(request['name'])
             _need(key not in {_name_key(n) for n in names_on_disk(c.tart_home)}, 'fresh-name-required')
@@ -720,8 +765,7 @@ def publish_fresh(c, request, update):
             registry.write_private(journal_path, journal)
             # Do not reopen/close config.json while holding its POSIX lock.
             os.fsync(config_fd)
-            for filename in ('disk.img', 'nvram.bin', '.clean-vm-installer.complete.json',
-                             '.offline-preinstall.complete.json', '.offline-vpn.complete.json'):
+            for filename in ('disk.img', 'nvram.bin', '.clean-vm-installer.complete.json'):
                 fd = os.open(str(registry.safe_path(c.stage / filename)), os.O_RDONLY | os.O_NOFOLLOW)
                 try:
                     os.fsync(fd)
@@ -758,16 +802,13 @@ def _worker_updates(c):
 
 
 def _finish_preinstall(c, d, stored, service, update):
-    service.configure(d, stored, update)
-    value = registry.read_private(c.state / 'build-current.json')
-    _need(value.get('vpn_configuration_staged') is True, 'vpn-seed-readback-not-accepted')
-    update('preparing_runtime', '绑定独立网络保护与首次登录回执；不启动网络后端或 VM。')
+    update('preparing_runtime', '准备首次设置文件夹并绑定受保护启动环境；不启动网络后端或 VM。')
     prepared = service.runtime(d, stored, update)
     registry.write_private(c.jobdir / 'runtime-preparation.json', prepared)
-    update('publishing', '独立只读核验完成；仅发布这个新 VM，不覆盖或删除旧 VM。')
+    update('publishing', '核对完成；仅发布这个新 VM，不覆盖或删除旧 VM。')
     target = service.publish(d, update)
     return update('awaiting_first_desktop_acceptance',
-                  '系统、四个完整应用与私有配置已预装。首次设置需单独确认并使用普通网络，由本人完成系统设置和授权，确认 Clash 连上节点后标记完成；未验收桌面或 VPN 连通。',
+                  '全新 macOS 已发布，客机磁盘未写入任何东西。首次设置需单独确认，使用普通网络并挂只读安装文件夹：由你完成系统设置、用 Finder 安装 4 个应用、在 Clash 导入节点并授权，确认连上节点后标记完成；未验收桌面或 VPN 连通。',
                   1, published=True, stage_path=None, published_path=str(target),
                   needs_host_security_authorization=True, guest_started=False,
                   desktop_verified=False, vpn_connected=False, network_independently_verified=False)
@@ -776,22 +817,13 @@ def _finish_preinstall(c, d, stored, service, update):
 def _worker_failure(c, update, error):
     value = registry.read_private(c.state / 'build-current.json', {})
     phase = value.get('phase')
-    if phase == 'failed':
-        operation = value.get('vpn_configuration') or value.get('offline_preinstall') or {}
-        phase = operation.get('phase', 'preinstalling')
     code = error_codes.public_code(error, 'preinstall-step-failed')
-    # The VPN workflow records its own inner step and a sanitized reason.
-    inner = value.get('vpn_configuration')
-    inner = inner if type(inner) is dict else {}
-    failed_step = inner.get('failed_step') if error_codes.is_step(inner.get('failed_step')) else None
-    failure_reason = inner.get('failure_code') if error_codes.is_code(inner.get('failure_code')) else None
     product = getattr(error, 'product', None)
     failed_product = product if type(product) is str and product in MATERIAL_LABELS else None
     message = ('原始材料下载或校验未完成，尚未创建虚拟磁盘；已保留下载，不会自动重试。'
                if phase == 'acquiring' and not value.get('stage_path') else
                '预装未完成；保留所有暂存文件，不自动覆盖重试。请查看失败步骤。')
-    return update('failed', message, failure_code=code, failed_phase=phase,
-                  failed_step=failed_step, failure_reason=failure_reason, failed_product=failed_product,
+    return update('failed', message, failure_code=code, failed_phase=phase, failed_product=failed_product,
                   recovery_required=bool(value.get('stage_path')) or (c.jobdir / 'commit.json').exists(),
                   desktop_verified=False, vpn_connected=False, network_independently_verified=False)
 
@@ -824,11 +856,8 @@ def execute(context, *, services=None):
         service.prepare(d, update)
         update('inspecting', '验证 Apple 恢复兼容性。')
         service.restore(d, update)
-        update('awaiting_offline_preinstall', '全新隔离恢复完成，开始完整应用离线预装。',
-               system_restored=True, stage_path=str(c.stage))
-        service.preinstall(d, update)
-        value = registry.read_private(c.state / 'build-current.json')
-        _need(value.get('applications_preinstalled') is True, 'application-readback-not-accepted')
+        value = update('installing', '全新 macOS 已恢复到暂存盘；不往客机磁盘写入任何东西。', 1,
+                       system_restored=True, stage_path=str(c.stage))
         if defer:
             _require_detached(c.stage / 'disk.img')
             checkpoint = {'schema': 1, 'id': c.job_id, 'request': d, 'stage_stamps': _stage_stamps(c),
@@ -837,7 +866,7 @@ def execute(context, *, services=None):
             _need(not os.path.lexists(marker), 'deferred-checkpoint-already-exists')
             registry.write_private(marker, checkpoint)
             _deferred_checkpoint(c, d, value)
-            return update(PAUSE_PHASE, '系统和软件已安装到暂存盘。请补充 VPN 配置后继续；未发布、未开机。',
+            return update(PAUSE_PHASE, '系统已恢复到暂存盘，应用已下载核验。请补充 VPN 配置后继续；未发布、未开机。',
                           1, user_vpn_configuration_supplied=False)
         return _finish_preinstall(c, d, stored, service, update)
     except Exception as error:
@@ -863,7 +892,7 @@ def execute_resume(context, *, services=None):
         stored = vpn_store.load_configuration(c.state, details['vpn_configuration_id'], job_id=c.job_id)
         _need(stored.bound_job == c.job_id and (not stored.summary['normalization_required']
               or details.get('acknowledge_normalization') is True), 'unconfirmed-vpn-resume-configuration')
-        update('resuming_vpn', '正在复核用于此 VM 的配置和同一批已审查材料；不重新恢复系统或重新预装。')
+        update('resuming_vpn', '正在复核用于此 VM 的配置和同一批已审查材料；不重新恢复系统或重新下载。')
         service.load_deferred_materials(checkpoint['materials'])
         _require_detached(c.stage / 'disk.img')
         _deferred_checkpoint(c, initial, registry.read_private(c.state / 'build-current.json'))
@@ -872,7 +901,6 @@ def execute_resume(context, *, services=None):
         d = dict(initial, **details)
         del d['defer_vpn']
         registry.write_private(c.jobdir / 'request.json', d)
-        update('awaiting_first_desktop_acceptance', '同一暂存盘已通过续接检查，准备独立验证并写入 VPN。')
         return _finish_preinstall(c, d, stored, service, update)
     except Exception as error:
         return _worker_failure(c, update, error)
@@ -933,29 +961,6 @@ def archive_failed(payload, *, state_dir=None, tart_home=None):
         return {'ok': True, 'job_id': payload['job_id'], 'name': job['name'], 'stage_retained': os.path.lexists(stage)}
     finally:
         os.close(fd)
-
-
-AUTHORIZATION_DECISION_KEYS = frozenset(('job_id', 'attempt', 'decision'))
-
-
-def authorization_decision(payload, *, state_dir=None):
-    """Pass the user's explicit retry/abandon choice to a paused, live worker.
-
-    Only a preinstall job whose worker is alive and paused on a refused macOS
-    prompt (phase awaiting_system_authorization, checked by lifecycle.status)
-    can receive it. Writes one private decision file; nothing else changes.
-    """
-    state = Path(state_dir) if state_dir is not None else registry.STATE_DIR
-    _need(type(payload) is dict and set(payload) == AUTHORIZATION_DECISION_KEYS
-          and type(payload['job_id']) is str and ID.fullmatch(payload['job_id'])
-          and type(payload['attempt']) is int and type(payload['decision']) is str
-          and payload['decision'] in ('retry', 'abandon'), 'invalid-authorization-decision')
-    job = lifecycle.status(state_dir=state)
-    _need(type(job) is dict and job.get('id') == payload['job_id'] and job.get('mode') == MODE
-          and job.get('phase') == 'awaiting_system_authorization', 'authorization-decision-not-pending')
-    from offline_vpn import submit_authorization_decision
-    result = submit_authorization_decision(state, payload['job_id'], payload['attempt'], payload['decision'])
-    return dict(result, ok=True, job_id=payload['job_id'])
 
 
 def main():

@@ -1,6 +1,8 @@
-# 首次开机前：完整 GUI 应用离线预装
+# 首次开机前：恢复系统和准备应用
 
-这是 **显式调用、仅全新暂存磁盘** 的开发接口，不是普通 VM 开机、发布或已安装宿主 GUI 的自动升级。原 `offline_validate` 只恢复系统，仍停在 `awaiting_offline_preinstall`；恢复成功和下载成功都不能标为应用已预装。
+新建 VM 只恢复全新 macOS，**不再往客机磁盘写任何东西**（2026-11-20 起）。4 个应用经过下面的来源审查和提取校验后，复制进这台 VM 专用的只读安装文件夹，首次设置时由你在客机里用 Finder 安装。原 `offline_validate`（高级选项 → 仅安装 VM）只恢复系统，仍停在 `awaiting_offline_preinstall`。
+
+为什么不再离线写盘：从宿主复制进客机 `/Applications` 的应用保留了下载隔离标记，却从没被 Finder 移动过，macOS 会把它们放到随机的只读 App Translocation 路径里运行。Clash Verge 2.5.10 启动时检查到这一点就退出。处理办法只能是用户用 Finder 移动应用，所以干脆让用户在客机里安装。
 
 ## 固定应用与来源审查
 
@@ -28,77 +30,23 @@
 - 所有常规文件/目录写完后才创建相对内部 symlink，保留文件权限，随后再次核对原始 archive 摘要。AppleDouble 需要另一份明确支持的恢复契约：当前发现即拒绝，不能静默丢弃资源叉。此次 Claude ZIP 没有 AppleDouble。
 - 提取本身仍不等于完成签名审核，更不等于写入客机。
 
-## 磁盘边界
+## 首次设置用的安装文件夹
 
-[offline_disk.py](<offline_disk.py>) 的 `StageTarget.load` 只接受当前同 job/name 的 `offline_validate` 新暂存区：恢复成功、没有 source VM、未发布、未普通启动、未预装、未复制凭据。目录与关键文件必须 canonical/private/current-user-owned，镜像大小匹配原恢复请求。
+[oneclick.py](<oneclick.py>) 的 `build_installers(target, materials, private_config)` 在系统恢复之后、发布之前运行：
 
-[offline_volume.py](<offline_volume.py>) 分别提供只读未挂载、只读 Data 挂载、显式授权 RW 未挂载、RW Data 挂载的**不同类型**契约，不把 RW 数据改造为只读数据以求通过。校验完整 image → GUID → partition UUID → APFS physical store → container UUID → volume UUID → 唯一 System/Data group；不靠 `Data` 卷名或保存的 `/dev/diskN` 选择磁盘。
+- 先用 [preinstall_materials.verify_materials](<preinstall_materials.py>) 把全部来源应用再完整校验一遍（签名、公证、quarantine、树哈希），不沿用之前的结果。
+- 在新的目标目录里，用 APFS `clonefile` 克隆每个完整 bundle（字节、权限、内部链接和扩展属性一起，包括下载隔离标记）；只有文件系统不支持克隆时才用 `/usr/bin/ditto`。每份副本的树哈希必须等于刚校验过的原件，隔离标记必须一致，否则停止（`installer-copy-mismatch`、`installer-quarantine-mismatch`）。
+- 写入 `Clash 节点配置.yaml`：校验过的私有配置原样输出为 JSON（JSON 也是合法的 YAML），节点名保留可读文字。写入 `先读我.txt`：用 Finder 安装、在 Clash Verge 导入本地订阅、打开虚拟网卡模式、确认连通、关机后标记首次设置完成。
+- 文件 0644、文件夹最后改成 0755，让客机用户不论 UID 都能读；它放在 0700 的运行环境里，宿主上仍是私有的。
+- 随后 [preinstall_runtime.prepare_environment](<preinstall_runtime.py>) 把整个文件夹改名移进新的 v3 运行环境，并记录它的 device/inode。受保护启动器只在首次设置期间把它以 `gold-installers` 只读挂给客机。
 
-- 每次设备动作前重新核对 exact image mapping 与同一 attachment generation；身份变化只报告需人工核对，不猜测、不 detach 替代 attachment。
-- plist 重复键在 decode 时直接拒绝，不能经 `plistlib.loads/dumps` 消掉重复键后冒充原始证据。
-- 只允许新 Data 卷挂载；其他卷不能被顺带挂载。不会 unlock、repair、force-unmount、弱化 FileVault/SIP，或写入 System 卷。
-- [offline_writable.py](<offline_writable.py>) 要求完整新 RW capture 与先前只读图中所有持久 UUID/大小/角色一致。写入期间保持镜像 inode/size，config/NVRAM 不变。
-- APFS 的正常 journal/应用写入可以改变镜像 mtime。必须在成功 unmount+detach 后、仍持原生命周期锁时，重新加载 post-write signature，并核对仍是原 inode/size/config/NVRAM，才可进行新的只读会话。不能对任意替换文件盲目 rebase。
-
-## 受限写入与成功条件
-
-[offline_install.py](<offline_install.py>) 仅向 Data 的 `Applications` 新建四个之前不存在的应用目录。不会覆盖既有目标，不删除失败目录，不创建账号、不跳过 Setup Assistant、不安装服务、不复制宿主节点/订阅/账号、不会调用 Tart 启动。
-
-- 调用前再次验证**全部**来源应用，检查空间、没有用户 home、没有 `.AppleSetupDone`。
-- 独占创建每个目标目录，完整复制原 bundle，核对 inode、内容树和 quarantine。
-- 任一失败：保留未发布暂存磁盘和失败证据，不进行破坏性自动重试。
-- macOS `ditto --qtn` 默认开启，但合并到**事先独占创建的应用根目录**时不会带入该目录的 quarantine。写入器因此显式读取原应用根的实际值，只在新目标缺失时新增该属性，并逐字回读核对；已有不同属性立即拒绝，绝不清除或覆盖。
-- 复制完成仍是 `applications_preinstalled=false`，必须卸载、detach、重新只读附加/挂载，再从客机磁盘独立验证四个完整 app 的版本、签名、notarization、树哈希和 quarantine，并再次干净 detach。
-
-[offline_preinstall.py](<offline_preinstall.py>) 的显式入口为：
-
-```python
-preinstall_stage(
-    state_dir=private_restore_state,
-    tart_home=private_tart_stage_root,
-    job_id=restore_job_id,
-    name=fresh_vm_name,
-    materials=tuple_of_three_reviewed_official_Material_objects,
-    evidence_dir=new_private_evidence_directory,
-    acknowledge_write=True,
-    external_lock=production_lifecycle_lock_if_separate,
-)
-```
-
-`Material` 是原始 archive acquisition receipt、固定 manifest 和该 archive 的受控提取结果；**不能传入宿主已安装应用或宿主用户配置**。完整 manifest 必须逐项等于固定 catalog。入口持生命周期/配置锁跨越全部验证、RO→RW→RO 操作；不会发布到 VM registry。
-
-成功状态是 `awaiting_first_desktop_acceptance`，不是 legacy `awaiting_user_setup`：
-
-```json
-{
-  "applications_preinstalled": true,
-  "guest_started": false,
-  "desktop_verified": false,
-  "credentials_copied": false,
-  "published": false
-}
-```
-
-仅在最终只读验证和 detach 成功后写成功 receipt。状态/UI 不提供新 VM 启动按钮。中断遗留的 active 标志若已失去生命周期锁，会被显示为 interrupted + recovery_required，阻止覆盖重试。
-
-**首次桌面运行、服务/代理实际可用、账号登录、许可/管理员授权以及产品交付仍未验收，需要另行明确授权。** 此开发变更不会自动替换已安装的宿主应用或启动另一个服务器。
-
-## 明确审查后的非破坏性续装
-
-[offline_recovery.py](<offline_recovery.py>) 的 `resume_verified_prefix` 是独立显式接口，需要 `acknowledge_recovery=True`、精确失败 operation ID 和原始私有失败/cleanup/copy 证据。它不是自动 retry，也不删除、重复制或覆盖已有应用字节。
-
-1. `StageTarget.load(..., review_failed_operation_id=...)` 只产生 **readonly_review** 对象，直接交给 RW 会话会被拒绝；仍要求同一新建恢复任务、未发布、未开机、未完成用户设置。
-2. 持原生命周期/配置锁，重新验证全部官方来源，再新建只读附件检查同一 Data/group UUID。既有应用必须构成固定应用集合的连续完整前缀，每个字节/权限/相对 link 都与已验证官方原件一致；未知项目、半包、损坏或修改的 bundle 一律拒绝。
-3. 仅在上述只读审查及干净 detach 之后，才允许显式续装决定升级同一 inode/size 的暂存对象。再次核对既有 bundle 全树，保留其 inode/内容且不对它运行 ditto；只补确实缺失的原始 quarantine，然后独占新建剩余缺失应用。
-4. 最后仍需完整四 app 的独立只读重挂验签、树与原始 quarantine 对比、最终 detach。成功状态提交之后才保存最终成功 evidence receipt；中途异常保持 failed + recovery_required。
-
-原失败证据不覆盖；新的续装证据会指出保留了哪些完整应用。暂存 sidecar 记录物理磁盘验证，若后续状态写入失败，它不单独代表整个操作已提交；以最终状态和最终 receipt 一致为准。
+失败时保留暂存盘和已建的部分文件夹，不自动重试；任务可以归档后用新名称重新预装。
 
 ## 回归测试
 
 ```sh
 /usr/bin/python3 -B -m unittest discover -s tests -p 'test_*.py' -v
-node --test tests/test_offline_ui.js
+node --test tests/test_offline_ui.js tests/test_preinstall_ui.js
 ```
 
 自动化 fixtures 与真实磁盘证据分开保存；fixtures 不能冒充真实预装。私有 IPSW、VM 镜像、下载原件和真实 UUID 只放在 gitignored evidence 中，不进入源代码测试 fixtures。

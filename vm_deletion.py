@@ -44,7 +44,7 @@ def validated_request(vm, confirm_name, acknowledge_erase, known_names):
     if vm not in known_names:
         _reject('只能删除列表中明确选中的 VM')
     if type(confirm_name) is not str or confirm_name != vm or acknowledge_erase is not True:
-        _reject('请完整输入 VM 名称并确认永久删除磁盘和暂停状态')
+        _reject('删除请求必须对应所选 VM 并确认永久删除磁盘和暂停状态')
     return {'mode': 'delete', 'source_vm': vm, 'name': vm,
             'confirm_name': confirm_name, 'acknowledge_erase': True}
 
@@ -131,7 +131,10 @@ def _check_tree(path, socket_identity):
             info = child.lstat()
             allowed_socket = (child == path / 'control.sock' and stat.S_ISSOCK(info.st_mode)
                               and socket_identity == (info.st_dev, info.st_ino) and info.st_nlink == 1)
-            if (info.st_dev != root_info.st_dev or info.st_uid != os.getuid()
+            # Only exact root-owned markers left by the retired ownership helper
+            # in older preinstalled VMs; nothing else foreign-owned is deleted.
+            owned = info.st_uid == os.getuid() or lifecycle.legacy_ownership_marker(path, child, info)
+            if (info.st_dev != root_info.st_dev or not owned
                     or stat.S_ISLNK(info.st_mode)
                     or not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode) or allowed_socket)
                     or os.path.ismount(str(child))
@@ -139,7 +142,7 @@ def _check_tree(path, socket_identity):
                 _reject('VM 目录含链接、挂载、多重硬链接或异常文件；未删除')
     # The lifecycle helper permits ONLY the pinned, proven-stale top-level
     # socket and verifies that the previously observed socket is still present.
-    lifecycle.check_tree(path, control_socket_identity=socket_identity)
+    lifecycle.check_tree(path, control_socket_identity=socket_identity, legacy_ownership_markers=True)
 
 
 def _journal_complete(journal, jid, vm):

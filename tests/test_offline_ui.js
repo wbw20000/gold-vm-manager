@@ -117,7 +117,7 @@ test('verified offline apps are still unpublished and have no startup action', (
     progress: null, applications_preinstalled: true, guest_started: false, desktop_verified: false,
     message: '完整应用经只读重挂验收；未发布、未启动，不是产品交付' };
   f.sandbox.renderBuildJob();
-  assert.match(f.node('build-job').children[0].text, /完整应用已离线预装.*未启动.*待首次桌面验收/);
+  assert.match(f.node('build-job').children[0].text, /gg1 · 未启动 · 待首次设置/);
 });
 
 test('in-flight offline copy and recovery state block new build controls', () => {

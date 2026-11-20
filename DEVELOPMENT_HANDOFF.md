@@ -2,7 +2,11 @@
 
 这是可独立构建的源码仓库，不是虚拟机镜像或已公证安装包。**Claude 在客机运行；宿主只负责管理。** 这里不包含开发机器上的状态、节点、账号、日志、第三方二进制或测试磁盘。
 
-## 当前状态（2026-11-18）
+## 最新变化（2026-11-20）：不再写客机磁盘
+
+负责人决定简化流程。新建 VM 只恢复全新 macOS；4 个应用和节点配置放进一个只读安装文件夹，首次设置时挂给客机，由用户用 Finder 安装、在 Clash Verge 里导入。离线写盘、文件归属授权（root 助手和管理员弹窗）、首次登录导入程序都已删除。详见下文「不再写客机磁盘（追加）」。下面 2026-11-18 起的记录保留作历史，其中关于离线写盘和属主授权的内容已经过时。
+
+## 当前状态（2026-11-18，历史）
 
 - **实机进度**：有一次真实运行完成了 macOS 恢复和四个原版应用的独立只读验收，随后在 VPN 阶段的 `authorized-ownership-apply` 失败。操作者没看到管理员弹窗；没有 `apply.started` 或成功回执；暂存盘已正常卸载，未发布、未开机。之后重跑又失败，界面只显示「请查看失败步骤」，却没有列出任何步骤。
 - **本轮已完成**：
@@ -18,9 +22,9 @@
 | --- | --- |
 | 前端 | [页面](<static/index.html>)、[主界面](<static/app.js>)、[预装向导](<static/preinstall.js>)、[主题样式](<static/style.css>)、[向导样式](<static/preinstall.css>) |
 | 原生外壳和本机服务 | [AppKit/WKWebView](<NativeApp.swift>) → [引导](<bootstrap.py>) → [HTTP 控制器](<manager.py>)。服务在本机 loopback 上运行，需要令牌，写操作检查 Host 和 Origin。接口见 [API 契约](<API_CONTRACT.md>)。 |
-| 新建、预装和续接 | [流程编排](<oneclick.py>)、[生命周期与状态](<lifecycle.py>)、[Apple 恢复助手](<CleanVMInstaller.swift>)、[离线预装](<offline_preinstall.py>)、[APFS 归属](<offline_volume.py>)、[发布保护](<preinstall_runtime.py>)。系统与应用从受审查的固定来源获取，不从开发机器复制。 |
-| Clash 配置 | [公开占位模板](<examples/vpn/clash.yaml>)、[解析与策略](<vpn_config.py>)、[本地路径与私有票据](<vpn_store.py>)、[写盘与验收](<offline_vpn.py>)、[首次登录助手](<GuestVPNBootstrap.swift>)。界面默认填本地 YAML 绝对路径，也可先预装、后补 VPN。 |
-| 系统授权和网络 | [授权请求及回执](<guest_ownership.py>)、[固定属主助手](<GuestOwnershipHelper.swift>)、[受保护启动](<protected_launcher.py>)、[端点过滤](<packet_policy.py>)。没有普通 NAT 回退。 |
+| 新建、预装和续接 | [流程编排和安装文件夹](<oneclick.py>)、[生命周期与状态](<lifecycle.py>)、[Apple 恢复助手](<CleanVMInstaller.swift>)、[应用材料](<preinstall_materials.py>)、[发布保护](<preinstall_runtime.py>)。系统与应用从受审查的固定来源获取，不从开发机器复制，也不写进客机磁盘。 |
+| Clash 配置 | [公开占位模板](<examples/vpn/clash.yaml>)、[解析与策略](<vpn_config.py>)、[本地路径与私有票据](<vpn_store.py>)。校验后的配置写进安装文件夹的「Clash 节点配置.yaml」，由用户在客机里导入。界面默认填本地 YAML 绝对路径，也可先恢复系统、后补 VPN。 |
+| 网络 | [受保护启动](<protected_launcher.py>)、[端点过滤](<packet_policy.py>)。首次设置用普通网络；标记完成后没有普通 NAT 回退。 |
 | 失败代码 | [异常到公开代码的映射](<error_codes.py>)。界面只显示固定代码，不显示原生输出、路径或节点数据。 |
 | 构建 | [源码安装](<SOURCE_INSTALL.md>)、[双击入口](<Install.command>)、[打包清单](<install_app.py>)、[Git 排除项](<.gitignore>)。旧迁移工具和旧客机 setup 保留用于兼容，不是新版干净构建的前置条件。 |
 
@@ -167,6 +171,18 @@
 - **客机测试**：Python 878 项，只有已知的 `test_compiler_system_temp…` 失败（改动前 865 项，同一个失败）；Node 44/44（改动前 43）。
 - **没有验证**：宿主上普通网络下设置助理能否走完、Tart 自带 NAT 在宿主上能否联网、首次登录后 Clash 导入和连接、标记完成后受保护启动能否通过节点上网。
 
+### 不再写客机磁盘（追加，2026-11-20）
+
+- **起因**：bb1 首次登录后 Clash Verge 报「正在从 App Translocation 临时路径运行」并退出。应用是宿主复制进客机 `/Applications` 的，带着下载隔离标记却从没被 Finder 移动过，macOS 就把它们放到随机的只读路径运行；Clash Verge 2.5.10 的 `macos_launch_guard.rs` 检查到就退出。另外三个应用也一样被放进临时路径（不能自动更新）。不清除隔离标记就只能让用户用 Finder 移动，所以改成在客机里安装。
+- **负责人决定**：按简化流程重写。
+- **新流程**：恢复系统 → 重新校验 4 个应用并用 APFS 克隆进安装文件夹，写入节点配置和说明 → 发布 v3 运行环境 → 首次设置用普通网络，挂只读 `gold-installers` → 用户安装、导入、开 TUN、确认连通 → 关机后标记完成 → 之后只走受保护启动，不再挂安装文件夹。
+- **运行环境 v3**（`preinstall_runtime.py`）：没有收据和状态邮箱，记录 `installers` 文件夹的 device/inode。v2（bb1）照旧校验和启动，启动器同时认 2 和 3。
+- **删除**：`offline_preinstall.py`、`offline_vpn.py`、`offline_install.py`（材料类型移到 `preinstall_materials.py`）、`offline_writable.py`、`offline_recovery.py`、`offline_disk.py`、`guest_ownership.py`、`GuestOwnershipHelper.swift`、`guest_vpn_seed.py`、`GuestVPNBootstrap.swift`、对应测试和三份文档；管理员授权暂停（接口、状态字段、界面）；`acknowledge_guest_autoconfigure`。只编译 CleanVMInstaller。
+- **顺带修复**：
+  - **bb1 删不掉**：旧属主助手以 root 身份在 VM 目录里写了 `.guest-ownership/<编号>/apply.started`、`verify.started`，删除前检查拒绝任何不属于当前用户的文件。现在只对这两类标记放行（`lifecycle.legacy_ownership_marker`），其他异常文件照旧拒绝。
+  - **不再要求输入 VM 名称**：所有确认对话框改为点一下按钮。接口里的 `confirm_name` 仍然检查，由界面自动填入当前对话框对应的 VM。
+- **版本**：App 1.4.0（build 7）。
+
 ## 验证
 
 ### 宿主实机已完成预装并发布（2026-11-19）
@@ -217,19 +233,14 @@
 
 ## 待办（按优先级）
 
-1. **根据诊断结果修复管理员授权（B2）。** 两项都需要改 Swift，并在宿主上编译和实测。
-   - **TOCTOU 风险**：[`request_authorization`](<guest_ownership.py:624>) 先以普通用户身份校验 helper，再让 root 执行同一个用户可写路径。等待输入密码期间，同 UID 的进程可以替换这个文件。
-     - **修法**：在 root 脚本里先把 helper 复制到只有 root 可写的目录，用 root 重新计算 sha256，比对一致后再执行。
-     - **注意**：helper 会检查 [`argv[0] == ticket.helper`](<GuestOwnershipHelper.swift:316>)，需要同步修改这项检查。
-   - **改由原生 App 发起授权**（Authorization Services）仍待办。helper 固定失败类别已实现，历史任务的 `exit(2)` 无法追溯。
+1. ~~根据诊断结果修复管理员授权（B2）。~~ 2026-11-20 删除了属主助手和管理员授权，不再需要。
 2. **移除实验性代码（D）。** [NativeApp.swift](<NativeApp.swift>) 仍然注册了账户初始化桥：包括密码表单、辅助功能和屏幕录制权限请求、同意 macOS 许可的勾选框，前端也能触发它；但 README 写的是「未交付」。另外，[deploy_rebuild_update.py](<deploy_rebuild_update.py>) 的文件清单缺少 `oneclick.py` 等文件，执行后会让已安装的 App 无法启动，而且它用 `assert` 做安全检查。
 3. **非破坏性恢复和首次启动仍未验收。**
    - 已进入私有配置写盘后才失败的任务，与主动选择「先不配置 VPN」的干净等待状态不同。
    - 失败任务**只能归档**，不能直接改成可续接；不能重用旧授权票据、跳过只读验收、覆盖现有盘，也不能把未验证状态标成成功。
    - 没有真实授权和获准的配置时，不得执行实机连通测试。
    - gvproxy 已换成 Red Hat 签名并公证的版本（见上文「网络后端换成 Red Hat 签名并公证的 gvproxy」），仍不能清除隔离属性或降低 Gatekeeper 检查。
-   - 首次设置用普通网络（见上文「首次设置改用普通网络」），宿主上还没走通过：设置助理、首次登录导入 Clash、标记完成后的受保护启动都要实测。
-   - `offline_recovery.py` 被打包了，但没有任何模块导入它，也没有命令行入口；仍缺一个只读的诊断命令。
+   - 首次设置用普通网络并挂只读安装文件夹（见上文「不再写客机磁盘」），宿主上还没走通过：设置助理、从共享文件夹用 Finder 安装、Clash 导入本地订阅、标记完成后的受保护启动都要实测。
 4. **验收分级。** 分别记录以下各项是否成功：软件和磁盘核验、属主核验、事务发布、首次桌面、导入自报、VPN 连通。独立 fixture 通过、宿主打包成功或客机回执，都不代表真实 VM 的网络已经验收。
 5. **审查中其余未处理的问题。**
    - 宿主系统被精确锁定在 26.6.2（`host_tools.py`、`install_app.py`），系统小版本一更新就无法构建和预装。建议改为 ≥26.0 即可，遇到未审查的版本给出警告。
@@ -241,7 +252,7 @@
    - 「打开窗口」每次都用 `swift -e` 现场编译。
    - `/tmp/goldnet-*` 目录从不清理。
    - 没有格式化工具、代码检查或 CI。
-6. **需要负责人决定的架构问题。** 是否放弃「宿主离线写客机磁盘」，改为在客机内用可见的安装器安装？这样做可以去掉宿主 root 授权、APFS 布局依赖和宿主版本锁定（上面第 1 项和第 5 项的第一条），代价是首次登录后用户要多做一步。另外，控制器依赖 Command Line Tools 自带的 `/usr/bin/python3`（3.9，已停止维护），没装 CLT 的 Mac 无法运行。
+6. **架构问题。** ~~是否放弃「宿主离线写客机磁盘」~~：已决定放弃（2026-11-20）。宿主版本锁定（第 5 项第一条）仍在，可以单独放宽。控制器仍依赖 Command Line Tools 自带的 `/usr/bin/python3`（3.9，已停止维护），没装 CLT 的 Mac 无法运行。
 
 ## 改代码时要注意
 
@@ -251,4 +262,4 @@
   - 在测试里断言原始文本不会出现在状态 JSON 中。
 - **界面测试的取函数方式有限制。** `tests/test_*_ui.js` 用 `declaration(name)` 从 `app.js` 截取单个函数，截取范围到第一个 `\n  }` 为止。函数内部如果有缩进两格的 `}`，就会截错。
 - **打包清单是手写的。** 新增的 Python 模块必须加进 `install_app.py` 的 `FILES`，本轮已加入 `error_codes.py`。
-- **不要提交本地数据。** 公开任务请使用合成样例和最小错误类别。不要把本机 `evidence/`、管理器状态、原始凭据或已填入真实节点的配置加入 Git。更多边界见 [安全说明](<SECURITY.md>)、[一键预装指南](<ONE_CLICK_PREINSTALL.md>) 和 [属主授权契约](<GUEST_OWNERSHIP.md>)。
+- **不要提交本地数据。** 公开任务请使用合成样例和最小错误类别。不要把本机 `evidence/`、管理器状态、原始凭据或已填入真实节点的配置加入 Git。更多边界见 [安全说明](<SECURITY.md>) 和 [一键预装指南](<ONE_CLICK_PREINSTALL.md>)。

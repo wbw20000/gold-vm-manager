@@ -21,10 +21,40 @@ import uuid
 import error_codes
 import guest_app_artifacts as artifacts
 from guest_app_pins import reviewed_manifests
-from offline_install import Material, PRODUCTS, APP_NAMES, validate_material_set
 import offline_payload
 import offline_volume
 import quarantine_policy as quarantine
+
+PRODUCTS = ('ccbaga', 'clashVergeRev', 'claudeDesktop')
+APP_NAMES = ('CCBaga-A.app', 'CCBaga-B.app', 'Clash Verge.app', 'Claude.app')
+
+
+@dataclasses.dataclass(frozen=True)
+class Material:
+    manifest: artifacts.ArtifactManifest
+    download: artifacts.DownloadReceipt
+    staging_root: Path
+    app_paths: tuple
+
+
+def validate_material_set(materials):
+    _need(type(materials) is tuple and len(materials) == 3
+          and all(type(m) is Material for m in materials), 'complete-reviewed-set-required')
+    _need(tuple(m.manifest.product for m in materials) == PRODUCTS, 'complete-reviewed-set-required')
+    _need(tuple(app.name for m in materials for app in m.manifest.expected_apps) == APP_NAMES,
+          'complete-reviewed-set-required')
+    for m in materials:
+        _need(type(m.app_paths) is tuple and all(isinstance(p, Path) for p in m.app_paths),
+              'complete-reviewed-set-required')
+    return materials
+
+
+def verify_materials(materials):
+    """Do not trust an earlier success: reverify all actual source bundles."""
+    validate_material_set(materials)
+    return tuple(artifacts.verify_app_bundles(m.manifest, m.staging_root, m.app_paths, m.download)
+                 for m in materials)
+
 
 SCHEMA = 1
 SUPPORTED_SCHEMA_TUPLES = (('Darwin', 'arm64', '26.6.2', 'macos-26.6.2'),)

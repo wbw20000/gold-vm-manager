@@ -107,7 +107,7 @@
   }
   function vpnConsentFields(validated, now) {
     need(validated && /^[0-9a-f]{32}$/.test(validated.id) && validated.expires > now, '节点校验已失效，请重新校验。');
-    return { vpn_configuration_id: validated.id, acknowledge_network_policy: true, acknowledge_guest_autoconfigure: true,
+    return { vpn_configuration_id: validated.id, acknowledge_network_policy: true,
       ...(validated.normalization ? { acknowledge_normalization: true } : {}) };
   }
   function creationFields(v, context) {
@@ -327,13 +327,13 @@
       deferNote.hidden = !skip;
       vpnInputs.hidden = skip;
       title.textContent = resuming ? `继续配置 VPN · ${resumeTarget.name}` : '新建 VM 及预装软件';
-      description.textContent = resuming ? '仅为这项已完成系统与应用预装的任务配置 VPN，沿用原资源，不重建也不自动开机。' :
-        '仅创建新名字，不重建旧 VM，不自动首次开机。原始公开下载经固定版本、签名与完整性验证后才用于离线预装。';
+      description.textContent = resuming ? '仅为这项已恢复系统、已下载应用的任务配置 VPN，沿用原资源，不重建也不自动开机。' :
+        '仅创建新名字，不重建旧 VM，不自动首次开机。原始公开下载经固定版本、签名与完整性验证；不往客机磁盘写入任何东西。';
       const finalLabel = resuming ? '同意并继续配置 VPN' : skip ? '同意并开始预装（暂不配置 VPN）' : '同意并开始预装';
-      const networkNote = '只走校验过的节点，采用固定 DNS 和路由防止直连。首次登录后导入配置并打开 Clash；系统设置、管理员权限和应用登录仍由你本人确认，导入不代表已连通。';
-      const installNote = '仅创建新 VM，不覆盖或自动开机。恢复系统并预装 CCBaga A+B、Clash Verge 和 Claude Desktop。';
-      consent.textContent = resuming ? `点击「${finalLabel}」将写入受保护的配置并继续发布，不会重装或自动开机。${networkNote}` :
-        `点击「${finalLabel}」${installNote}${skip ? '系统与应用预装完成后暂停；配置 VPN 之前不会发布、开机或设置客机网络。' : networkNote}`;
+      const networkNote = '首次设置用普通网络，并挂一个只读文件夹，里面是 CCBaga A+B、Clash Verge、Claude Desktop 和节点配置：由你用 Finder 安装应用、在 Clash 导入节点。确认连上节点后标记首次设置完成，之后只走校验过的节点。';
+      const installNote = '仅创建新 VM，不覆盖或自动开机。恢复全新 macOS，下载并核验 4 个应用。';
+      consent.textContent = resuming ? `点击「${finalLabel}」将绑定这份节点配置并继续发布，不会重装或自动开机。${networkNote}` :
+        `点击「${finalLabel}」${installNote}${skip ? '系统恢复后暂停；配置 VPN 之前不会发布或开机。' : networkNote}`;
       downloadSummary.textContent = controls.downloadProxy.value.trim() ? '高级下载设置（已填写代理）' : '高级下载设置';
       allControls.forEach(input => { input.disabled = busy; });
       for (const key of machineKeys) controls[key].disabled = busy || resuming;

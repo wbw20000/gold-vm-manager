@@ -21,7 +21,7 @@ manager = MaterialManager(
 try:
     materials = manager.load_reusable()   # this store's newest completed attempt, fully revalidated
 except MaterialPreparationError:          # 'material-cache-miss' (or every candidate failed)
-    materials = manager.prepare()         # tuple[offline_install.Material, ...], fixed order
+    materials = manager.prepare()         # tuple[preinstall_materials.Material, ...], fixed order
 attempt_id = manager.last_attempt_id      # save in the parent's lifecycle transaction
 public_status = manager.summary(attempt_id)
 # Later, using the SAME root and reviewed catalog:

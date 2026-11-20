@@ -59,31 +59,6 @@ def waiting_for_vpn(job):
     return bool(job and job.get('mode') == PREINSTALL_MODE and job.get('phase') == 'awaiting_vpn_configuration')
 
 
-AUTHORIZATION_RETRY_KEYS = frozenset(('operation', 'reason', 'attempt', 'max_attempts', 'expires_at'))
-_RETRY_REASON = re.compile(r'system-authorization-[a-z0-9]+(?:-[a-z0-9]+)*\Z')
-
-
-def public_authorization_retry(value):
-    """Return a copy of a paused-authorization record, or None if malformed.
-
-    Written by offline_vpn while a refused macOS prompt waits for the user's
-    explicit retry/abandon; holds only fixed tokens, small integers and a time.
-    """
-    if not (type(value) is dict and set(value) == AUTHORIZATION_RETRY_KEYS
-            and value['operation'] in ('apply', 'verify')
-            and type(value['reason']) is str and len(value['reason']) <= 100 and _RETRY_REASON.match(value['reason'])
-            and type(value['attempt']) is int and type(value['max_attempts']) is int
-            and 1 <= value['attempt'] < value['max_attempts'] <= 10
-            and type(value['expires_at']) is str and len(value['expires_at']) <= 40):
-        return None
-    try:
-        if datetime.fromisoformat(value['expires_at']).tzinfo is None:
-            return None
-    except ValueError:
-        return None
-    return dict(value)
-
-
 def offline_status_fields():
     """Restoration is not application preinstallation or delivery acceptance."""
     return {'system_restored': False, 'applications_preinstalled': False,
@@ -167,7 +142,7 @@ def validated_request(payload, known_names, host_cpu=None, host_memory=None):
         if type(old) is not str or old not in known_names: raise ValueError('只能重建列表中明确选中的 VM')
         registry.validate_name(old)
         if d.get('confirm_name') != old or d.get('acknowledge_erase') is not True:
-            raise ValueError('请完整输入旧 VM 名称并确认永久丢弃旧磁盘和暂停状态')
+            raise ValueError('重建请求必须对应所选旧 VM 并确认永久丢弃旧磁盘和暂停状态')
     elif d.get('source_vm') or d.get('confirm_name') or d.get('acknowledge_erase'):
         raise ValueError('新建操作不能指定待删除的 VM')
     else: d['source_vm'] = None
@@ -472,7 +447,23 @@ def stale_control_socket(path):
     return identity
 
 
-def check_tree(path, *, control_socket_identity=None):
+def legacy_ownership_marker(root, path, info):
+    """True only for a root-owned start marker of the retired guest-ownership helper.
+
+    VMs published before 2026-11-20 keep .guest-ownership/<32 hex>/apply.started
+    and verify.started, written by that root helper with owner 0. Their user-owned
+    directory lets the user remove them; no other foreign-owned entry is accepted.
+    """
+    try:
+        parts = path.relative_to(root).parts
+    except ValueError:
+        return False
+    return (len(parts) == 3 and parts[0] == '.guest-ownership' and re.fullmatch(r'[0-9a-f]{32}', parts[1]) is not None
+            and parts[2] in ('apply.started', 'verify.started') and info.st_uid == 0
+            and stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_size <= 65536)
+
+
+def check_tree(path, *, control_socket_identity=None, legacy_ownership_markers=False):
     registry.safe_path(path)
     device = path.stat().st_dev
     seen_socket = False
@@ -486,7 +477,8 @@ def check_tree(path, *, control_socket_identity=None):
                               and (s.st_dev, s.st_ino) == control_socket_identity and s.st_nlink == 1)
             if allowed_socket:
                 seen_socket = True
-            if s.st_dev != device or s.st_uid != os.getuid() or stat.S_ISLNK(s.st_mode) or not (stat.S_ISDIR(s.st_mode) or stat.S_ISREG(s.st_mode) or allowed_socket):
+            owned = s.st_uid == os.getuid() or (legacy_ownership_markers and legacy_ownership_marker(path, p, s))
+            if s.st_dev != device or not owned or stat.S_ISLNK(s.st_mode) or not (stat.S_ISDIR(s.st_mode) or stat.S_ISREG(s.st_mode) or allowed_socket):
                 raise ValueError('旧 VM 目录含链接、挂载或异常文件；拒绝递归删除')
     if control_socket_identity is not None and not seen_socket:
         raise ValueError('已确认的旧 VM 控制套接字已变化；拒绝清理')

@@ -345,41 +345,16 @@ class ControllerTests(PrivateFixture):
         self.assertEqual((build['failure_code'], build['failed_product'], build['materials_source']),
                          ('download-timeout', 'ccbaga', 'downloaded'))
 
-    def test_paused_authorization_retry_is_public_only_while_waiting(self):
-        retry = {'operation': 'apply', 'reason': 'system-authorization-user-cancelled', 'attempt': 1,
-                 'max_attempts': 3, 'expires_at': '2026-11-18T23:30:00+00:00'}
-        job = {'id': 'a' * 32, 'mode': 'preinstall', 'name': 'paused fixture', 'phase': 'awaiting_system_authorization',
-               'authorization_retry': retry, 'stage_path': '/private/stage/fixture',
+    def test_retired_authorization_pause_never_reaches_the_ui(self):
+        job = {'id': 'a' * 32, 'mode': 'preinstall', 'name': 'old fixture', 'phase': 'awaiting_system_authorization',
+               'authorization_retry': {'operation': 'apply', 'attempt': 1}, 'stage_path': '/private/stage/fixture',
                'vpn_configuration': {'operation_id': 'b' * 32, 'active': True}}
         self.controller.build_status = Mock(return_value=job)
         build = self.controller.state()['build_job']
-        self.assertEqual(build['authorization_retry'], retry)
+        self.assertNotIn('authorization_retry', build)
         self.assertNotIn('vpn_configuration', build)
-        for label, changed in (('dead-worker', dict(job, phase='interrupted')),
-                               ('extra-key', dict(job, authorization_retry=dict(retry, operation_id='b' * 32))),
-                               ('native-text', dict(job, authorization_retry=dict(retry, reason='User canceled. (-128)'))),
-                               ('bad-attempt', dict(job, authorization_retry=dict(retry, attempt=3))),
-                               ('bool-attempt', dict(job, authorization_retry=dict(retry, attempt=True))),
-                               ('bad-time', dict(job, authorization_retry=dict(retry, expires_at='soon'))),
-                               ('not-a-dict', dict(job, authorization_retry='retry'))):
-            with self.subTest(label):
-                self.controller.build_status = Mock(return_value=changed)
-                self.assertNotIn('authorization_retry', self.controller.state()['build_job'])
-
-    def test_authorization_decision_delegates_and_hides_internal_reasons(self):
-        decide = self.start_patch(patch.object(m.oneclick, 'authorization_decision', return_value={
-            'ok': True, 'job_id': 'a' * 32, 'operation': 'apply', 'attempt': 1, 'decision': 'retry'}))
-        value = {'job_id': 'a' * 32, 'attempt': 1, 'decision': 'retry'}
-        self.assertEqual(self.controller.decide_preinstall_authorization(value)['decision'], 'retry')
-        decide.assert_called_once_with(value, state_dir=self.state_dir)
-        for error in (m.oneclick.OneClickError('inert-internal-reason-not-for-ui'), OSError('inert-os-reason')):
-            with self.subTest(error=type(error).__name__):
-                decide.side_effect = error
-                with self.assertRaises(m.AppError) as raised:
-                    self.controller.decide_preinstall_authorization(value)
-                self.assertEqual((raised.exception.code, raised.exception.status),
-                                 ('authorization_decision_rejected', 409))
-                self.assertNotIn('inert', str(raised.exception))
+        self.assertFalse(hasattr(self.controller, 'decide_preinstall_authorization'))
+        self.assertFalse(hasattr(m.oneclick, 'authorization_decision'))
 
     def test_archive_preinstall_delegates_and_hides_internal_reasons(self):
         archive = self.start_patch(patch.object(m.oneclick, 'archive_failed', return_value={
@@ -399,9 +374,9 @@ class ControllerTests(PrivateFixture):
         self.assertEqual(busy.exception.status, 409)
         archive.assert_not_called()
 
-    def preinstalled(self, vm='gold'):
+    def preinstalled(self, vm='gold', version=2):
         base = self.bases[vm]
-        self.write_json(base / 'environment.json', {'version': 2})
+        self.write_json(base / 'environment.json', {'version': version})
         return base
 
     def test_preinstalled_start_requires_own_named_execution_consent(self):
@@ -446,9 +421,28 @@ class ControllerTests(PrivateFixture):
                                                      'first_setup_normal_network': True})
             self.assertTrue(result['ok'])
             self.assertIn('普通网络', result['message'])
+            self.assertNotIn('gold-installers', result['message'], 'v2 VMs have no installers folder')
             fence.assert_called_once_with('gold', base)
             self.assertEqual(self.worker.call_args.kwargs['args'], ('gold', 'start', True, True))
         self.popen.assert_not_called()
+
+    def test_v3_first_setup_names_the_installers_folder_and_writes_nothing_into_the_guest(self):
+        base = self.preinstalled(version=3)
+        with patch.object(self.controller, '_require_preinstall_publication'), \
+                patch.object(m.shares_lib, 'prepare_vm_shares'):
+            result = self.controller.action('gold', {'action': 'start', 'confirm_name': 'gold',
+                                                     'first_setup_normal_network': True})
+        self.assertIn('gold-installers', result['message'])
+        self.assertEqual(self.worker.call_args.kwargs['args'], ('gold', 'start', True, True))
+        gold = next(vm for vm in self.controller.state()['vms'] if vm['id'] == 'gold')
+        self.assertIs(gold['preinstalled']['installers_share'], True)
+        self.assertIs(gold['preinstalled']['configuration_staged'], False)
+        self.assertNotIn('evidence', gold['preinstalled'])
+        self.assertTrue(gold['preinstalled']['first_setup_pending'])
+        self.assertFalse(gold['rebuild_supported'])
+        self.write_json(self.bases['gold'] / 'environment.json', {'version': 4})
+        gold = next(vm for vm in self.controller.state()['vms'] if vm['id'] == 'gold')
+        self.assertIsNone(gold['preinstalled'], 'unknown layouts are not treated as preinstalled')
 
     def test_finished_first_setup_refuses_the_normal_network(self):
         import preinstall_runtime
@@ -741,10 +735,6 @@ class FakeController:
         self.calls.append(('archive-preinstall', value))
         return {'ok': True, 'job_id': '2' * 32, 'name': 'fixture', 'stage_retained': True}
 
-    def decide_preinstall_authorization(self, value):
-        self.calls.append(('authorization-decision', value))
-        return {'ok': True, 'job_id': '2' * 32, 'operation': 'apply', 'attempt': 1, 'decision': 'retry'}
-
     def pick_ipsw(self, value):
         self.calls.append(('ipsw', value))
         return {'ok': True, 'cancelled': True}
@@ -940,16 +930,11 @@ class HTTPSecurityTests(unittest.TestCase):
         self.assertEqual((status, result['stage_retained']), (200, True))
         self.assertEqual(self.fake.calls, [('archive-preinstall', value)])
 
-    def test_authorization_decision_route_requires_authentication_and_same_origin(self):
+    def test_retired_authorization_decision_route_is_gone(self):
         route = '/api/preinstall/authorization'
         value = {'job_id': '2' * 32, 'attempt': 1, 'decision': 'retry'}
-        self.assertEqual(self.request(route, 'POST', value, {'Content-Type': 'application/json'})[0], 403)
-        self.assertEqual(self.request(route, 'POST', value, {**self.auth(), 'Content-Type': 'application/json'})[0], 403)
-        self.assertEqual(self.request(route, 'POST', value, {'Origin': self.origin, 'Content-Type': 'application/json'})[0], 401)
+        self.assertEqual(self.request(route, 'POST', value, self.mutation_headers())[0], 404)
         self.assertEqual(self.fake.calls, [])
-        status, result, _ = self.request(route, 'POST', value, self.mutation_headers())
-        self.assertEqual((status, result['decision']), (200, 'retry'))
-        self.assertEqual(self.fake.calls, [('authorization-decision', value)])
 
     def test_only_vpn_validation_has_a_larger_request_limit(self):
         payload = {'submission': {'input_mode': 'yaml', 'yaml_text': '柴' * 30000}, 'allow_resolve': False}

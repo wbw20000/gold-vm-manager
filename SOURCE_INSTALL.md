@@ -9,7 +9,7 @@ The reviewed platform combination is **Apple Silicon / macOS 26.6.2**, with:
 - Apple Command Line Tools or an explicitly selected Apple Xcode SDK providing `xcrun`, `swiftc`, `codesign` and `lipo`;
 - `/usr/bin/python3` version **3.9 or newer**;
 - system Ruby with `Psych.safe_load`;
-- the complete project checkout, including the parent-owned one-click, offline VPN and guest ownership modules/helpers listed below.
+- the complete project checkout, including the parent-owned one-click module and the restore helper source listed below.
 
 `source_prerequisites()` checks this tuple, CLT selection, system Python, Ruby/Psych and SDK discovery. An unavailable tool or unsupported host fails closed. It does not run `xcode-select --install`, Homebrew, pip, npm, sudo, or any global package installer. Install required Apple developer tools yourself before retrying.
 
@@ -38,44 +38,37 @@ A successful package writes its receipt to the explicitly selected build root's 
 
 [The installer's fixed closure](<install_app.py>) includes all prior manager/lifecycle/share/profile/packet modules plus:
 
-- [VPN parsing](<vpn_config.py>), [VPN storage](<vpn_store.py>), [guest seed generation](<guest_vpn_seed.py>), [material preparation](<preinstall_materials.py>), [host acquisition](<host_artifacts.py>), [host tooling](<host_tools.py>), and [v2 runtime preparation](<preinstall_runtime.py>);
-- required parent-owned [one-click orchestration](<oneclick.py>), [offline VPN](<offline_vpn.py>), [guest ownership](<guest_ownership.py>) (a missing module is a hard error, never silently omitted);
-- all current offline writable/volume/payload/install/recovery/disk/preinstall modules, [guest artifacts](<guest_app_artifacts.py>), [reviewed guest pins](<guest_app_pins.py>) and [quarantine policy](<quarantine_policy.py>);
+- [VPN parsing](<vpn_config.py>), [VPN storage](<vpn_store.py>), [material preparation](<preinstall_materials.py>), [host acquisition](<host_artifacts.py>), [host tooling](<host_tools.py>), and [v2/v3 runtime preparation](<preinstall_runtime.py>);
+- required parent-owned [one-click orchestration](<oneclick.py>) (a missing module is a hard error, never silently omitted);
+- the [volume](<offline_volume.py>) and [payload](<offline_payload.py>) modules used to extract the downloaded DMG/ZIP originals, [guest artifacts](<guest_app_artifacts.py>), [reviewed guest pins](<guest_app_pins.py>) and [quarantine policy](<quarantine_policy.py>). The guest disk writers, ownership helper and first-login seed were removed on 2026-11-20;
 - the original static files plus [preinstall JavaScript](<static/preinstall.js>) and [preinstall CSS](<static/preinstall.css>), and both [YAML](<examples/vpn/clash.yaml>)/[JSON](<examples/vpn/fields.json>) VPN examples;
 - only the fixed three legacy guest setup source files, **not** a broad copy of any locally generated private setup configuration;
-- required Swift source/entitlement inputs and all three newly built local helpers.
+- required Swift source/entitlement inputs and the newly built local restore helper.
 
 An AST pass also rejects a local Python import dependency not present in the declared package closure. Tests provide an entirely isolated fixture checkout containing every declared input; they do not omit parent-owned files merely because those files are still being developed.
 
-The existing native wrapper compilation of [NativeApp](<NativeApp.swift>) **and** [GuestInitialization](<GuestInitialization.swift>) is preserved, including its AppKit/WebKit/ScreenCaptureKit/Vision frameworks. Source and packaged copies are hashed. Nested helpers are signed/verified first; the final wrapper is then locally ad-hoc signed and deep/strict verified; nested helper entitlements are rechecked afterward. Third-party Tart is never included in that re-sign operation.
+The existing native wrapper compilation of [NativeApp](<NativeApp.swift>) **and** [GuestInitialization](<GuestInitialization.swift>) is preserved, including its AppKit/WebKit/ScreenCaptureKit/Vision frameworks. Source and packaged copies are hashed. The nested restore helper is signed/verified first; the final wrapper is then locally ad-hoc signed and deep/strict verified; the helper's entitlements are rechecked afterward. Third-party Tart is never included in that re-sign operation.
 
 ## Local helper compiler interfaces
 
 ```python
-clean_installer, guest_bootstrap = compile_helpers(private_build_root)
-ownership_helper = compile_ownership_helper(private_build_root)
+(clean_installer,) = compile_helpers(private_build_root)
 ```
 
-`compile_helpers` retains its **two-Path tuple** interface:
-
-1. [CleanVMInstaller source](<CleanVMInstaller.swift>) is built for arm64 with Virtualization, signed locally with exactly the [virtualization entitlement](<CleanVMInstaller.entitlements.plist>), and its resulting signature/entitlements are verified.
-2. [GuestVPNBootstrap source](<GuestVPNBootstrap.swift>) is built in **production mode**, with no `-D GOLD_VPN_BOOTSTRAP_FIXTURE`, then locally signed and verified with no added entitlement.
-
-`compile_ownership_helper` separately builds the required parent-owned [ownership helper source](<GuestOwnershipHelper.swift>), returns one Path, and emits an ownership-helper receipt. It adds no entitlements, setuid/setgid bit or authorization action. The parent and helper own the constrained metadata protocol and standard OS administrator-consent flow; packaging does not request root, run that helper, or implement authorization.
+`compile_helpers` returns a one-Path tuple: [CleanVMInstaller source](<CleanVMInstaller.swift>) is built for arm64 with Virtualization, signed locally with exactly the [virtualization entitlement](<CleanVMInstaller.entitlements.plist>), and its resulting signature/entitlements are verified. Nothing is built for, or run in, the guest any more (the first-login bootstrap and the ownership helper were removed on 2026-11-20).
 
 All compiler outputs are new caller-owned executables under private attempts. Local ad-hoc signing uses `--sign - --timestamp=none`; it does not use a signing identity or claim Developer ID/notarization. Helpers are **compiled and statically verified only, never executed**. Per-attempt receipts bind source hashes, output hashes, entitlement checks, production status and no-execution/no-authorization facts. No existing evidence build is reused.
 
 ### Resolve installed helpers without runtime Swift compilation
 
 ```python
-clean_installer, guest_bootstrap = resolve_helpers(resource_root, private_build_root)
-ownership_helper = resolve_ownership_helper(resource_root, private_build_root)
+clean_installer = resolve_helpers(resource_root, private_build_root)
 ```
 
-Use these resolver interfaces in one-click orchestration. `resource_root` is the explicit canonical source/resource directory, not a search path.
+Use this resolver in one-click orchestration. `resource_root` is the explicit canonical source/resource directory, not a search path.
 
-- Fresh builds emit `helpers.portable.json` and `ownership-helper.portable.json`. These records contain only fixed source/binary basenames, source/output hashes, exact arm64 build recipes, empty compiler-define lists, expected entitlements and honest local-ad-hoc/no-notarization/no-execution facts. **No development build path, SDK path, inode or temporary directory is embedded in a portable receipt.**
-- The installer copies those records alongside all three binaries **before** signing the outer wrapper, then calls both resolvers after signing as an installed-app self-check. The outer app's seal protects these resources; it is still only a local ad-hoc integrity seal, not a vendor identity or source-build attestation.
+- Fresh builds emit `helpers.portable.json`. This record contains only fixed source/binary basenames, source/output hashes, exact arm64 build recipes, empty compiler-define lists, expected entitlements and honest local-ad-hoc/no-notarization/no-execution facts. **No development build path, SDK path, inode or temporary directory is embedded in a portable receipt.**
+- The installer copies that record alongside the binary **before** signing the outer wrapper, then calls the resolver after signing as an installed-app self-check. An app built by an older installer carries a two-helper receipt that no longer matches; build a new app instead. The outer app's seal protects these resources; it is still only a local ad-hoc integrity seal, not a vendor identity or source-build attestation.
 - If any candidate binary or its portable receipt exists, the resolver requires the complete corresponding set. It rejects duplicate JSON keys, unknown/altered build recipes, fixture defines, changed binary hashes, wrong architecture/signatures/entitlements and changed optional source hashes. It verifies a containing local wrapper's deep/strict signature when using its normal Resources/app directory. Binaries/receipt metadata and hashes are checked again across verification.
 - A valid binary package needs **no Swift source, SDK lookup, compiler call, build-directory creation or helper execution**. If source files are present, their hashes must match the portable record; their absence does not trigger compilation. Runtime verification uses only static codesign/lipo checks.
 - An unreceipted, incomplete or tampered binary set is never adopted, overwritten, or silently repaired by rebuilding. A packaged app missing its helpers is refused even if Swift source happens to be included. Only a source checkout with no candidate binaries/receipts and all required sources may fall back to a fresh private source build.

@@ -64,12 +64,15 @@ class Spec:
 
 # These are reviewed pins, not a runtime manifest or arbitrary URL API.
 SPECS = MappingProxyType({
-    'gvproxy': Spec(
-        'gvproxy', '0.9.0',
-        'https://github.com/containers/gvisor-tap-vsock/releases/download/v0.9.0/gvproxy-darwin',
-        26951570, 'e2a6825ba789fe588828b418c09aaf16525dec6d8cb2d16c94e72535dd4606be',
-        'gvproxy-darwin', 'publisher-github-release-digest',
-        'https://api.github.com/repos/containers/gvisor-tap-vsock/releases/latest',
+    # Podman's official installer carries gvproxy v0.9.0 (the same upstream tag
+    # commit as the bare release) signed with Red Hat's Developer ID and notarized.
+    # The bare release binary is not notarized, so macOS refuses to run it.
+    'podman-installer': Spec(
+        'podman-installer', '6.2.0',
+        'https://github.com/podman-container-tools/podman/releases/download/v6.2.0/podman-installer-macos-arm64.pkg',
+        76730429, 'b4628a29a4c70bbec757a84d0e429882d358cab18956a0017f99df74b37201a7',
+        'podman-installer-macos-arm64.pkg', 'publisher-github-release-digest',
+        'https://api.github.com/repos/podman-container-tools/podman/releases/tags/v6.2.0',
         ('release-assets.githubusercontent.com',)),
     'tart': Spec(
         'tart', '2.41.1',

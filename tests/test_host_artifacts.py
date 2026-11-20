@@ -23,7 +23,7 @@ BODY = b'tiny inert host artifact fixture; never executable\n'
 SHA = hashlib.sha256(BODY).hexdigest()
 REAL_SPECS = artifacts.SPECS
 REAL_BUILD_OPENER = artifacts._build_opener
-SPEC = dataclasses.replace(REAL_SPECS['gvproxy'], size_bytes=len(BODY), sha256=SHA)
+SPEC = dataclasses.replace(REAL_SPECS['podman-installer'], size_bytes=len(BODY), sha256=SHA)
 CDN = ('https://release-assets.githubusercontent.com/github-production-release-asset/'
        '123456/12345678-1234-1234-1234-123456789abc')
 
@@ -49,7 +49,7 @@ class HostArtifactTests(unittest.TestCase):
         self.opener = mock.Mock()
         self.opener.open.side_effect = lambda *args, **kw: Response()
         # Only tests replace the immutable registry with tiny size/hash fixtures.
-        self.patch(mock.patch.object(artifacts, 'SPECS', MappingProxyType({'gvproxy': SPEC})))
+        self.patch(mock.patch.object(artifacts, 'SPECS', MappingProxyType({'podman-installer': SPEC})))
         self.build = self.patch(mock.patch.object(artifacts, '_build_opener', return_value=self.opener))
         self.quarantine = self.patch(mock.patch.object(artifacts.quarantine_policy, 'ensure',
                                                        side_effect=self.ensure_fixture))
@@ -75,10 +75,10 @@ class HostArtifactTests(unittest.TestCase):
         if response is not None:
             self.opener.open.side_effect = None
             self.opener.open.return_value = response
-        return artifacts.acquire('gvproxy', self.cache, **kwargs)
+        return artifacts.acquire('podman-installer', self.cache, **kwargs)
 
     def attempts(self):
-        return sorted(self.cache.glob('gvproxy-*')) if self.cache.exists() else []
+        return sorted(self.cache.glob('podman-installer-*')) if self.cache.exists() else []
 
     def source(self, payload=BODY):
         path = self.root / 'local.fixture'
@@ -90,10 +90,13 @@ class HostArtifactTests(unittest.TestCase):
         self.quarantine.assert_not_called()
 
     def test_public_registry_pins_and_immutable_types(self):
-        self.assertEqual(set(REAL_SPECS), {'gvproxy', 'tart', 'ipsw'})
-        self.assertEqual(REAL_SPECS['gvproxy'].size_bytes, 26951570)
-        self.assertEqual(REAL_SPECS['gvproxy'].sha256,
-                         'e2a6825ba789fe588828b418c09aaf16525dec6d8cb2d16c94e72535dd4606be')
+        self.assertEqual(set(REAL_SPECS), {'podman-installer', 'tart', 'ipsw'})
+        podman = REAL_SPECS['podman-installer']
+        self.assertEqual((podman.version, podman.size_bytes), ('6.2.0', 76730429))
+        self.assertEqual(podman.sha256, 'b4628a29a4c70bbec757a84d0e429882d358cab18956a0017f99df74b37201a7')
+        self.assertEqual(podman.url, 'https://github.com/podman-container-tools/podman/releases/download/'
+                                     'v6.2.0/podman-installer-macos-arm64.pkg')
+        self.assertNotIn('gvisor-tap-vsock', ' '.join(spec.url for spec in REAL_SPECS.values()))
         self.assertEqual(REAL_SPECS['tart'].version, '2.41.1')
         self.assertEqual(REAL_SPECS['tart'].size_bytes, 22959557)
         self.assertEqual(REAL_SPECS['tart'].sha256,
@@ -153,7 +156,7 @@ class HostArtifactTests(unittest.TestCase):
         events = []
         self.acquire(progress=events.append)
         self.assertEqual({e.phase for e in events}, {'download', 'verify', 'accepted'})
-        self.assertTrue(all(e.total_bytes == len(BODY) and e.spec_key == 'gvproxy' for e in events))
+        self.assertTrue(all(e.total_bytes == len(BODY) and e.spec_key == 'podman-installer' for e in events))
         self.assertEqual(events[-1].completed_bytes, len(BODY))
         with self.assertRaises(dataclasses.FrozenInstanceError):
             events[-1].phase = 'executed'
@@ -447,7 +450,7 @@ class HostArtifactTests(unittest.TestCase):
     def test_local_import_copies_new_inode_and_never_mutates_source(self):
         source = self.source()
         before = source.stat()
-        receipt = artifacts.import_local('gvproxy', source, self.cache)
+        receipt = artifacts.import_local('podman-installer', source, self.cache)
         after = source.stat()
         self.assertEqual((before.st_ino, before.st_mtime_ns, before.st_ctime_ns, before.st_mode),
                          (after.st_ino, after.st_mtime_ns, after.st_ctime_ns, after.st_mode))
@@ -461,7 +464,7 @@ class HostArtifactTests(unittest.TestCase):
     def test_import_verifies_source_even_if_cache_already_accepted(self):
         self.acquire()
         with self.assertRaisesRegex(artifacts.ArtifactError, 'checksum-mismatch'):
-            artifacts.import_local('gvproxy', self.source(b'X' * len(BODY)), self.cache)
+            artifacts.import_local('podman-installer', self.source(b'X' * len(BODY)), self.cache)
         self.assertEqual(len(self.attempts()), 2)
 
     def test_local_import_rejects_symlink_hardlink_fifo_and_directory(self):
@@ -469,17 +472,17 @@ class HostArtifactTests(unittest.TestCase):
         alias = self.root / 'alias'
         alias.symlink_to(source)
         with self.assertRaises(artifacts.ArtifactError):
-            artifacts.import_local('gvproxy', alias, self.cache)
+            artifacts.import_local('podman-installer', alias, self.cache)
         hardlink = self.root / 'hardlink'
         os.link(str(source), str(hardlink))
         with self.assertRaises(artifacts.ArtifactError):
-            artifacts.import_local('gvproxy', source, self.cache)
+            artifacts.import_local('podman-installer', source, self.cache)
         fifo = self.root / 'fifo'
         os.mkfifo(str(fifo))
         with self.assertRaises(artifacts.ArtifactError):
-            artifacts.import_local('gvproxy', fifo, self.cache)
+            artifacts.import_local('podman-installer', fifo, self.cache)
         with self.assertRaises(artifacts.ArtifactError):
-            artifacts.import_local('gvproxy', self.root, self.cache)
+            artifacts.import_local('podman-installer', self.root, self.cache)
         self.assert_not_accepted()
         self.build.assert_not_called()
 
@@ -489,7 +492,7 @@ class HostArtifactTests(unittest.TestCase):
             if event.phase == 'import' and event.completed_bytes:
                 source.write_bytes(b'X' * len(BODY))
         with self.assertRaisesRegex(artifacts.ArtifactError, 'source-changed'):
-            artifacts.import_local('gvproxy', source, self.cache, progress=changed)
+            artifacts.import_local('podman-installer', source, self.cache, progress=changed)
         self.assert_not_accepted()
 
     def test_owner_mismatch_and_private_file_modes_fail_closed(self):
@@ -516,7 +519,7 @@ class HostArtifactTests(unittest.TestCase):
         self.cache.mkdir(mode=0o700)
         target = self.root / 'external'
         target.mkdir(mode=0o700)
-        (self.cache / ('gvproxy-' + 'a' * 32)).symlink_to(target, target_is_directory=True)
+        (self.cache / ('podman-installer-' + 'a' * 32)).symlink_to(target, target_is_directory=True)
         with self.assertRaises(artifacts.ArtifactError):
             self.acquire()
         self.build.assert_not_called()
@@ -533,7 +536,7 @@ class HostArtifactTests(unittest.TestCase):
             os.write(fd, b'X' * len(BODY))
         with mock.patch.object(artifacts, '_copy_source', side_effect=bad_copy):
             with self.assertRaisesRegex(artifacts.ArtifactError, 'checksum-mismatch'):
-                artifacts.import_local('gvproxy', self.source(), self.cache)
+                artifacts.import_local('podman-installer', self.source(), self.cache)
         self.assert_not_accepted()
 
     def test_quarantine_byte_mutation_prevents_acceptance(self):

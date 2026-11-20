@@ -157,8 +157,10 @@ class RuntimeTests(unittest.TestCase):
     def test_source_and_copy_backend_pinned_without_modifying_production_constant(self):
         original = runtime.GV_SHA256
         self.prepare()
-        self.assertEqual(original, 'e2a6825ba789fe588828b418c09aaf16525dec6d8cb2d16c94e72535dd4606be')
+        # Podman 6.2.0's Red Hat-signed, notarized gvproxy v0.9.0, not the bare release.
+        self.assertEqual(original, '45881c33400a14c4c50d4ed7e814b69a60248aa0d78e9b541e879edc05346a85')
         self.assertEqual(runtime.GV_SHA256, original)
+        self.assertEqual(self.meta()['backend_assessment'], runtime.BACKEND_ASSESSMENT)
         self.assertIn(mock.call(self.backend), self.pin.call_args_list)
         self.assertIn(mock.call(self.base / 'gvproxy-darwin'), self.pin.call_args_list)
         self.assertEqual((self.base / 'gvproxy-darwin').read_bytes(), BACKEND)
@@ -171,13 +173,109 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(runtime.RuntimePreparationError, 'backend-quarantine-changed'):
             runtime.validate_environment(self.base)
 
-    def test_absent_source_quarantine_is_not_execution_authorization(self):
-        self.quarantines[str(self.backend)] = None
+    def test_gatekeeper_may_update_the_backend_quarantine_but_never_remove_it(self):
         self.prepare()
-        self.assertIsNone(self.meta()['backend_quarantine_sha256'])
-        self.assertTrue(self.meta()['needs_host_security_authorization'])
-        with self.assertRaisesRegex(runtime.RuntimePreparationError, 'awaiting-host-authorization'):
-            runtime.require_backend_authorization(self.meta(), False)
+        copy = str(self.base / 'gvproxy-darwin')
+        self.quarantines[copy] = b'00c3;0;Fixture;assessed-by-gatekeeper'
+        self.assertEqual(runtime.validate_environment(self.base)['backend_quarantine_sha256'],
+                         hashlib.sha256(Q).hexdigest())
+        self.quarantines[copy] = None
+        with self.assertRaisesRegex(runtime.RuntimePreparationError, 'backend-quarantine-changed'):
+            runtime.validate_environment(self.base)
+
+    def inode_quarantines(self):
+        """Quarantine that follows a file across renames, as a real xattr does."""
+        by_inode = {os.lstat(path).st_ino: value for path, value in self.quarantines.items()
+                    if value is not None and os.path.lexists(path)}
+
+        def lookup(path):
+            return by_inode.get(os.lstat(str(path)).st_ino) if os.path.lexists(str(path)) else None
+
+        def preserve(source, target, expected):
+            self.assertEqual(lookup(source), expected)
+            if expected is not None:
+                by_inode[os.lstat(str(target)).st_ino] = expected
+        return lookup, preserve
+
+    def older_environment(self, backend_present=False):
+        """As left by builds that pinned the unnotarized gvproxy (bb1's case: copy gone)."""
+        self.prepare()
+        meta = self.meta()
+        launcher_copy = b'# GOLD_VM_MANAGER_SHARES_V1\n# GOLD_VM_MANAGER_RECOVERY_V1\n# older launcher copy\n'
+        (self.base / 'launcher.py').write_bytes(launcher_copy)
+        meta['source_sha256']['launcher.py'] = hashlib.sha256(launcher_copy).hexdigest()
+        meta['backend_assessment'] = 'reviewed-sha256-only-adhoc-no-usable-native-signature'
+        meta['source_sha256']['gvproxy-darwin'] = runtime._LEGACY_GV_SHA256
+        if not backend_present:
+            copy = self.base / 'gvproxy-darwin'
+            self.assertEqual(copy.resolve(strict=True), self.expected_root / 'environment/gvproxy-darwin')
+            copy.unlink()
+        (self.base / 'environment.json').write_bytes(runtime._json(meta))
+        return meta
+
+    def test_refresh_moves_an_older_environment_to_the_signed_backend(self):
+        old = self.older_environment()
+        kept = {name: (self.base / name).read_bytes() for name in runtime._KEPT}
+        mailbox = (self.base / 'guest-status').stat().st_ino
+        lookup, preserve = self.inode_quarantines()
+        with mock.patch.object(runtime, '_quarantine', side_effect=lookup), \
+                mock.patch.object(runtime, '_preserve_quarantine', side_effect=preserve):
+            with self.assertRaisesRegex(runtime.RuntimePreparationError, 'invalid-backend-authorization-contract'):
+                runtime.validate_environment(self.base)
+            self.assertEqual(runtime.validate_environment_for_refresh(self.base), old)
+            self.assertTrue(runtime.environment_needs_refresh(self.base))
+            self.assertTrue(runtime.refresh_environment(self.base, self.backend))
+            meta = runtime.validate_environment(self.base)
+            self.assertEqual(lookup(self.base / 'gvproxy-darwin'), Q)  # macOS still assesses it.
+            self.assertFalse(runtime.environment_needs_refresh(self.base))
+            self.assertFalse(runtime.refresh_environment(self.base, self.backend))
+        self.assertEqual({key for key in meta if meta[key] != old[key]}, {'source_sha256', 'backend_assessment'})
+        self.assertEqual(meta['backend_assessment'], runtime.BACKEND_ASSESSMENT)
+        self.assertEqual((self.base / 'launcher.py').read_bytes(), (runtime.HERE / 'protected_launcher.py').read_bytes())
+        self.assertEqual({name: (self.base / name).read_bytes() for name in runtime._KEPT}, kept)
+        self.assertEqual((self.base / 'guest-status').stat().st_ino, mailbox)
+        self.assertEqual(stat.S_IMODE((self.base / 'gvproxy-darwin').stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE((self.base / 'launcher.py').stat().st_mode), 0o700)
+        self.assertFalse([p.name for p in self.base.iterdir() if p.name.startswith('.')])
+        self.run.assert_not_called()
+        self.spawn.assert_not_called()
+
+    def test_refresh_never_repairs_what_it_keeps_or_takes_other_backend_bytes(self):
+        self.older_environment()
+        launcher_copy = (self.base / 'launcher.py').read_bytes()
+        other = self.root / 'other-backend.fixture'
+        other.write_bytes(b'other bytes')
+        other.chmod(0o600)
+        with self.assertRaisesRegex(runtime.RuntimePreparationError, 'reviewed-backend-digest-mismatch'):
+            runtime.refresh_environment(self.base, other)
+        for name in runtime._KEPT:
+            path = self.base / name
+            original = path.read_bytes()
+            with self.subTest(name=name):
+                path.write_bytes(original + b' ')
+                for call in (runtime.environment_needs_refresh, lambda base: runtime.refresh_environment(base, self.backend)):
+                    with self.assertRaisesRegex(runtime.RuntimePreparationError, 'environment-source-integrity-mismatch'):
+                        call(self.base)
+                path.write_bytes(original)
+        self.assertEqual((self.base / 'launcher.py').read_bytes(), launcher_copy)
+        self.assertFalse(os.path.lexists(self.base / 'gvproxy-darwin'))
+        self.assertFalse([p.name for p in self.base.iterdir() if p.name.startswith('.')])
+
+    def test_absent_source_quarantine_blocks_preparation(self):
+        self.quarantines[str(self.backend)] = None
+        with self.assertRaisesRegex(runtime.RuntimePreparationError, 'backend-source-quarantine-required'):
+            self.prepare()
+        self.assertFalse(self.base.exists())
+
+    def test_current_signed_environment_missing_quarantine_is_not_migrated(self):
+        self.prepare()
+        copy = self.base / 'gvproxy-darwin'
+        self.quarantines[str(copy)] = None
+        before = (self.base / 'environment.json').read_bytes()
+        with self.assertRaisesRegex(runtime.RuntimePreparationError, 'backend-quarantine-changed'):
+            runtime.refresh_environment(self.base, self.backend)
+        self.assertEqual((self.base / 'environment.json').read_bytes(), before)
+        self.assertIsNone(self.quarantines[str(copy)])
 
     def test_exact_explicit_tart_and_config_binding_not_home_defaults(self):
         self.prepare()

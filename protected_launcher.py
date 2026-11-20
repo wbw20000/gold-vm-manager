@@ -186,7 +186,8 @@ def main():
     parser.add_argument('--no-graphics', action='store_true')
     parser.add_argument('--recovery', action='store_true')
     parser.add_argument('--acknowledge-reviewed-unsigned-backend', action='store_true',
-                        help='V2 only: explicitly request normal OS execution of the pinned unsigned backend; not a signature approval')
+                        help='V2 only: explicitly request normal OS execution of the pinned backend '
+                             '(Red Hat-signed, notarized gvproxy); macOS still decides; the legacy flag name is kept')
     parser.add_argument('--enable-reviewed-backend-owner-execute', action='store_true',
                         help='V2 only with acknowledgement: make the exact private backend owner-executable; preserve quarantine')
     args = parser.parse_args()

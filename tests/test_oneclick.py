@@ -356,6 +356,9 @@ class WorkerTests(Fixture):
         self.resolve_helpers = self.patch(host_tools, 'resolve_helpers', return_value=(self.installer, self.bootstrap))
         self.patch(host_tools, 'resolve_ownership_helper', return_value=self.ownership)
         self.ensure_tart = self.patch(host_tools, 'ensure_tart', return_value=self.tools)
+        self.podman_package = SimpleNamespace(artifact_path=self.root / 'podman-installer.fixture')
+        self.ensure_gvproxy = self.patch(host_tools, 'ensure_gvproxy',
+                                         return_value=SimpleNamespace(executable_path=self.backend))
         self.acquire = self.patch(host_artifacts, 'acquire', side_effect=self.acquire_fixture)
         image_info = self.image.stat()
         self.image_receipt = SimpleNamespace(artifact_path=self.image, device=image_info.st_dev,
@@ -373,7 +376,8 @@ class WorkerTests(Fixture):
         self.app = self.patch(offline_preinstall, 'preinstall_stage', side_effect=self.app_fixture)
         self.vpn = self.patch(offline_vpn, 'configure_preinstalled_stage', side_effect=self.vpn_fixture)
         self.patch(preinstall_runtime, '_verified_backend', side_effect=self.verify_inert_backend)
-        self.patch(preinstall_runtime, '_quarantine', return_value=None)
+        self.patch(preinstall_runtime, '_quarantine', return_value=b'0083;0;Fixture;package-origin')
+        self.patch(preinstall_runtime, '_preserve_quarantine')  # Simulated xattr; never invoke native tools.
         self.runtime_prepare = self.patch(preinstall_runtime, 'prepare_environment', wraps=preinstall_runtime.prepare_environment)
         self.published_readback = self.patch(preinstall_runtime, 'validate_environment',
                                              side_effect=self.verify_published_environment)
@@ -406,7 +410,7 @@ class WorkerTests(Fixture):
         self.assertEqual(cache, self.state / 'host-materials')
         self.assertEqual(loopback_proxy, self.proxy)
         progress(SimpleNamespace(spec_key=key, completed_bytes=1, total_bytes=2))
-        return {'tart': self.tart_archive, 'gvproxy': SimpleNamespace(artifact_path=self.backend)}[key]
+        return {'tart': self.tart_archive, 'podman-installer': self.podman_package}[key]
 
     def inspect_fixture(self, command, **kwargs):
         if command == ['/usr/sbin/sysctl', '-n', 'hw.memsize']:
@@ -606,6 +610,10 @@ class WorkerTests(Fixture):
         self.assertEqual(status, registry.read_private(self.context.jobdir / 'status.json'))
         self.assert_redacted(status)
         self.assertEqual(self.trace.count(('offline', 'applications')), 1)
+        # Only gvproxy, from Podman's notarized installer; never the bare release binary.
+        self.assertIn('podman-installer', [c.args[0] for c in self.acquire.call_args_list])
+        self.ensure_gvproxy.assert_called_once_with(self.state / 'tools', artifact_receipt=self.podman_package)
+        self.assertEqual(self.runtime_prepare.call_args.kwargs['gvproxy_path'], self.backend)
         self.assertLess(self.trace.index(('installer', 'inspect')), self.trace.index(('installer', 'create')))
         self.assertLess(self.trace.index(('offline', 'applications')), self.trace.index(('offline', 'vpn')))
         self.assertLess(self.trace.index(('status', 'awaiting_system_authorization')), self.trace.index(('status', 'publishing')))
@@ -1193,6 +1201,71 @@ class DeferredWorkerTests(Fixture):
         self.assertTrue(done['recovery_required'])
         self.service.configure.assert_not_called()
         self.service.publish.assert_not_called()
+
+
+class DeferredBackendTests(unittest.TestCase):
+    """The deferred-VPN checkpoint binds the extracted, signed gvproxy copy."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix='gold-deferred-backend-')).resolve()
+        self.addCleanup(shutil.rmtree, str(self.root))
+        self.state = self.root / 'state'
+        self.tool = 'gvproxy-tool-' + 'a' * 32
+        self.path = self.state / 'tools' / self.tool / 'gvproxy'
+        self.path.parent.mkdir(mode=0o700, parents=True)
+        self.path.write_bytes(b'inert fixture backend')
+        self.path.chmod(0o600)
+        self.tart = {'version': 1, 'executable_path': str(self.root / 'tart'), 'executable_sha256': '1' * 64,
+                     'receipt_path': str(self.root / 'receipt')}
+        self.quarantine = b'0083;0;Fixture;package-origin'
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        patch = lambda *a, **k: self.stack.enter_context(mock.patch.object(*a, **k))
+        patch(preinstall_runtime, '_quarantine', side_effect=lambda path: self.quarantine)
+        patch(preinstall_runtime, '_verified_backend', return_value=(b'', None))
+        patch(registry, 'read_private', return_value=self.tart)
+        patch(lifecycle, 'inventory_tool', return_value=Path(self.tart['executable_path']))
+        patch(host_tools, 'resolve_helpers', return_value=(None, None))
+        patch(host_tools, 'resolve_ownership_helper', return_value=None)
+        patch(preinstall_materials, 'MaterialManager')
+        self.acquire = patch(host_artifacts, 'acquire', side_effect=AssertionError('no download'))
+        self.extract = patch(host_tools, 'ensure_gvproxy', side_effect=AssertionError('no extraction'))
+        self.service = oneclick.NativeServices(SimpleNamespace(state=self.state, jobdir=self.root / 'job'))
+
+    def record(self):
+        self.service.backend = SimpleNamespace(executable_path=self.path)
+        self.service.material_attempt_id = 'materials-fixture'
+        return self.service.deferred_materials()
+
+    def test_checkpoint_binds_the_signed_copy_and_its_quarantine(self):
+        record = self.record()
+        self.assertEqual(record['backend'], self.tool)
+        self.service.load_deferred_materials(record)
+        self.assertEqual(self.service.backend.executable_path, self.path)
+        self.quarantine = b'0083;0;Fixture;changed'
+        with self.assertRaisesRegex(oneclick.OneClickError, '^deferred-backend-quarantine-changed$'):
+            self.service.load_deferred_materials(record)
+        self.quarantine = None
+        with self.assertRaisesRegex(oneclick.OneClickError, '^deferred-backend-quarantine-missing$'):
+            self.record()
+        self.service.backend = SimpleNamespace(executable_path=self.root / 'elsewhere' / 'gvproxy')
+        with self.assertRaisesRegex(oneclick.OneClickError, '^backend-path-mismatch$'):
+            self.service.deferred_materials()
+        self.acquire.assert_not_called()
+        self.extract.assert_not_called()
+
+    def test_older_checkpoint_with_the_unnotarized_backend_takes_the_signed_one(self):
+        record = dict(self.record(), backend='gvproxy-' + 'b' * 32)  # As written by an older build.
+        package, signed = object(), SimpleNamespace(executable_path=self.root / 'signed' / 'gvproxy')
+        self.acquire.side_effect, self.acquire.return_value = None, package
+        self.extract.side_effect, self.extract.return_value = None, signed
+        self.service.load_deferred_materials(record)
+        self.acquire.assert_called_once_with('podman-installer', self.state / 'host-materials')
+        self.extract.assert_called_once_with(self.state / 'tools', artifact_receipt=package)
+        self.assertIs(self.service.backend, signed)
+        for bad in ('gvproxy-tool-x', 'other-' + 'a' * 32, 7):
+            with self.subTest(bad=bad), self.assertRaisesRegex(oneclick.OneClickError, '^deferred-material-record-mismatch$'):
+                self.service.load_deferred_materials(dict(record, backend=bad))
 
 
 class ExclusiveRenameTests(Fixture):

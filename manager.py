@@ -409,7 +409,9 @@ class Controller:
         return result
 
     def _require_preinstall_publication(self, vm, base):
-        from preinstall_runtime import validate_environment
+        # Launcher code and backend may still be the older unnotarized set here;
+        # _refresh_runtime replaces them before launch, then the launcher validates all.
+        from preinstall_runtime import validate_environment_for_refresh as validate_environment
         try:
             jid = base.name
             journal = managed_registry.read_private(STATE_DIR / 'build-jobs' / jid / 'commit.json')
@@ -665,8 +667,37 @@ class Controller:
                     'force-stop': '正在强制停止 VM', 'discard-state': '正在丢弃已确认的暂停状态',
                     'focus': '正在打开 VM 窗口', 'recovery-start': '正在以受保护恢复模式启动；未抹盘或更改密码'}[action]}
 
+    def _refresh_runtime(self, vm):
+        """Before a confirmed preinstalled start, move an older environment to the signed backend.
+
+        Environments prepared before 2026-11-19 pinned the unnotarized gvproxy,
+        which macOS refuses to run. Their launcher code and backend are replaced
+        with the current ones and Red Hat's notarized gvproxy (quarantine kept).
+        The VM, its packet-filter policy and receipts are kept and rechecked.
+        """
+        import host_artifacts
+        import host_tools
+        import preinstall_runtime
+        base = self.bases()[vm]
+        try:
+            if not preinstall_runtime.environment_needs_refresh(base):
+                return
+            self.event(vm, 'start', '正在获取 Red Hat 签名并经公证的网络后端（Podman 官方安装包，约 77 MB）；不安装 Podman')
+            package = host_artifacts.acquire('podman-installer', STATE_DIR / 'host-materials')
+            backend = host_tools.ensure_gvproxy(STATE_DIR / 'tools', artifact_receipt=package)
+            if preinstall_runtime.refresh_environment(base, backend.executable_path):
+                self.event(vm, 'start', '已换用签名版网络后端并更新受保护启动文件；VM 磁盘和网络过滤规则未改动')
+        except host_artifacts.ArtifactError as error:
+            raise AppError('无法获取签名版网络后端（' + error.code + '）；未启动 VM。', 'backend_refresh_failed', 409) from None
+        except host_tools.HostToolError as error:
+            raise AppError('签名版网络后端未通过签名或公证核对（' + error.code + '）；未启动 VM。', 'backend_refresh_failed', 409) from None
+        except preinstall_runtime.RuntimePreparationError as error:
+            raise AppError('受保护启动文件未通过核对（' + error.code + '）；未启动 VM。', 'backend_refresh_failed', 409) from None
+
     def _perform(self, vm, action, launch_ack=False):
         try:
+            if launch_ack:
+                self._refresh_runtime(vm)
             if action in ('start', 'recovery-start'):
                 logfile = STATE_DIR / 'logs' / (vm + '-' + datetime.now().strftime('%Y%m%d-%H%M%S') + '.log')
                 if logfile.is_symlink():

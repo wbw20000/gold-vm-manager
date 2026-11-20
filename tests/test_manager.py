@@ -422,6 +422,66 @@ class ControllerTests(PrivateFixture):
             self.assertEqual(self.worker.call_args.kwargs['args'], ('gold', 'start', True))
         self.popen.assert_not_called()
 
+    def test_confirmed_start_moves_an_older_environment_to_the_signed_backend_first(self):
+        import host_artifacts
+        import host_tools
+        import preinstall_runtime
+        base = self.bases['gold']
+        package = SimpleNamespace(artifact_path='package-fixture')
+        backend = SimpleNamespace(executable_path=self.state_dir / 'tools' / 'gvproxy-tool-fixture' / 'gvproxy')
+        steps = []
+        with patch.object(preinstall_runtime, 'environment_needs_refresh', side_effect=lambda b: steps.append(('check', b)) or True), \
+                patch.object(host_artifacts, 'acquire', side_effect=lambda key, root: steps.append(('acquire', key, root)) or package), \
+                patch.object(host_tools, 'ensure_gvproxy', side_effect=lambda root, artifact_receipt: steps.append(
+                    ('extract', root, artifact_receipt)) or backend), \
+                patch.object(preinstall_runtime, 'refresh_environment', side_effect=lambda b, p: steps.append(('refresh', b, p)) or True):
+            self.controller._refresh_runtime('gold')
+        self.assertEqual(steps, [('check', base), ('acquire', 'podman-installer', self.state_dir / 'host-materials'),
+                                 ('extract', self.state_dir / 'tools', package), ('refresh', base, backend.executable_path)])
+        with patch.object(preinstall_runtime, 'environment_needs_refresh', return_value=False), \
+                patch.object(host_artifacts, 'acquire', side_effect=AssertionError('no download for a current environment')):
+            self.controller._refresh_runtime('gold')
+        for module, name, error in ((host_artifacts, 'acquire', host_artifacts.ArtifactError('download-timeout')),
+                                    (host_tools, 'ensure_gvproxy', host_tools.HostToolError('gvproxy-notarization-required')),
+                                    (preinstall_runtime, 'refresh_environment',
+                                     preinstall_runtime.RuntimePreparationError('environment-source-integrity-mismatch'))):
+            with self.subTest(code=error.code), patch.object(preinstall_runtime, 'environment_needs_refresh', return_value=True), \
+                    patch.object(host_artifacts, 'acquire', return_value=package), \
+                    patch.object(host_tools, 'ensure_gvproxy', return_value=backend), \
+                    patch.object(preinstall_runtime, 'refresh_environment', return_value=True), \
+                    patch.object(module, name, side_effect=error), self.assertRaises(m.AppError) as raised:
+                self.controller._refresh_runtime('gold')
+            self.assertEqual((raised.exception.code, raised.exception.status), ('backend_refresh_failed', 409))
+            self.assertIn(error.code, str(raised.exception))
+
+    def test_runtime_refresh_failure_never_launches(self):
+        (self.state_dir / 'logs').mkdir(mode=0o700, exist_ok=True)
+        refusal = m.AppError('fixture refresh refusal', 'backend_refresh_failed', 409)
+        with patch.object(self.controller, '_refresh_runtime', side_effect=refusal) as refresh:
+            self.controller._perform('gold', 'start', True)
+        refresh.assert_called_once_with('gold')
+        self.popen.assert_not_called()
+        self.assertEqual(self.controller.errors['gold'], 'fixture refresh refusal')
+        with patch.object(self.controller, '_refresh_runtime') as refresh:
+            self.controller._perform('gold', 'start')  # Only a confirmed preinstalled start refreshes.
+        refresh.assert_not_called()
+
+    def test_publication_check_accepts_an_environment_that_still_needs_refresh(self):
+        import preinstall_runtime
+        base = self.bases['gold']
+        jid = 'c' * 32
+        base = base.parent / jid
+        base.mkdir(mode=0o700)
+        (self.state_dir / 'build-jobs' / jid).mkdir(mode=0o700, parents=True)
+        self.write_json(self.state_dir / 'build-jobs' / jid / 'commit.json', {
+            'version': 1, 'phase': 'committed_new_registered', 'id': jid, 'mode': 'preinstall', 'name': 'gold',
+            'source_vm': None, 'environment_id': jid, 'target': str(self.vm_root / 'gold')})
+        meta = {'vm_name': 'gold', 'vm_config': str(self.vm_root / 'gold' / 'config.json')}
+        with patch.object(preinstall_runtime, 'validate_environment_for_refresh', return_value=meta) as kept, \
+                patch.object(preinstall_runtime, 'validate_environment', side_effect=AssertionError('backend not yet current')):
+            self.controller._require_preinstall_publication('gold', base)
+        kept.assert_called_once_with(base)
+
     def test_validation_binds_only_an_explicit_submission_without_resolving(self):
         payload = {'submission': {'input_mode': 'fields', 'nodes': [{'type': 'trojan',
             'server': '8.8.8.8', 'port': 443, 'password': 'fixture-only', 'sni': 'example.com'}]},

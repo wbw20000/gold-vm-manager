@@ -186,7 +186,7 @@ def capabilities():
                              for m in reviewed_manifests() for a in m.expected_apps],
             'source_prerequisites': prerequisites,
             'limitations': ['下载/复制失败保留材料，不自动续传或覆盖重试。',
-                            '首次启动另行确认；原版 gvproxy 未公证，默认禁止启动，需单独安全确认。',
+                            '首次启动另行确认；网络后端 gvproxy 取自 Podman 官方安装包（Red Hat 签名、已公证，不安装 Podman），保留隔离属性，由 macOS 自行核验。',
                             '配置导入、系统授权、桌面验收和 VPN 连通分别记录；未提供真实节点不能验收连通。']}
 
 
@@ -399,7 +399,9 @@ class NativeServices:
         options = {'loopback_proxy': request['download_loopback_proxy'], 'progress': progress}
         tart_archive = host_artifacts.acquire('tart', c.state / 'host-materials', **options)
         self.tart = host_tools.ensure_tart(c.state / 'tools', artifact_receipt=tart_archive)
-        self.backend = host_artifacts.acquire('gvproxy', c.state / 'host-materials', **options)
+        # Only gvproxy is taken from Podman's notarized installer; Podman itself is never installed.
+        backend_package = host_artifacts.acquire('podman-installer', c.state / 'host-materials', **options)
+        self.backend = host_tools.ensure_gvproxy(c.state / 'tools', artifact_receipt=backend_package)
         if request['ipsw'] == 'reviewed':
             self.ipsw = host_artifacts.acquire('ipsw', c.state / 'host-materials', **options)
         else:
@@ -439,16 +441,15 @@ class NativeServices:
             'receipt_path': str(self.tart.receipt_path)})
 
     def deferred_materials(self):
-        import host_artifacts
         from preinstall_runtime import _qhash, _quarantine
         c = self.context
-        attempt = self.backend.attempt_id
-        _need(type(attempt) is str and re.fullmatch(r'gvproxy-[0-9a-f]{32}', attempt), 'invalid-backend-attempt')
-        path = c.state / 'host-materials' / attempt / host_artifacts.SPECS['gvproxy'].filename
-        _need(Path(self.backend.artifact_path) == path, 'backend-path-mismatch')
+        path = Path(self.backend.executable_path)
+        tool = path.parent.name
+        _need(re.fullmatch(r'gvproxy-tool-[0-9a-f]{32}', tool) and path == c.state / 'tools' / tool / 'gvproxy',
+              'backend-path-mismatch')
         quarantine = _quarantine(path)
         _need(quarantine is not None, 'deferred-backend-quarantine-missing')
-        return {'applications': self.material_attempt_id, 'backend': attempt, 'backend_stamp': list(_stamp(path)),
+        return {'applications': self.material_attempt_id, 'backend': tool, 'backend_stamp': list(_stamp(path)),
                 'backend_quarantine': _qhash(quarantine), 'tart': registry.read_private(c.state / 'tart-tool.json')}
 
     def load_deferred_materials(self, value):
@@ -460,18 +461,24 @@ class NativeServices:
         c = self.context
         _need(type(value) is dict and set(value) == {'applications','backend','backend_stamp','backend_quarantine','tart'}
               and type(value['tart']) is dict and value['tart'] == registry.read_private(c.state / 'tart-tool.json')
-              and type(value['backend']) is str and re.fullmatch(r'gvproxy-[0-9a-f]{32}', value['backend']),
+              and type(value['backend']) is str and re.fullmatch(r'gvproxy-(tool-)?[0-9a-f]{32}', value['backend']),
               'deferred-material-record-mismatch')
         tart = lifecycle.inventory_tool(state_dir=c.state)
         _need(tart is not None and str(tart) == value['tart'].get('executable_path'), 'deferred-tart-changed')
         self.tart = SimpleNamespace(executable_path=tart)
-        path = c.state / 'host-materials' / value['backend'] / host_artifacts.SPECS['gvproxy'].filename
-        _need(list(_stamp(path)) == value['backend_stamp'], 'deferred-backend-changed')
-        _verified_backend(path)
-        q = _quarantine(path)
-        _need(q is not None and _qhash(q) == value['backend_quarantine'] and list(_stamp(path)) == value['backend_stamp'],
-              'deferred-backend-quarantine-changed')
-        self.backend = SimpleNamespace(artifact_path=path)
+        if not value['backend'].startswith('gvproxy-tool-'):
+            # Recorded by an older build with the unnotarized release gvproxy, which
+            # macOS refuses to run. Take the same upstream v0.9.0, signed and notarized.
+            package = host_artifacts.acquire('podman-installer', c.state / 'host-materials')
+            self.backend = host_tools.ensure_gvproxy(c.state / 'tools', artifact_receipt=package)
+        else:
+            path = c.state / 'tools' / value['backend'] / 'gvproxy'
+            _need(list(_stamp(path)) == value['backend_stamp'], 'deferred-backend-changed')
+            _verified_backend(path)
+            q = _quarantine(path)
+            _need(q is not None and _qhash(q) == value['backend_quarantine'] and list(_stamp(path)) == value['backend_stamp'],
+                  'deferred-backend-quarantine-changed')
+            self.backend = SimpleNamespace(executable_path=path)
         _, self.bootstrap = host_tools.resolve_helpers(HERE, c.jobdir / 'build')
         self.ownership = host_tools.resolve_ownership_helper(HERE, c.jobdir / 'build')
         self.materials = MaterialManager(c.state / 'application-materials').load(value['applications'])
@@ -558,7 +565,7 @@ class NativeServices:
         return prepare_environment(request['name'], c.stage / 'config.json', c.base,
                                    published_vm_config=c.tart_home / 'vms' / request['name'] / 'config.json',
                                    private_config=stored.private_config, endpoints=stored.endpoints,
-                                   gvproxy_path=Path(self.backend.artifact_path), tart_path=self.tart.executable_path,
+                                   gvproxy_path=Path(self.backend.executable_path), tart_path=self.tart.executable_path,
                                    preinstall_receipt=c.stage / '.offline-preinstall.complete.json',
                                    vpn_seed_receipt=c.stage / '.offline-vpn.complete.json')
 

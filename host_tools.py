@@ -1,6 +1,6 @@
 """Reviewed host tools and local-source builds; never run Tart, gvproxy or a VM.
 
-Third-party Tart is only statically assessed, never re-signed. Local project code
+Third-party Tart and gvproxy are only statically assessed, never re-signed. Local project code
 may be compiled/ad-hoc signed; that is not Developer ID or notarization.
 """
 from contextlib import contextmanager
@@ -17,6 +17,7 @@ import platform
 import plistlib
 import pwd
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -32,6 +33,15 @@ HERE = Path(__file__).absolute().parent
 TART_VERSION = '2.41.1'
 TART_TEAM = '9M2P8L4D89'
 TART_IDENTIFIER = 'com.github.cirruslabs.tart'
+# gvproxy comes only from Podman's pinned, notarized installer package: upstream
+# v0.9.0 (tag commit 6dbb5d4f) built and signed by Red Hat. The package is
+# expanded, never installed; only this one binary is kept.
+GVPROXY_VERSION = '0.9.0'
+GVPROXY_TEAM = 'HYSCB8KRL2'
+GVPROXY_IDENTIFIER = 'gvproxy'
+GVPROXY_SHA256 = '45881c33400a14c4c50d4ed7e814b69a60248aa0d78e9b541e879edc05346a85'
+GVPROXY_SIZE = 27024976
+_GVPROXY_PAYLOAD = 'podman.pkg/Payload/podman/bin/gvproxy'
 MAX_ENTRIES = 20000
 MAX_EXPANDED_BYTES = 512 * 1024 * 1024
 MAX_FILE_BYTES = 256 * 1024 * 1024
@@ -211,7 +221,8 @@ def _system_compiler_temp():
 
 def _tool(argv, timeout=120, build_directory=None):
     _need(argv[0] in ('/usr/bin/xcrun', '/usr/bin/xcode-select', '/usr/bin/python3', '/usr/bin/ruby',
-                     '/usr/bin/codesign', '/usr/bin/lipo', '/usr/bin/getconf', '/usr/sbin/spctl'), 'unsupported-native-tool')
+                     '/usr/bin/codesign', '/usr/bin/lipo', '/usr/bin/getconf', '/usr/sbin/spctl',
+                     '/usr/sbin/pkgutil'), 'unsupported-native-tool')
     # The native SDK driver requires a legitimate OS account HOME. Looking up
     # that account field is not profile/keychain harvesting; no home files are
     # read/copied by this module and no ambient auth/proxy/loader env is retained.
@@ -712,19 +723,23 @@ def _reviewed_tart_spec():
     return host_artifacts.SPECS['tart']
 
 
+def _reviewed_podman_spec():
+    return host_artifacts.SPECS['podman-installer']
+
+
 @contextmanager
-def _archive_source(receipt):
+def _archive_source(receipt, key='tart'):
     _need(type(receipt) is host_artifacts.Receipt, 'host-artifact-receipt-required')
-    spec = _reviewed_tart_spec()
-    _need(receipt.spec_key == 'tart' and receipt.spec_sha256 == spec.spec_sha256
+    spec = _reviewed_tart_spec() if key == 'tart' else _reviewed_podman_spec()
+    _need(receipt.spec_key == key and receipt.spec_sha256 == spec.spec_sha256
           and receipt.version == spec.version and receipt.sha256 == spec.sha256
           and receipt.size_bytes == spec.size_bytes and receipt.digest_verified is True
           and receipt.quarantine_ensured is True and receipt.native_execution_approved is False,
-          'reviewed-tart-receipt-required')
+          'reviewed-tart-receipt-required' if key == 'tart' else 'reviewed-podman-receipt-required')
     path = _path(receipt.artifact_path)
     _private_root(path.parent)
     _need(path.name == spec.filename and path.parent.name == receipt.attempt_id
-          and re.fullmatch(r'tart-[0-9a-f]{32}', receipt.attempt_id)
+          and re.fullmatch(re.escape(key) + r'-[0-9a-f]{32}', receipt.attempt_id)
           and receipt.receipt_path == str(path.parent / 'receipt.json')
           and receipt.acceptance_path == str(path.parent / 'accepted.json'), 'invalid-receipt-path')
     accepted = _read(Path(receipt.acceptance_path), private=True)
@@ -734,7 +749,9 @@ def _archive_source(receipt):
               dataclasses.replace(receipt, quarantine_ensured=False))), 'durable-receipt-mismatch')
     fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # A reader's shared lock still excludes writers. pkgutil takes its own
+        # shared lock on a package and would block forever behind an exclusive one.
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
         before = os.fstat(fd)
         _regular(before, True)
         _need((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
@@ -864,3 +881,100 @@ def ensure_tart(private_tools_root, *, artifact_receipt=None, existing_tart=None
         raise
     except Exception:
         raise HostToolError('tart-preparation-failed') from None
+
+
+@dataclasses.dataclass(frozen=True)
+class GvproxyReceipt:
+    executable_path: Path
+    receipt_path: Path
+    version: str
+    team_id: str
+    executable_sha256: str
+    package_sha256: str
+    notarized: bool
+    execution_performed: bool = False
+
+
+def _verify_podman_package(package):
+    checked = _tool(['/usr/sbin/pkgutil', '--check-signature', str(package)])
+    text = (checked.stdout + checked.stderr).decode('utf-8', 'replace')
+    _need(re.search(r'^\s*Status: signed by a developer certificate issued by Apple for distribution\s*$', text, re.M)
+          and re.search(r'^\s*Notarization: trusted by the Apple notary service\s*$', text, re.M)
+          and re.search(r'^\s*1\. Developer ID Installer: Red Hat, Inc\. \(%s\)\s*$' % GVPROXY_TEAM, text, re.M),
+          'podman-package-signature-required')
+    # -vv (not --verbose=N) is what prints the origin line.
+    assessment = _tool(['/usr/sbin/spctl', '--assess', '--type', 'install', '-vv', str(package)])
+    verdict = (assessment.stdout + assessment.stderr).decode('utf-8', 'replace')
+    _need(re.search(r': accepted\s*$', verdict, re.M)
+          and re.search(r'^source=Notarized Developer ID\s*$', verdict, re.M)
+          and re.search(r'^origin=Developer ID Installer: Red Hat, Inc\. \(%s\)\s*$' % GVPROXY_TEAM, verdict, re.M),
+          'podman-package-notarization-required')
+
+
+def verify_gvproxy(binary):
+    """Static Developer ID and notarization assessment of the pinned gvproxy; never runs it."""
+    binary = _path(binary)
+    before = _digest(binary, cap=GVPROXY_SIZE)
+    _need(before == GVPROXY_SHA256, 'reviewed-gvproxy-digest-mismatch')
+    requirement = ('=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists '
+                   'and certificate leaf[field.1.2.840.113635.100.6.1.13] exists '
+                   'and certificate leaf[subject.OU] = "%s" and identifier "%s"'
+                   % (GVPROXY_TEAM, GVPROXY_IDENTIFIER))
+    _tool(['/usr/bin/codesign', '--verify', '--strict', '-R', requirement, str(binary)])
+    display = _tool(['/usr/bin/codesign', '--display', '--verbose=4', str(binary)])
+    signature = (display.stdout + display.stderr).decode('utf-8', 'replace')
+    _need(re.findall(r'^TeamIdentifier=(.+)$', signature, re.M) == [GVPROXY_TEAM]
+          and re.findall(r'^Identifier=(.+)$', signature, re.M) == [GVPROXY_IDENTIFIER]
+          and re.findall(r'^Authority=Developer ID Application: (.+)$', signature, re.M)
+          == ['Red Hat, Inc. (%s)' % GVPROXY_TEAM], 'gvproxy-signing-identity-mismatch')
+    # A command-line tool is "not an app" to the execute assessment; this is the
+    # standalone-code assessment Gatekeeper applies to it.
+    assessment = _tool(['/usr/sbin/spctl', '--assess', '--type', 'open', '--context',
+                        'context:primary-signature', '-vv', str(binary)])
+    verdict = (assessment.stdout + assessment.stderr).decode('utf-8', 'replace')
+    _need(re.search(r': accepted\s*$', verdict, re.M)
+          and re.search(r'^source=Notarized Developer ID\s*$', verdict, re.M)
+          and re.search(r'^origin=Developer ID Application: Red Hat, Inc\. \(%s\)\s*$' % GVPROXY_TEAM, verdict, re.M),
+          'gvproxy-notarization-required')
+    _need(_digest(binary, cap=GVPROXY_SIZE) == before, 'gvproxy-changed-during-verification')
+    return before
+
+
+def ensure_gvproxy(private_tools_root, *, artifact_receipt):
+    """Take only gvproxy from Podman's pinned, notarized installer; never install it.
+
+    The package's quarantine is propagated onto the copy, so macOS still makes
+    its own decision when the launcher runs it. The copy is 0600: only the
+    launcher's confirmed owner-execute step makes it executable.
+    """
+    try:
+        root = _attempt(private_tools_root, 'gvproxy-tool')
+        expanded = root / 'expanded'
+        binary = root / 'gvproxy'
+        try:
+            with _archive_source(artifact_receipt, 'podman-installer') as (package, _stream, package_sha):
+                _verify_podman_package(package)
+                _tool(['/usr/sbin/pkgutil', '--expand-full', str(package), str(expanded)], timeout=600)
+                source = _path(expanded / _GVPROXY_PAYLOAD)
+                _need(source.lstat().st_size == GVPROXY_SIZE, 'reviewed-gvproxy-size-mismatch')
+                raw = _read(source, cap=GVPROXY_SIZE)
+                _need(_sha(raw) == GVPROXY_SHA256, 'reviewed-gvproxy-digest-mismatch')
+                _write(binary, raw)
+                quarantine_policy.propagate(package, binary)
+        finally:
+            # Only this call's own expansion of the rest of the package (Podman
+            # itself, vfkit, krunkit). Nothing else is ever removed.
+            if expanded.exists() and not expanded.is_symlink():
+                shutil.rmtree(str(expanded), ignore_errors=True)
+        digest = verify_gvproxy(binary)
+        receipt = GvproxyReceipt(binary, root / 'gvproxy.json', GVPROXY_VERSION, GVPROXY_TEAM,
+                                 digest, package_sha, True)
+        value = dataclasses.asdict(receipt)
+        for key in ('executable_path', 'receipt_path'):
+            value[key] = str(value[key])
+        _write(receipt.receipt_path, _json(value))
+        return receipt
+    except HostToolError:
+        raise
+    except Exception:
+        raise HostToolError('gvproxy-preparation-failed') from None

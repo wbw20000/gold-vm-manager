@@ -675,5 +675,146 @@ class HostToolFixtures(unittest.TestCase):
             self.assertNotIn(forbidden, source)
 
 
+
+class GvproxyToolTests(unittest.TestCase):
+    """Podman's installer is only expanded and assessed with mocked native tools."""
+
+    BINARY = b'inert gvproxy fixture; never execute'
+    TEAM = tools.GVPROXY_TEAM
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix='gold-host-tools-fixture-')).resolve()
+        self.root.chmod(0o700)
+        self.addCleanup(shutil.rmtree, str(self.root))
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.package = self.root / 'podman-installer-macos-arm64.pkg'
+        self.package.write_bytes(b'inert package fixture')
+        self.package.chmod(0o600)
+        self.payload = self.BINARY
+        self.signature = ('Package "podman-installer-macos-arm64.pkg":\n'
+                          '   Status: signed by a developer certificate issued by Apple for distribution\n'
+                          '   Notarization: trusted by the Apple notary service\n'
+                          '   Certificate Chain:\n'
+                          '    1. Developer ID Installer: Red Hat, Inc. (%s)\n' % self.TEAM)
+        self.install_verdict = ': accepted\nsource=Notarized Developer ID\norigin=Developer ID Installer: Red Hat, Inc. (%s)\n' % self.TEAM
+        self.display = 'Identifier=gvproxy\nTeamIdentifier=%s\nAuthority=Developer ID Application: Red Hat, Inc. (%s)\n' % (self.TEAM, self.TEAM)
+        self.open_verdict = ': accepted\nsource=Notarized Developer ID\norigin=Developer ID Application: Red Hat, Inc. (%s)\n' % self.TEAM
+        self.calls = []
+        self.stack.enter_context(mock.patch.object(tools, 'GVPROXY_SHA256', hashlib.sha256(self.BINARY).hexdigest()))
+        self.stack.enter_context(mock.patch.object(tools, 'GVPROXY_SIZE', len(self.BINARY)))
+        self.stack.enter_context(mock.patch.object(tools, '_tool', side_effect=self.tool))
+        self.stack.enter_context(mock.patch.object(tools, '_archive_source', side_effect=self.source))
+        self.propagate = self.stack.enter_context(mock.patch.object(tools.quarantine_policy, 'propagate'))
+        self.stack.enter_context(mock.patch('subprocess.run', side_effect=AssertionError('real native forbidden')))
+        self.stack.enter_context(mock.patch('subprocess.Popen', side_effect=AssertionError('no process launch')))
+
+    @contextmanager
+    def source(self, receipt, key='tart'):
+        self.assertEqual(key, 'podman-installer')
+        with self.package.open('rb') as stream:
+            yield self.package, stream, 'f' * 64
+
+    def tool(self, argv, timeout=120, build_directory=None):
+        self.calls.append(list(argv))
+        out = err = ''
+        if argv[:2] == ['/usr/sbin/pkgutil', '--check-signature']:
+            out = self.signature
+        elif argv[:2] == ['/usr/sbin/pkgutil', '--expand-full']:
+            destination = Path(argv[3])
+            self.assertFalse(destination.exists())
+            binary = destination / 'podman.pkg' / 'Payload' / 'podman' / 'bin' / 'gvproxy'
+            binary.parent.mkdir(mode=0o755, parents=True)
+            binary.write_bytes(self.payload)
+            binary.chmod(0o755)
+            (binary.parent / 'podman').write_bytes(b'inert podman fixture; never installed')
+        elif argv[0] == '/usr/sbin/spctl' and '--type' in argv and argv[argv.index('--type') + 1] == 'install':
+            err = argv[-1] + self.install_verdict
+        elif argv[0] == '/usr/sbin/spctl':
+            self.assertEqual(argv[argv.index('--type') + 1], 'open')
+            self.assertIn('context:primary-signature', argv)
+            err = argv[-1] + self.open_verdict
+        elif argv[0] == '/usr/bin/codesign' and '--display' in argv:
+            err = self.display
+        elif argv[0] == '/usr/bin/codesign':
+            self.assertIn('--verify', argv)
+        else:
+            self.fail('unexpected native tool')
+        return SimpleNamespace(returncode=0, stdout=out.encode(), stderr=err.encode())
+
+    def ensure(self):
+        return tools.ensure_gvproxy(self.root / 'tools', artifact_receipt=object())
+
+    def test_only_gvproxy_is_taken_from_the_signed_package_without_installing(self):
+        result = self.ensure()
+        binary = Path(result.executable_path)
+        self.assertEqual(binary.read_bytes(), self.BINARY)
+        self.assertEqual(stat.S_IMODE(binary.stat().st_mode), 0o600)  # Executable only after confirmation.
+        self.assertEqual(sorted(p.name for p in binary.parent.iterdir()), ['gvproxy', 'gvproxy.json'])
+        self.assertEqual((result.team_id, result.version, result.notarized, result.execution_performed),
+                         (self.TEAM, '0.9.0', True, False))
+        self.assertEqual(json.loads(Path(result.receipt_path).read_text())['executable_sha256'],
+                         hashlib.sha256(self.BINARY).hexdigest())
+        self.propagate.assert_called_once_with(self.package, binary)
+        steps = [c[:2] for c in self.calls]
+        self.assertEqual(steps[:3], [['/usr/sbin/pkgutil', '--check-signature'], ['/usr/sbin/spctl', '--assess'],
+                                     ['/usr/sbin/pkgutil', '--expand-full']])
+        requirement = next(c[c.index('-R') + 1] for c in self.calls if '-R' in c)
+        self.assertIn('certificate leaf[subject.OU] = "%s" and identifier "gvproxy"' % self.TEAM, requirement)
+
+    def test_package_without_red_hat_signature_or_notarization_is_never_expanded(self):
+        good_signature, good_verdict = self.signature, self.install_verdict
+        for signature, verdict, code in (
+                (good_signature.replace('   Notarization: trusted by the Apple notary service\n', ''), good_verdict,
+                 'podman-package-signature-required'),
+                (good_signature.replace('Red Hat, Inc. (%s)' % self.TEAM, 'Someone Else (ABCDE12345)'), good_verdict,
+                 'podman-package-signature-required'),
+                (good_signature, good_verdict.replace('Notarized Developer ID', 'Developer ID'),
+                 'podman-package-notarization-required'),
+                (good_signature, good_verdict.replace('Red Hat, Inc.', 'Other, Inc.'), 'podman-package-notarization-required')):
+            with self.subTest(code=code):
+                self.signature, self.install_verdict, self.calls = signature, verdict, []
+                with self.assertRaisesRegex(tools.HostToolError, '^' + code + '$'):
+                    self.ensure()
+                self.assertNotIn(['/usr/sbin/pkgutil', '--expand-full'], [c[:2] for c in self.calls])
+        self.assertFalse(list((self.root / 'tools').glob('*/gvproxy')))
+
+    def test_other_bytes_identity_or_unnotarized_binary_is_refused(self):
+        cases = (('payload', self.BINARY[:-1] + b'X', 'reviewed-gvproxy-digest-mismatch'),
+                 ('payload', self.BINARY + b'X', 'reviewed-gvproxy-size-mismatch'),
+                 ('display', self.display.replace('TeamIdentifier=' + self.TEAM, 'TeamIdentifier=ABCDE12345'),
+                  'gvproxy-signing-identity-mismatch'),
+                 ('display', self.display.replace('Identifier=gvproxy\n', 'Identifier=other\n'), 'gvproxy-signing-identity-mismatch'),
+                 ('open_verdict', self.open_verdict.replace('Notarized Developer ID', 'Developer ID'),
+                  'gvproxy-notarization-required'))
+        for attribute, value, code in cases:
+            with self.subTest(code=code, attribute=attribute):
+                original = getattr(self, attribute)
+                setattr(self, attribute, value)
+                try:
+                    with self.assertRaisesRegex(tools.HostToolError, '^' + code + '$'):
+                        self.ensure()
+                finally:
+                    setattr(self, attribute, original)
+        self.assertFalse(list((self.root / 'tools').glob('*/expanded')))  # Never retained.
+        self.assertFalse(list((self.root / 'tools').glob('*/gvproxy.json')))
+
+    def test_only_the_reviewed_podman_receipt_is_accepted(self):
+        self.stack.close()  # Real _archive_source and pins; nothing native may run.
+        tart = host_artifacts.SPECS['tart']
+        receipt = host_artifacts.Receipt(
+            spec_key='tart', spec_sha256=tart.spec_sha256, version=tart.version, artifact_path=str(self.package),
+            receipt_path='', acceptance_path='', attempt_id='tart-' + 'a' * 32, size_bytes=tart.size_bytes,
+            sha256=tart.sha256, source_kind='download', source_url=tart.url, final_host='github.com',
+            hash_provenance=tart.hash_provenance, device=0, inode=0, mtime_ns=0, quarantine_ensured=True)
+        with mock.patch.object(tools, '_tool', side_effect=AssertionError('no native tool')):
+            for value in (receipt, object()):
+                with self.subTest(value=type(value).__name__), self.assertRaises(tools.HostToolError) as raised:
+                    tools.ensure_gvproxy(self.root / 'tools', artifact_receipt=value)
+                self.assertIn(raised.exception.code, ('reviewed-podman-receipt-required', 'host-artifact-receipt-required'))
+        self.assertEqual((tools.GVPROXY_TEAM, tools.GVPROXY_SHA256),
+                         ('HYSCB8KRL2', '45881c33400a14c4c50d4ed7e814b69a60248aa0d78e9b541e879edc05346a85'))
+
+
 if __name__ == '__main__':
     unittest.main()

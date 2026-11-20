@@ -12,8 +12,19 @@ from pathlib import Path
 import re
 import stat
 import unicodedata
+import uuid
 
-GV_SHA256 = 'e2a6825ba789fe588828b418c09aaf16525dec6d8cb2d16c94e72535dd4606be'
+# gvproxy v0.9.0 from Podman 6.2.0's installer: Red Hat Developer ID, notarized
+# (host_tools.ensure_gvproxy). Environments prepared before 2026-11-19 pinned the
+# bare, unnotarized release binary, which macOS refuses to run while quarantined;
+# refresh_environment moves them to this one.
+GV_SHA256 = '45881c33400a14c4c50d4ed7e814b69a60248aa0d78e9b541e879edc05346a85'
+_LEGACY_GV_SHA256 = 'e2a6825ba789fe588828b418c09aaf16525dec6d8cb2d16c94e72535dd4606be'
+BACKEND_ASSESSMENT = 'developer-id-notarized-HYSCB8KRL2'
+_UNNOTARIZED_ASSESSMENT = 'reviewed-sha256-only-adhoc-no-usable-native-signature'
+# What a refresh keeps and still requires intact; everything else in the
+# manifest is replaced from the current checkout and the pinned backend.
+_KEPT = ('policy.json', 'preinstall-receipt.json', 'vpn-seed-receipt.json')
 PACKET_SHA256 = '3feded0b8521c8c1f71b880731c18b53f00df64162e114b7c6936474851da10a'
 HERE = Path(__file__).absolute().parent
 _SOURCE_NAMES = {
@@ -257,6 +268,15 @@ def _qhash(value):
     return None if value is None else _sha(value)
 
 
+def _quarantine_kept(path, meta):
+    # Gatekeeper may update the flags once it has assessed the notarized backend.
+    # The signed backend must retain quarantine. Record the original digest,
+    # but let macOS update the flags without forcing another download or refresh.
+    digest = meta['backend_quarantine_sha256']
+    return (type(digest) is str and re.fullmatch(r'[0-9a-f]{64}', digest) is not None
+            and _quarantine(path) is not None)
+
+
 def _receipt_bytes(path):
     raw, _ = _read(path)
     _need(type(_parse(raw)) is dict, 'private-receipt-object-required')
@@ -290,6 +310,7 @@ def prepare_environment(vm_name, vm_config, destination_private_base, *, publish
                     'vpn-seed-receipt.json': _receipt_bytes(vpn_seed_receipt)}
         backend, backend_info = _verified_backend(gvproxy_path)
         source_q = _quarantine(_path(gvproxy_path))
+        _need(bool(source_q), 'backend-source-quarantine-required')
         tart = _tart_binding(tart_path)
         sources = {name: _read(HERE / source, private=False)[0]
                    for name, source in _SOURCE_NAMES.items()}
@@ -322,7 +343,7 @@ def prepare_environment(vm_name, vm_config, destination_private_base, *, publish
             'ecid': ecid, 'guest_mac': mac, 'source_sha256': manifest,
             'tart_binding': tart, 'backend_quarantine_sha256': _qhash(source_q),
             'needs_host_security_authorization': True, 'native_execution_approved': False,
-            'backend_assessment': 'reviewed-sha256-only-adhoc-no-usable-native-signature',
+            'backend_assessment': BACKEND_ASSESSMENT,
             'private_config_sha256': config_sha,
             'preinstall_receipt_sha256': manifest['preinstall-receipt.json'],
             'vpn_seed_receipt_sha256': manifest['vpn-seed-receipt.json'],
@@ -350,7 +371,7 @@ def validate_environment(base, meta=None):
     return _validate_environment(base, meta)
 
 
-def _validate_environment(base, meta=None, staged_vm_config=None):
+def _validate_environment(base, meta=None, staged_vm_config=None, *, refreshable=False):
     try:
         base = _directory(base)
         stored = _parse(_read(base / 'environment.json')[0])
@@ -362,13 +383,16 @@ def _validate_environment(base, meta=None, staged_vm_config=None):
         name = _name(meta['vm_name'])
         _need(meta['needs_host_security_authorization'] is True
               and meta['native_execution_approved'] is False
-              and meta['backend_assessment'] == 'reviewed-sha256-only-adhoc-no-usable-native-signature',
+              and meta['backend_assessment'] in ((BACKEND_ASSESSMENT, _UNNOTARIZED_ASSESSMENT)
+                                                 if refreshable else (BACKEND_ASSESSMENT,)),
               'invalid-backend-authorization-contract')
         _need(type(meta['source_sha256']) is dict and set(meta['source_sha256']) == _MANIFEST,
               'incomplete-v2-source-manifest')
         _need(not (base / 'setup').exists() and not (base / 'setup').is_symlink(),
               'legacy-setup-refused')
         for name, expected in meta['source_sha256'].items():
+            if refreshable and name not in _KEPT:
+                continue
             raw, _ = _read(base / name, cap=64 * 1024 * 1024)
             _need(_sha(raw) == expected, 'environment-source-integrity-mismatch')
         _need(meta['source_sha256']['packet_policy.py'] == PACKET_SHA256,
@@ -377,7 +401,7 @@ def _validate_environment(base, meta=None, staged_vm_config=None):
               and meta['vpn_seed_receipt_sha256'] == meta['source_sha256']['vpn-seed-receipt.json']
               and type(meta['private_config_sha256']) is str
               and re.fullmatch('[0-9a-f]{64}', meta['private_config_sha256']), 'invalid-private-receipt-pins')
-        _validate_bindings(base, meta, staged_vm_config)
+        _validate_bindings(base, meta, staged_vm_config, backend=not refreshable)
         return meta
     except RuntimePreparationError:
         raise
@@ -395,7 +419,7 @@ def validate_bindings(base, meta):
         raise RuntimePreparationError('runtime-binding-validation-failed') from None
 
 
-def _validate_bindings(base, meta, staged_vm_config=None):
+def _validate_bindings(base, meta, staged_vm_config=None, *, backend=True):
     base = _directory(base)
     path, tart_home = _vm_location(meta['vm_name'], meta['vm_config'],
                                    missing=staged_vm_config is not None)
@@ -411,11 +435,88 @@ def _validate_bindings(base, meta, staged_vm_config=None):
           and policy['guest_mac'] == mac, 'invalid-v2-policy')
     _endpoints(policy['endpoints'])
     _need(_tart_binding(meta['tart_binding']['path']) == meta['tart_binding'], 'tart-binding-changed')
-    backend, _ = _verified_backend(base / 'gvproxy-darwin')
-    _need(_sha(backend) == meta['source_sha256']['gvproxy-darwin'], 'backend-binding-changed')
-    _need(_qhash(_quarantine(base / 'gvproxy-darwin')) == meta['backend_quarantine_sha256'],
-          'backend-quarantine-changed')
+    if backend:
+        raw, _ = _verified_backend(base / 'gvproxy-darwin')
+        _need(_sha(raw) == meta['source_sha256']['gvproxy-darwin'], 'backend-binding-changed')
+        _need(_quarantine_kept(base / 'gvproxy-darwin', meta), 'backend-quarantine-changed')
     status_directory(base, meta)
+
+
+def validate_environment_for_refresh(base):
+    """Only what refresh_environment keeps: VM/Tart bindings, policy, receipts, mailbox."""
+    return _validate_environment(base, refreshable=True)
+
+
+def environment_needs_refresh(base):
+    """True if a published environment must take the current launcher code and backend.
+
+    Raises if anything a refresh keeps has changed; that is never repaired.
+    """
+    meta = validate_environment_for_refresh(base)
+    if meta['backend_assessment'] == _UNNOTARIZED_ASSESSMENT:
+        _need(meta['source_sha256']['gvproxy-darwin'] == _LEGACY_GV_SHA256,
+              'unknown-legacy-backend-pin')
+        return True
+    # A current signed environment that lost quarantine or has modified files
+    # must fail closed, not be silently repaired by the legacy migration.
+    validate_environment(base, meta)
+    return False
+
+
+def refresh_environment(base, gvproxy_path):
+    """Give a published environment the current sources and the signed backend.
+
+    For environments that pinned the unnotarized backend, or whose backend copy
+    is gone. The VM and Tart bindings, packet-filter policy, both private
+    receipts and the status mailbox are kept and must still validate. The new
+    backend copy is 0600 and carries its source's quarantine, so macOS still
+    assesses it at launch. Returns True if anything was replaced.
+    """
+    staged = []
+    try:
+        base = _directory(base)
+        if not environment_needs_refresh(base):
+            return False
+        meta = validate_environment_for_refresh(base)
+        backend, _ = _verified_backend(gvproxy_path)
+        source_q = _quarantine(_path(gvproxy_path))
+        _need(bool(source_q), 'backend-source-quarantine-required')
+        files = {name: _read(HERE / source, private=False)[0] for name, source in _SOURCE_NAMES.items()}
+        _need(_sha(files['packet_policy.py']) == PACKET_SHA256, 'reviewed-policy-digest-mismatch')
+        files['gvproxy-darwin'] = backend
+        manifest = dict(meta['source_sha256'])
+        pending = []
+        for name, raw in files.items():
+            temporary = base / ('.' + name + '-' + uuid.uuid4().hex)
+            staged.append(temporary)
+            _write(temporary, raw, 0o700 if name == 'launcher.py' else 0o600)
+            if name == 'gvproxy-darwin':
+                _preserve_quarantine(_path(gvproxy_path), temporary, source_q)
+            manifest[name] = _sha(raw)
+            pending.append((temporary, name))
+        for temporary, name in pending:
+            os.replace(str(temporary), str(base / name))
+            staged.remove(temporary)
+        _sync(base)
+        record = base / ('.environment-' + uuid.uuid4().hex)
+        staged.append(record)
+        _write(record, _json(dict(meta, source_sha256=manifest, backend_assessment=BACKEND_ASSESSMENT,
+                                  backend_quarantine_sha256=_qhash(source_q))))
+        os.replace(str(record), str(base / 'environment.json'))
+        staged.remove(record)
+        _sync(base)
+        _validate_environment(base)
+        return True
+    except RuntimePreparationError:
+        raise
+    except Exception:
+        raise RuntimePreparationError('environment-refresh-failed') from None
+    finally:
+        for path in staged:
+            try:
+                os.unlink(str(path))  # Only this call's own unpublished temporary files.
+            except OSError:
+                pass
 
 
 def status_directory(base, meta):
@@ -449,7 +550,7 @@ def authorize_backend_execution_bit(base, meta, *, acknowledged=False):
     require_backend_authorization(meta, acknowledged)
     path = _directory(base) / 'gvproxy-darwin'
     _, before = _verified_backend(path)
-    _need(_qhash(_quarantine(path)) == meta['backend_quarantine_sha256'], 'backend-quarantine-changed')
+    _need(_quarantine_kept(path, meta), 'backend-quarantine-changed')
     fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
         opened = os.fstat(fd)
@@ -463,7 +564,7 @@ def authorize_backend_execution_bit(base, meta, *, acknowledged=False):
     finally:
         os.close(fd)
     backend_is_executable(base)
-    _need(_qhash(_quarantine(path)) == meta['backend_quarantine_sha256'], 'backend-quarantine-changed')
+    _need(_quarantine_kept(path, meta), 'backend-quarantine-changed')
 
 
 def build_tart_command(base, meta, vm_name, network_fd, share_plan, no_graphics=False, recovery=False):

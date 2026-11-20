@@ -8,7 +8,7 @@
 from host_artifacts import SPECS, Receipt, Progress, ArtifactError, acquire, import_local
 
 receipt = acquire(
-    'gvproxy', private_cache_root,
+    'podman-installer', private_cache_root,
     loopback_proxy=None,
     progress=lambda event: print(event.phase, event.completed_bytes, event.total_bytes),
     cancelled=lambda: False,
@@ -20,7 +20,7 @@ receipt = import_local('ipsw', selected_file, private_cache_root,
                        deadline_seconds=86400)
 ```
 
-- `SPECS` is a read-only mapping of frozen `Spec` values. Only string keys `gvproxy`, `tart`, and `ipsw` are accepted. There is no URL, custom manifest, mutable registry, or `Spec` parameter in the acquisition API. Small test fixtures replace the module mapping **only inside tests**.
+- `SPECS` is a read-only mapping of frozen `Spec` values. Only string keys `podman-installer`, `tart`, and `ipsw` are accepted. There is no URL, custom manifest, mutable registry, or `Spec` parameter in the acquisition API. Small test fixtures replace the module mapping **only inside tests**.
 - `Spec` exposes `key`, `version`, `url`, `size_bytes`, `sha256`, `filename`, `hash_provenance`, `review_source`, `redirect_hosts`, and computed `spec_sha256`.
 - `Progress` is frozen: `spec_key`, `attempt_id`, `phase`, `completed_bytes`, `total_bytes`. Phases: `download`, `import`, `verify`, `cache-verify`, `accepted`. Counts restart for the separate full-file disk-verification pass. Cache reuse emits `cache-verify`; no transfer is implied. Progress is throttled to about four callbacks per second, except phase boundaries/completion, to avoid flooding the UI during a 20 GB transfer. Callbacks run synchronously and must return promptly.
 - `cancelled()` must return an actual boolean. Cancellation/error keeps the attempt's bytes, never deletes them. `ArtifactError.code` is a stable safe code; `.attempt_id` identifies a locally generated attempt when one was created. Error text deliberately excludes URL responses, credentials, private source paths and exception causes. Transfer failures carry a fixed cause code instead of the generic `artifact-io-failed` when one applies (`download-timeout`, `download-connection-lost`, `download-connect-failed`, `download-dns-failed`, `download-tls-failed`, `download-network-unreachable`, `download-protocol-error`, `host-disk-full`).
@@ -32,13 +32,13 @@ receipt = import_local('ipsw', selected_file, private_cache_root,
 
 | Key | Version | Exact bytes | SHA-256 provenance |
 |---|---|---:|---|
-| `gvproxy` | 0.9.0 | 26,951,570 | Publisher GitHub release API digest |
+| `podman-installer` | 6.2.0 | 76,730,429 | Publisher GitHub release API digest |
 | `tart` | 2.41.1 | 22,959,557 | Publisher GitHub release API digest |
 | `ipsw` | 26.6.2 / 25G83 | 19,772,231,540 | Reviewed local SHA of official HTTPS acquisition; **not an independently published Apple hash** |
 
 Public inputs and pins:
 
-- [gvproxy asset](<https://github.com/containers/gvisor-tap-vsock/releases/download/v0.9.0/gvproxy-darwin>), [review source](<https://api.github.com/repos/containers/gvisor-tap-vsock/releases/latest>): `e2a6825ba789fe588828b418c09aaf16525dec6d8cb2d16c94e72535dd4606be`.
+- [Podman macOS installer](<https://github.com/podman-container-tools/podman/releases/download/v6.2.0/podman-installer-macos-arm64.pkg>), [review source](<https://api.github.com/repos/podman-container-tools/podman/releases/tags/v6.2.0>): `b4628a29a4c70bbec757a84d0e429882d358cab18956a0017f99df74b37201a7`. Only its gvproxy is used (see below).
 - [Tart archive](<https://github.com/openai/tart/releases/download/2.41.1/tart.tar.gz>), [review source](<https://api.github.com/repos/openai/tart/releases/tags/2.41.1>): `e680a734febccfce7d4e910c1f7f13fc3b00f19a181c945e2d746de3214c32c2`.
 - [Apple IPSW](<https://updates.cdn-apple.com/2026SummerFCS/fullrestores/140-75212/A2A24B94-1FC1-45A3-93F7-C51B02AF1F4D/UniversalMac_26.6.2_25G83_Restore.ipsw>): `885503b7f4b06609e9a512f2befd40f59730640a3f1233e3892d60affdd51c95`.
 
@@ -83,7 +83,7 @@ binary_verification_performed = false
 apple_restore_validation_performed = false
 ```
 
-- **gvproxy v0.9.0:** parent inspection found the SHA-matching installed binary has only a linker ad-hoc signature, no TeamIdentifier, and `spctl --assess --type execute` returns 3 / `source=no usable signature`. These pins do not fix that trust failure. Existing host absence of quarantine does not establish a qualified public distribution. Parent must obtain the required first-execution permission or separately reviewed local-build/Developer-ID-signed distribution gate; never silently re-sign, delete quarantine or equate a matching SHA with execution permission.
+- **gvproxy:** the bare upstream release (`gvisor-tap-vsock` v0.9.0, `gvproxy-darwin`) has only a linker ad-hoc signature and no notarization; macOS refused to run it on the host, so it is no longer acquired. Instead the pinned Podman installer is acquired (quarantined like every download) and [host tools](<host_tools.py>) `ensure_gvproxy` checks the package (Developer ID Installer: Red Hat, Inc. (HYSCB8KRL2), notarized, `spctl --assess --type install` accepted), expands it **without installing** it, keeps only `podman/bin/gvproxy` (pinned SHA-256 `45881c33400a14c4c50d4ed7e814b69a60248aa0d78e9b541e879edc05346a85`), propagates the package's quarantine onto that copy, and checks the copy (Developer ID Application: Red Hat, Inc. (HYSCB8KRL2), identifier `gvproxy`, hardened runtime, Gatekeeper's standalone-code assessment `source=Notarized Developer ID`). Its Go build info names the same upstream v0.9.0 tag commit (`6dbb5d4f`) as the bare release. macOS still makes its own decision when the launcher runs it; nothing is re-signed and no quarantine is removed.
 - **Tart:** safe archive/package inspection, native signature assessment, exact executable/CLI installation and permissions remain parent tasks. No extraction or binary invocation occurs here.
 - **IPSW:** Apple framework signed restore validation, compatibility/support validation and all VM restore/control remain parent tasks. The local reviewed SHA is continuity evidence, not an Apple-published digest or an Apple framework validation result.
 - No license acceptance, application launch, helper execution, signing mutation, profile/keychain/credential access, or VM operation is implemented.

@@ -8,7 +8,7 @@
   let preinstallUI = null;
   const TOKEN_KEY = 'gold-vm-manager-token';
   const STATE_LABELS = { running: '运行中', stopped: '已关机', suspended: '已暂停', missing: '未找到' };
-  const ACTION_LABELS = { start: '启动', 'recovery-start': '恢复模式启动', pause: '暂停', shutdown: '正常关机', 'force-stop': '强制停止', 'discard-state': '丢弃暂停状态', focus: '打开窗口' };
+  const ACTION_LABELS = { start: '启动', 'recovery-start': '恢复模式启动', pause: '暂停', shutdown: '正常关机', 'force-stop': '强制停止', 'discard-state': '丢弃暂停状态', focus: '打开窗口', 'finish-first-setup': '标记首次设置完成' };
   const $ = (id) => document.getElementById(id);
   let token = '';
   let state = null;
@@ -68,6 +68,7 @@
       rebuild: 'M20 7v5h-5M20 12a8 8 0 1 0-2.3 5.7',
       recovery: 'M12 3a9 9 0 1 0 9 9M12 7v5l3 3M16 3h5v5',
       trash: 'M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7',
+      check: 'M5 12l5 5L20 7',
     };
     const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
     svg.setAttribute('viewBox', '0 0 24 24');
@@ -218,12 +219,15 @@
     panel.append(resources);
     const protection = el('div', 'protection-list');
     const network = vm.network || {};
-    protection.append(el('span', `protection-chip${network.protected ? '' : ' warning'}`, network.protected ? (vm.state === 'running' ? '◇ 网络规则已附加 · 待实测' : '◇ 保护启动器已配置') : '◇ 网络保护未确认'));
+    const firstSetup = vm.preinstalled?.first_setup_pending === true;
+    if (network.normal_network) protection.append(el('span', 'protection-chip warning', '◇ 首次设置 · 普通网络，未过滤'));
+    else if (firstSetup && vm.state !== 'running') protection.append(el('span', 'protection-chip warning', '◇ 首次设置将使用普通网络'));
+    else protection.append(el('span', `protection-chip${network.protected ? '' : ' warning'}`, network.protected ? (vm.state === 'running' ? '◇ 网络规则已附加 · 待实测' : '◇ 保护启动器已配置') : '◇ 网络保护未确认'));
     if (network.blocked) protection.append(el('span', 'protection-chip warning', '网络阻断中 · 保持现状'));
     protection.append(el('span', 'protection-chip', network.management_enabled ? '管理通道已启用' : '管理通道未启用'));
     panel.append(protection);
     const actions = el('div', 'machine-actions');
-    const starting = vm.preinstalled ? '受保护启动…' : vm.state === 'suspended' ? '继续运行' : '启动虚拟机';
+    const starting = vm.preinstalled ? (firstSetup ? '首次设置启动…' : '受保护启动…') : vm.state === 'suspended' ? '继续运行' : '启动虚拟机';
     actions.append(actionButton(starting, 'play', 'button button-primary', () => vm.preinstalled ? openActionConfirm(vm.id, 'start') : runAction(vm.id, 'start'), locked(vm) || !(vm.preinstalled ? vm.state === 'stopped' : ['stopped', 'suspended'].includes(vm.state)), `start-${vm.id}`));
     actions.append(actionButton('打开窗口', 'window', `button ${vm.state === 'running' ? 'button-primary' : 'button-secondary'}`, () => runAction(vm.id, 'focus'), locked(vm) || vm.state !== 'running', `focus-${vm.id}`));
     const pauseAllowed = vm.state === 'running' && vm.pause_supported && activeShares(vm).length === 0;
@@ -235,6 +239,7 @@
     actions.append(shutdown);
     panel.append(actions);
     const maintenance = el('div', 'maintenance-actions');
+    if (firstSetup) maintenance.append(actionButton('标记首次设置完成…', 'check', 'button button-secondary', () => openActionConfirm(vm.id, 'finish-first-setup'), locked(vm), `finish-setup-${vm.id}`));
     if (vm.recovery_supported) maintenance.append(actionButton('恢复模式…', 'recovery', 'button button-secondary', () => openActionConfirm(vm.id, 'recovery-start'), locked(vm) || vm.state !== 'stopped', `recovery-${vm.id}`));
     if (vm.rebuild_supported) maintenance.append(actionButton('彻底重建…', 'rebuild', 'button button-secondary', () => openBuild(vm.id), locked(vm) || buildActive(), `rebuild-${vm.id}`));
     if (maintenance.childElementCount) panel.append(maintenance);
@@ -249,6 +254,7 @@
     if (vm.preinstalled) {
       const imported = vm.preinstalled.configuration === 'imported';
       const manual = vm.preinstalled.configuration === 'manual_recovery_required';
+      if (firstSetup) panel.append(el('p', 'machine-notice', '首次设置使用普通网络，设置助理可以连上 Apple。进入桌面后确认 Clash Verge 已连上节点，再点「标记首次设置完成」；之后每次都受保护启动。'));
       panel.append(el('p', 'machine-notice', imported ? '客机报告：已导入配置。系统授权和连通性尚未验收。' : manual ? '客机报告：未覆盖已有资料，请在客机中检查配置。' : '私有配置已布置；首次登录后导入，尚无客机回执。'));
     }
     if (vm.state === 'missing') panel.append(el('p', 'machine-notice', '本机未找到这台虚拟机，请检查磁盘位置。'));
@@ -396,7 +402,7 @@
     return pollFlight;
   }
 
-  async function runAction(id, action, confirmName, backendAcknowledged = false) {
+  async function runAction(id, action, confirmName, backendAcknowledged = false, firstSetup = false) {
     lastActionError = '';
     const vm = vmById(id);
     if (!vm || locked(vm)) {
@@ -407,16 +413,21 @@
       toast('恢复启动仅适用于支持恢复模式且已关机的虚拟机，并须输入完整 VM 名称确认。', true);
       return false;
     }
-    if (action === 'start' && vm.preinstalled && (!backendAcknowledged || confirmName !== id || vm.state !== 'stopped')) {
-      toast('请在受保护启动对话框确认后端提示和完整 VM 名称。', true);
-      return false;
+    if (action === 'start' && vm.preinstalled) {
+      const pending = vm.preinstalled.first_setup_pending === true;
+      const consented = pending ? firstSetup && !backendAcknowledged : backendAcknowledged && !firstSetup;
+      if (!consented || confirmName !== id || vm.state !== 'stopped') {
+        toast(pending ? '请在首次设置对话框确认使用普通网络和完整 VM 名称。' : '请在受保护启动对话框确认后端提示和完整 VM 名称。', true);
+        return false;
+      }
     }
     busyVMs.add(id);
     render();
     try {
       const body = { action };
       if (confirmName !== undefined) body.confirm_name = confirmName;
-      if (action === 'start' && vm.preinstalled && backendAcknowledged) body.acknowledge_reviewed_unsigned_backend = true;
+      if (action === 'start' && vm.preinstalled && firstSetup) body.first_setup_normal_network = true;
+      else if (action === 'start' && vm.preinstalled && backendAcknowledged) body.acknowledge_reviewed_unsigned_backend = true;
       const result = await api(`/api/vms/${encodeURIComponent(id)}/action`, { method: 'POST', body });
       toast(result.message || '请求已发送，请等待虚拟机状态更新。');
       await refresh();
@@ -432,17 +443,19 @@
     const vm = vmById(id);
     if (!vm || locked(vm)) return;
     if (action === 'recovery-start' && (!vm.recovery_supported || vm.state !== 'stopped')) return;
-    const backend = action === 'start' && Boolean(vm.preinstalled);
-    if (backend && vm.state !== 'stopped') return;
-    const dangerous = backend || action === 'force-stop' || action === 'discard-state' || action === 'recovery-start';
-    confirmContext = { type: 'action', id, action, typed: dangerous, backend };
+    const firstSetup = action === 'start' && vm.preinstalled?.first_setup_pending === true;
+    const backend = action === 'start' && Boolean(vm.preinstalled) && !firstSetup;
+    if ((backend || firstSetup) && vm.state !== 'stopped') return;
+    if (action === 'finish-first-setup' && vm.preinstalled?.first_setup_pending !== true) return;
+    const dangerous = backend || firstSetup || action === 'force-stop' || action === 'discard-state' || action === 'recovery-start';
+    confirmContext = { type: 'action', id, action, typed: dangerous, backend, firstSetup };
     $('confirm-title').textContent = `${ACTION_LABELS[action]} ${id}？`;
-    $('confirm-description').textContent = backend ? '网络后端 gvproxy 取自 Podman 官方安装包（Red Hat 签名、经 Apple 公证、固定 SHA-256），不安装 Podman。输入完整 VM 名称并点击「同意尝试受保护启动」，即允许仅为本机这份私有副本设置所有者执行位，并请求 macOS 正常执行。较早预装的 VM 会先换用这份签名版后端并更新受保护启动文件，首次可能需要下载约 77 MB；磁盘和网络过滤规则不变。不会清除隔离属性或关闭系统保护；如被 macOS 拒绝则不启动，也不改用普通网络。首次系统设置、账号及服务授权仍需亲自完成。' : action === 'recovery-start' ? '仅为找回这台虚拟机遗忘的本地登录密码而进入 macOS 恢复模式。保留现有磁盘、数据与 VM 身份，不创建新身份，不抹除、不重建，也不清除钥匙串。本次恢复启动挂载的宿主共享目录为零。你需要亲自在虚拟机窗口内完成恢复，可能需要 FileVault 恢复密钥或 Apple Account。不要向模型提供任何密码、恢复密钥或账号凭据。此操作仅启动恢复模式，不保证能重设密码。请输入完整 VM 名称确认。' : action === 'shutdown' ? '向客机发送正常关机请求，不会强制终止进程。客机可能弹出确认窗口，请在虚拟机内完成确认；发送请求不等于已关机。' : action === 'force-stop' ? '将立即终止虚拟机，未保存的工作可能永久丢失。请优先使用正常关机。此操作不会删除虚拟机或主机共享目录。' : '将丢弃保存的运行状态，暂停时未保存的工作可能永久丢失。此操作不会删除虚拟机磁盘或主机共享目录；随后需重新启动。';
+    $('confirm-description').textContent = firstSetup ? '首次设置使用普通网络：这次启动不经过网络过滤，客机直接使用本机网络，Apple 等服务会看到本机的真实 IP；这样设置助理才能连上 Apple。不运行网络后端，也不需要后端授权。进入桌面后，Clash Verge 会自动导入节点；按提示授权它的服务，确认已经连上节点后，再点「标记首次设置完成」。之后每次启动都走受保护启动。请输入完整 VM 名称确认。' : action === 'finish-first-setup' ? '请先在客机里确认 Clash Verge 已连上节点。标记后，之后每次启动都走受保护启动：客机只能连到你的 VPN 节点，Clash 没连上时客机没有网络。此标记不能撤销；如果 VM 正在运行，这次运行仍是普通网络，关机后生效。' : backend ? '网络后端 gvproxy 取自 Podman 官方安装包（Red Hat 签名、经 Apple 公证、固定 SHA-256），不安装 Podman。输入完整 VM 名称并点击「同意尝试受保护启动」，即允许仅为本机这份私有副本设置所有者执行位，并请求 macOS 正常执行。较早预装的 VM 会先换用这份签名版后端并更新受保护启动文件，首次可能需要下载约 77 MB；磁盘和网络过滤规则不变。不会清除隔离属性或关闭系统保护；如被 macOS 拒绝则不启动，也不改用普通网络。首次系统设置、账号及服务授权仍需亲自完成。' : action === 'recovery-start' ? '仅为找回这台虚拟机遗忘的本地登录密码而进入 macOS 恢复模式。保留现有磁盘、数据与 VM 身份，不创建新身份，不抹除、不重建，也不清除钥匙串。本次恢复启动挂载的宿主共享目录为零。你需要亲自在虚拟机窗口内完成恢复，可能需要 FileVault 恢复密钥或 Apple Account。不要向模型提供任何密码、恢复密钥或账号凭据。此操作仅启动恢复模式，不保证能重设密码。请输入完整 VM 名称确认。' : action === 'shutdown' ? '向客机发送正常关机请求，不会强制终止进程。客机可能弹出确认窗口，请在虚拟机内完成确认；发送请求不等于已关机。' : action === 'force-stop' ? '将立即终止虚拟机，未保存的工作可能永久丢失。请优先使用正常关机。此操作不会删除虚拟机或主机共享目录。' : '将丢弃保存的运行状态，暂停时未保存的工作可能永久丢失。此操作不会删除虚拟机磁盘或主机共享目录；随后需重新启动。';
     $('confirm-input-group').hidden = !dangerous;
     $('confirm-input-label').textContent = `请输入「${id}」以确认`;
     $('confirm-name').value = '';
     $('confirm-name').required = dangerous;
-    $('confirm-submit').textContent = backend ? '同意尝试受保护启动' : ACTION_LABELS[action];
+    $('confirm-submit').textContent = firstSetup ? '用普通网络启动首次设置' : backend ? '同意尝试受保护启动' : ACTION_LABELS[action];
     $('confirm-submit').className = dangerous ? 'button button-danger' : 'button button-primary';
     $('confirm-submit').disabled = dangerous;
     $('confirm-error').hidden = true;
@@ -637,7 +650,7 @@
     $('confirm-error').hidden = true;
     try {
       if (context.type === 'action') {
-        const done = await runAction(context.id, context.action, context.typed ? $('confirm-name').value : undefined, context.backend === true);
+        const done = await runAction(context.id, context.action, context.typed ? $('confirm-name').value : undefined, context.backend === true, context.firstSetup === true);
         if (!done) { showError('confirm-error', lastActionError || '操作未完成，请刷新状态后核对；不要重复执行危险操作。'); return; }
       } else if (context.type === 'abandon-authorization') {
         await api('/api/preinstall/authorization', { method: 'POST', body: { job_id: context.jobId, attempt: context.attempt, decision: 'abandon' } });

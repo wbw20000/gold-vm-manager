@@ -186,7 +186,7 @@ def capabilities():
                              for m in reviewed_manifests() for a in m.expected_apps],
             'source_prerequisites': prerequisites,
             'limitations': ['下载/复制失败保留材料，不自动续传或覆盖重试。',
-                            '首次启动另行确认；网络后端 gvproxy 取自 Podman 官方安装包（Red Hat 签名、已公证，不安装 Podman），保留隔离属性，由 macOS 自行核验。',
+                            '首次设置另行确认，使用普通网络（不经过滤），由你标记完成；之后每次启动都受保护，网络后端 gvproxy 取自 Podman 官方安装包（Red Hat 签名、已公证，不安装 Podman），保留隔离属性，由 macOS 自行核验。',
                             '配置导入、系统授权、桌面验收和 VPN 连通分别记录；未提供真实节点不能验收连通。']}
 
 
@@ -767,7 +767,7 @@ def _finish_preinstall(c, d, stored, service, update):
     update('publishing', '独立只读核验完成；仅发布这个新 VM，不覆盖或删除旧 VM。')
     target = service.publish(d, update)
     return update('awaiting_first_desktop_acceptance',
-                  '系统、四个完整应用与私有配置已预装。首次启动需单独确认后端安全提示，并由本人完成系统设置和授权；未验收桌面或 VPN 连通。',
+                  '系统、四个完整应用与私有配置已预装。首次设置需单独确认并使用普通网络，由本人完成系统设置和授权，确认 Clash 连上节点后标记完成；未验收桌面或 VPN 连通。',
                   1, published=True, stage_path=None, published_path=str(target),
                   needs_host_security_authorization=True, guest_started=False,
                   desktop_verified=False, vpn_connected=False, network_independently_verified=False)

@@ -46,10 +46,14 @@ def checked_digest(path):
     return h.hexdigest()
 
 
-def build_tart_command(vm_name, network_fd, share_plan, no_graphics=False, recovery=False, *, environment=None):
+def build_tart_command(vm_name, network_fd, share_plan, no_graphics=False, recovery=False, *, environment=None,
+                       first_setup=False):
     if environment is not None and environment.get('version') == 2:
         from preinstall_runtime import build_tart_command as build_v2
-        return build_v2(BASE, environment, vm_name, network_fd, share_plan, no_graphics, recovery)
+        return build_v2(BASE, environment, vm_name, network_fd, share_plan, no_graphics, recovery,
+                        first_setup=first_setup)
+    if first_setup:
+        raise RuntimeError('First-setup normal network is only for a preinstalled v2 environment')
     if share_plan is not None and any(s['name'].casefold() == 'setup' for s in share_plan.shares):
         raise RuntimeError('The setup share name is reserved')
     cmd = [TART, 'run', vm_name, '--net-fd=' + str(network_fd)]
@@ -181,6 +185,61 @@ def stop_process(proc, signum=signal.SIGTERM):
             pass
 
 
+def run_first_setup(vm_name, share_plan, meta, runtime_env, no_graphics, lock):
+    """First setup only: Tart on its own normal network. No backend, no filter.
+
+    The owner decided (2026-11-19) that before Clash exists the fence only blocks
+    Setup Assistant. The caller has already checked that first setup is still
+    pending; once it is marked finished this path refuses and starts are protected.
+    """
+    import preinstall_runtime as runtime_v2
+    child = None
+    shutdown = False
+    def request_stop(signum, frame):
+        nonlocal shutdown
+        shutdown = True
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+    status = {'launcher_pid': os.getpid(), 'state': 'initializing', 'started_unix': time.time(),
+              'network_mode': runtime_v2.FIRST_SETUP_NETWORK,
+              'policy': 'none: Tart normal network for first setup only',
+              'native_execution_approved': False, 'guest_bootstrap_evidence': 'not_observed',
+              'desktop_verified': False, 'network_independently_verified': False}
+    try:
+        runtime_v2.validate_bindings(BASE, meta)
+        runtime_v2.require_first_setup(BASE)
+        cmd = build_tart_command(vm_name, None, share_plan, no_graphics, environment=meta, first_setup=True)
+        if shutdown:
+            raise RuntimeError('Startup cancelled; VM not started')
+        child = subprocess.Popen(cmd, env=runtime_env, stdin=subprocess.DEVNULL, close_fds=True)
+        share_plan.record_launch(child.pid)
+        status.update(state='running', tart_pid=child.pid, shared_directory_count=len(share_plan.shares) + 1,
+                      sharing_allows_suspend=False, recovery_mode=False, setup_status='first-setup')
+        write_status(BASE/'status.json', status)
+        print('First setup is running on the normal network; no packet filter.', flush=True)
+        while not shutdown and child.poll() is None:
+            time.sleep(0.5)
+        status['state'] = 'stopping' if shutdown else 'guest-exited'
+    except Exception as error:
+        status['state'] = 'failed-closed'
+        status['error_type'] = type(error).__name__
+        print('First-setup launcher stopped (' + type(error).__name__ + ').', file=sys.stderr, flush=True)
+        raise
+    finally:
+        cleanup_errors = []
+        try:
+            stop_process(child, signal.SIGINT)
+        except Exception as error:
+            cleanup_errors.append(type(error).__name__)
+        status['ended_unix'] = time.time()
+        status['cleanup_errors'] = cleanup_errors
+        try:
+            write_status(BASE/'status.json', status)
+        finally:
+            lock.close()
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--no-graphics', action='store_true')
@@ -190,6 +249,9 @@ def main():
                              '(Red Hat-signed, notarized gvproxy); macOS still decides; the legacy flag name is kept')
     parser.add_argument('--enable-reviewed-backend-owner-execute', action='store_true',
                         help='V2 only with acknowledgement: make the exact private backend owner-executable; preserve quarantine')
+    parser.add_argument('--first-setup-normal-network', action='store_true',
+                        help="V2 only, until first setup is marked finished: run Tart on its normal network, "
+                             "unfiltered, so Setup Assistant can reach Apple before Clash exists; no backend runs")
     args = parser.parse_args()
     args.management = False  # No guest management port is exposed by this launcher.
     os.umask(0o077)
@@ -206,6 +268,10 @@ def main():
     if ((args.acknowledge_reviewed_unsigned_backend or args.enable_reviewed_backend_owner_execute) and not v2
             or args.enable_reviewed_backend_owner_execute and not args.acknowledge_reviewed_unsigned_backend):
         raise RuntimeError('Backend execute permission needs explicit v2 acknowledgement')
+    first_setup = args.first_setup_normal_network
+    if first_setup and (not v2 or args.recovery or args.acknowledge_reviewed_unsigned_backend
+                        or args.enable_reviewed_backend_owner_execute):
+        raise RuntimeError('First-setup normal network is only a plain v2 start without backend flags')
     from packet_policy import PacketPolicy
     from share_support import prepare_vm_shares
     lock_path = BASE / 'run.lock'
@@ -232,7 +298,18 @@ def main():
     remove_stale_status_staging()  # Safe only now: run.lock excludes any other writer.
     write_status(BASE/'status.json',{'state':'validating','launcher_pid':os.getpid(),'started_unix':time.time()})
     gv = BASE / 'gvproxy-darwin'
-    if v2:
+    if first_setup:
+        import preinstall_runtime as runtime_v2
+        try:
+            runtime_v2.require_first_setup(BASE)
+            runtime_v2.validate_bindings(BASE, meta)
+        except runtime_v2.RuntimePreparationError as error:
+            write_status(BASE/'status.json', {'state': 'failed-closed', 'launcher_pid': os.getpid(),
+                         'reason': error.code, 'network_mode': runtime_v2.FIRST_SETUP_NETWORK,
+                         'native_execution_approved': False, 'vm_started': False})
+            lock.close()
+            raise
+    elif v2:
         import preinstall_runtime as runtime_v2
         try:
             runtime_v2.require_backend_authorization(meta, args.acknowledge_reviewed_unsigned_backend)
@@ -262,6 +339,8 @@ def main():
         raise RuntimeError('A protected runtime share name is reserved')
     endpoints = [tuple(x) for x in cfg['endpoints']]
     local_control(args.management)  # Validate before any VM can start.
+    if first_setup:
+        return run_first_setup(vm_name, share_plan, meta, runtime_env, args.no_graphics, lock)
     policy = PacketPolicy(guest_mac=cfg['guest_mac'], endpoints=endpoints, allow_management=args.management)
     run = Path(tempfile.mkdtemp(prefix='goldnet-', dir='/tmp'))
     private_directory(run)

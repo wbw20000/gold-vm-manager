@@ -399,9 +399,15 @@ class ControllerTests(PrivateFixture):
         self.assertEqual(busy.exception.status, 409)
         archive.assert_not_called()
 
-    def test_preinstalled_start_requires_own_named_execution_consent(self):
-        base = self.bases['gold']
+    def preinstalled(self, vm='gold'):
+        base = self.bases[vm]
         self.write_json(base / 'environment.json', {'version': 2})
+        return base
+
+    def test_preinstalled_start_requires_own_named_execution_consent(self):
+        import preinstall_runtime
+        base = self.preinstalled()
+        preinstall_runtime.finish_first_setup(base)
         original = self.controller._require_preinstall_publication
         with patch.object(self.controller, '_require_preinstall_publication', wraps=original) as fence:
             self.denied(self.controller.action, 'gold', {'action': 'start'}, code='host_authorization_required')
@@ -422,6 +428,110 @@ class ControllerTests(PrivateFixture):
             self.assertEqual(self.worker.call_args.kwargs['args'], ('gold', 'start', True))
         self.popen.assert_not_called()
 
+    def test_first_setup_start_needs_its_own_named_consent_and_no_backend_consent(self):
+        base = self.preinstalled()
+        with patch.object(self.controller, '_require_preinstall_publication') as fence, \
+                patch.object(m.shares_lib, 'prepare_vm_shares'):
+            for payload in ({'action': 'start'}, {'action': 'start', 'confirm_name': 'gold'},
+                            {'action': 'start', 'confirm_name': 'gold', 'first_setup_normal_network': 1},
+                            {'action': 'start', 'confirm_name': 'gold-backup', 'first_setup_normal_network': True},
+                            {'action': 'start', 'confirm_name': 'gold', 'acknowledge_reviewed_unsigned_backend': True},
+                            {'action': 'start', 'confirm_name': 'gold', 'first_setup_normal_network': True,
+                             'acknowledge_reviewed_unsigned_backend': True}):
+                with self.subTest(payload=payload):
+                    self.denied(self.controller.action, 'gold', payload, code='first_setup_confirmation_required')
+            fence.assert_not_called()
+            self.worker.assert_not_called()
+            result = self.controller.action('gold', {'action': 'start', 'confirm_name': 'gold',
+                                                     'first_setup_normal_network': True})
+            self.assertTrue(result['ok'])
+            self.assertIn('普通网络', result['message'])
+            fence.assert_called_once_with('gold', base)
+            self.assertEqual(self.worker.call_args.kwargs['args'], ('gold', 'start', True, True))
+        self.popen.assert_not_called()
+
+    def test_finished_first_setup_refuses_the_normal_network(self):
+        import preinstall_runtime
+        base = self.preinstalled()
+        preinstall_runtime.finish_first_setup(base)
+        for payload in ({'action': 'start', 'confirm_name': 'gold', 'first_setup_normal_network': True},
+                        {'action': 'start', 'confirm_name': 'gold', 'first_setup_normal_network': True,
+                         'acknowledge_reviewed_unsigned_backend': True}):
+            with self.subTest(payload=payload):
+                self.denied(self.controller.action, 'gold', payload, code='first_setup_finished')
+        (base / preinstall_runtime.NETWORK_MODE_NAME).write_text('{"version":1,"mode":"first-setup"}')
+        self.denied(self.controller.action, 'gold', {'action': 'start', 'confirm_name': 'gold',
+                    'first_setup_normal_network': True}, code='invalid_network_mode')
+        self.worker.assert_not_called()
+
+    def test_first_setup_flag_and_finish_action_belong_to_preinstalled_vms_only(self):
+        self.denied(self.controller.action, 'gold', {'action': 'start', 'first_setup_normal_network': True},
+                    code='invalid_execution_consent')
+        self.denied(self.controller.action, 'gold', {'action': 'finish-first-setup'}, code='first_setup_unavailable')
+        self.preinstalled()
+        self.denied(self.controller.action, 'gold', {'action': 'shutdown', 'first_setup_normal_network': True},
+                    code='invalid_execution_consent')
+        self.worker.assert_not_called()
+
+    def test_finishing_first_setup_is_recorded_once_and_never_reverts(self):
+        import preinstall_runtime
+        base = self.preinstalled()
+        self.controller.operations['gold'] = {'action': 'start'}
+        self.denied(self.controller.action, 'gold', {'action': 'finish-first-setup'}, code='busy')
+        self.assertTrue(preinstall_runtime.first_setup_pending(base))
+        self.controller.operations.clear()
+        result = self.controller.action('gold', {'action': 'finish-first-setup'})
+        self.assertTrue(result['ok'])
+        self.assertFalse(preinstall_runtime.first_setup_pending(base))
+        self.assertEqual(self.controller.events[0]['action'], 'finish-first-setup')
+        self.inventory['gold']['State'] = 'running'
+        again = self.controller.action('gold', {'action': 'finish-first-setup'})
+        self.assertTrue(again['ok'])
+        self.assertFalse(preinstall_runtime.first_setup_pending(base))
+        self.worker.assert_not_called()
+        self.popen.assert_not_called()
+
+    def test_launch_passes_the_normal_network_flag_only_for_first_setup(self):
+        (self.state_dir / 'logs').mkdir(mode=0o700, exist_ok=True)
+        proc = Mock()
+        proc.poll.return_value = None
+        self.popen.side_effect = None
+        self.popen.return_value = proc
+        for vm in self.bases:
+            self.inventory[vm]['State'] = 'running'
+        with patch.object(self.controller, '_refresh_runtime') as refresh:
+            self.controller._perform('gold', 'start', True, True)
+            refresh.assert_called_once_with('gold')
+            first = self.popen.call_args[0][0]
+            self.controller._perform('gold-backup', 'start', True)
+            protected = self.popen.call_args[0][0]
+        self.assertEqual(first[-1], '--first-setup-normal-network')
+        self.assertFalse({'--acknowledge-reviewed-unsigned-backend', '--enable-reviewed-backend-owner-execute'} & set(first))
+        self.assertEqual(protected[-2:], ['--acknowledge-reviewed-unsigned-backend', '--enable-reviewed-backend-owner-execute'])
+        self.assertNotIn('--first-setup-normal-network', protected)
+        self.assertEqual(self.controller.errors, {})
+        messages = [e['message'] for e in self.controller.events]
+        self.assertIn('普通网络', messages[1])
+        self.assertNotIn('普通网络', messages[0])
+
+    def test_state_reports_first_setup_and_a_normal_network_run(self):
+        import preinstall_runtime
+        base = self.preinstalled()
+        def gold():
+            return next(vm for vm in self.controller.state()['vms'] if vm['id'] == 'gold')
+        self.assertTrue(gold()['preinstalled']['first_setup_pending'])
+        self.assertFalse(gold()['network']['normal_network'])
+        self.inventory['gold']['State'] = 'running'
+        self.write_json(base / 'status.json', {'state': 'running', 'tart_pid': 12345,
+                                               'network_mode': preinstall_runtime.FIRST_SETUP_NETWORK})
+        self.assertTrue(gold()['network']['normal_network'])
+        self.assertFalse(gold()['network']['protected'])
+        preinstall_runtime.finish_first_setup(base)
+        self.assertFalse(gold()['preinstalled']['first_setup_pending'])
+        self.assertTrue(gold()['network']['normal_network'], 'this run stays on the normal network until shutdown')
+        self.inventory['gold']['State'] = 'stopped'
+        self.assertFalse(gold()['network']['normal_network'])
+
     def test_confirmed_start_moves_an_older_environment_to_the_signed_backend_first(self):
         import host_artifacts
         import host_tools
@@ -434,11 +544,13 @@ class ControllerTests(PrivateFixture):
                 patch.object(host_artifacts, 'acquire', side_effect=lambda key, root: steps.append(('acquire', key, root)) or package), \
                 patch.object(host_tools, 'ensure_gvproxy', side_effect=lambda root, artifact_receipt: steps.append(
                     ('extract', root, artifact_receipt)) or backend), \
-                patch.object(preinstall_runtime, 'refresh_environment', side_effect=lambda b, p: steps.append(('refresh', b, p)) or True):
+                patch.object(preinstall_runtime, 'refresh_environment', side_effect=lambda b, p: steps.append(('refresh', b, p)) or True), \
+                patch.object(preinstall_runtime, 'refresh_sources', side_effect=AssertionError('backend refresh already wrote the code')):
             self.controller._refresh_runtime('gold')
         self.assertEqual(steps, [('check', base), ('acquire', 'podman-installer', self.state_dir / 'host-materials'),
                                  ('extract', self.state_dir / 'tools', package), ('refresh', base, backend.executable_path)])
         with patch.object(preinstall_runtime, 'environment_needs_refresh', return_value=False), \
+                patch.object(preinstall_runtime, 'refresh_sources', return_value=False), \
                 patch.object(host_artifacts, 'acquire', side_effect=AssertionError('no download for a current environment')):
             self.controller._refresh_runtime('gold')
         for module, name, error in ((host_artifacts, 'acquire', host_artifacts.ArtifactError('download-timeout')),
@@ -453,6 +565,25 @@ class ControllerTests(PrivateFixture):
                 self.controller._refresh_runtime('gold')
             self.assertEqual((raised.exception.code, raised.exception.status), ('backend_refresh_failed', 409))
             self.assertIn(error.code, str(raised.exception))
+
+    def test_confirmed_start_gives_a_signed_environment_the_current_launcher_code(self):
+        import host_artifacts
+        import preinstall_runtime
+        base = self.bases['gold']
+        steps = []
+        with patch.object(preinstall_runtime, 'environment_needs_refresh', return_value=False), \
+                patch.object(host_artifacts, 'acquire', side_effect=AssertionError('no download for code only')), \
+                patch.object(preinstall_runtime, 'refresh_sources', side_effect=lambda b: steps.append(b) or True):
+            self.controller._refresh_runtime('gold')
+        self.assertEqual(steps, [base])
+        self.assertIn('受保护启动文件', self.controller.events[0]['message'])
+        error = preinstall_runtime.RuntimePreparationError('environment-source-integrity-mismatch')
+        with patch.object(preinstall_runtime, 'environment_needs_refresh', return_value=False), \
+                patch.object(preinstall_runtime, 'refresh_sources', side_effect=error), \
+                self.assertRaises(m.AppError) as raised:
+            self.controller._refresh_runtime('gold')
+        self.assertEqual((raised.exception.code, raised.exception.status), ('backend_refresh_failed', 409))
+        self.assertIn(error.code, str(raised.exception))
 
     def test_runtime_refresh_failure_never_launches(self):
         (self.state_dir / 'logs').mkdir(mode=0o700, exist_ok=True)

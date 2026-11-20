@@ -277,6 +277,170 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual((self.base / 'environment.json').read_bytes(), before)
         self.assertIsNone(self.quarantines[str(copy)])
 
+    def signed_environment_with_older_code(self):
+        """A current signed environment whose launcher copy predates this build (bb1 after 602adc1)."""
+        self.prepare()
+        meta = self.meta()
+        older = b'# GOLD_VM_MANAGER_SHARES_V1\n# GOLD_VM_MANAGER_RECOVERY_V1\n# launcher before first-setup support\n'
+        (self.base / 'launcher.py').write_bytes(older)
+        meta['source_sha256']['launcher.py'] = hashlib.sha256(older).hexdigest()
+        (self.base / 'environment.json').write_bytes(runtime._json(meta))
+        return meta
+
+    def test_source_refresh_gives_an_intact_environment_only_this_builds_code(self):
+        old = self.signed_environment_with_older_code()
+        kept = {name: (self.base / name).read_bytes() for name in ('gvproxy-darwin',) + runtime._KEPT}
+        backend_inode = (self.base / 'gvproxy-darwin').stat().st_ino
+        mailbox = (self.base / 'guest-status').stat().st_ino
+        self.assertTrue(runtime.environment_sources_outdated(self.base))
+        self.assertTrue(runtime.refresh_sources(self.base))
+        meta = runtime.validate_environment(self.base)
+        self.assertEqual((self.base / 'launcher.py').read_bytes(), (runtime.HERE / 'protected_launcher.py').read_bytes())
+        self.assertEqual(stat.S_IMODE((self.base / 'launcher.py').stat().st_mode), 0o700)
+        self.assertEqual({key for key in meta if meta[key] != old[key]}, {'source_sha256'})
+        self.assertEqual({name for name, digest in meta['source_sha256'].items()
+                          if digest != old['source_sha256'][name]}, {'launcher.py'})
+        self.assertEqual({name: (self.base / name).read_bytes() for name in kept}, kept)
+        self.assertEqual((self.base / 'gvproxy-darwin').stat().st_ino, backend_inode)
+        self.assertEqual(self.quarantines[str(self.base / 'gvproxy-darwin')], Q)
+        self.assertEqual((self.base / 'guest-status').stat().st_ino, mailbox)
+        self.assertFalse(runtime.environment_sources_outdated(self.base))
+        self.assertFalse(runtime.refresh_sources(self.base))
+        self.assertFalse([p.name for p in self.base.iterdir() if p.name.startswith('.')])
+        self.run.assert_not_called()
+        self.spawn.assert_not_called()
+
+    def test_source_refresh_never_repairs_a_changed_or_legacy_environment(self):
+        self.signed_environment_with_older_code()
+        launcher_copy = self.base / 'launcher.py'
+        original = launcher_copy.read_bytes()
+        record = (self.base / 'environment.json').read_bytes()
+        launcher_copy.write_bytes(original + b'# changed after preparation\n')
+        for call in (runtime.environment_sources_outdated, runtime.refresh_sources):
+            with self.subTest(call=call.__name__), \
+                    self.assertRaisesRegex(runtime.RuntimePreparationError, 'environment-source-integrity-mismatch'):
+                call(self.base)
+        launcher_copy.write_bytes(original)
+        self.quarantines[str(self.base / 'gvproxy-darwin')] = None
+        with self.assertRaisesRegex(runtime.RuntimePreparationError, 'backend-quarantine-changed'):
+            runtime.refresh_sources(self.base)
+        self.quarantines[str(self.base / 'gvproxy-darwin')] = Q
+        meta = self.meta()
+        meta['backend_assessment'] = runtime._UNNOTARIZED_ASSESSMENT
+        (self.base / 'environment.json').write_bytes(runtime._json(meta))
+        with self.assertRaisesRegex(runtime.RuntimePreparationError, 'invalid-backend-authorization-contract'):
+            runtime.refresh_sources(self.base)  # Legacy environments take refresh_environment instead.
+        (self.base / 'environment.json').write_bytes(record)
+        self.assertEqual(launcher_copy.read_bytes(), original)
+        self.assertFalse([p.name for p in self.base.iterdir() if p.name.startswith('.')])
+
+    def test_first_setup_runs_until_marked_finished_and_never_reverts(self):
+        self.prepare()
+        record = self.base / 'network-mode.json'
+        self.assertTrue(runtime.first_setup_pending(self.base))
+        runtime.require_first_setup(self.base)
+        self.assertTrue(runtime.finish_first_setup(self.base))
+        self.assertEqual(json.loads(record.read_text()), {'version': 1, 'mode': 'protected'})
+        self.assertEqual(stat.S_IMODE(record.stat().st_mode), 0o600)
+        self.assertFalse(runtime.first_setup_pending(self.base))
+        self.assertFalse(runtime.finish_first_setup(self.base))
+        with self.assertRaisesRegex(runtime.RuntimePreparationError, 'first-setup-finished'):
+            runtime.require_first_setup(self.base)
+        runtime.validate_environment(self.base)  # A host-only record outside the reviewed manifest.
+        finished = record.read_bytes()
+        for raw in (b'{"mode":"protected","version":true}', b'{"mode":"first-setup","version":1}',
+                    b'{"mode":"protected","version":1,"extra":1}', b'[]', b'not json'):
+            record.write_bytes(raw)
+            for call in (runtime.first_setup_pending, runtime.finish_first_setup):
+                with self.subTest(raw=raw, call=call.__name__), \
+                        self.assertRaisesRegex(runtime.RuntimePreparationError, 'invalid-network-mode'):
+                    call(self.base)
+            self.assertEqual(record.read_bytes(), raw)  # Never overwritten or repaired.
+        record.write_bytes(finished)
+        record.chmod(0o644)
+        with self.assertRaisesRegex(runtime.RuntimePreparationError, 'invalid-network-mode'):
+            runtime.first_setup_pending(self.base)
+        record.unlink()
+        other = self.root / 'finished-elsewhere.json'
+        other.write_bytes(finished)
+        other.chmod(0o600)
+        record.symlink_to(other)
+        with self.assertRaisesRegex(runtime.RuntimePreparationError, 'invalid-network-mode'):
+            runtime.first_setup_pending(self.base)
+        self.assertFalse([p.name for p in self.base.iterdir() if p.name.startswith('.')])
+
+    def test_first_setup_command_uses_normal_network_with_mailbox_and_user_shares(self):
+        self.prepare()
+        plan = SimpleNamespace(shares=[{'name': 'data'}], arguments=['--dir=data:/fixture/user-data:ro'])
+        with mock.patch.object(launcher, 'BASE', self.base):
+            command = launcher.build_tart_command(self.name, None, plan, environment=self.meta(), first_setup=True)
+            self.assertEqual(command[:4], [str(self.tart), 'run', self.name, '--no-clipboard'])
+            self.assertFalse(any(arg.startswith('--net') for arg in command))
+            self.assertIn('--dir=gold-status:' + str(self.base / 'guest-status'), command)
+            self.assertIn('--dir=data:/fixture/user-data:ro', command)
+            for fd, recovery in ((42, False), (None, True)):
+                with self.subTest(fd=fd, recovery=recovery), \
+                        self.assertRaisesRegex(runtime.RuntimePreparationError, 'invalid-v2-launch-binding'):
+                    launcher.build_tart_command(self.name, fd, plan, recovery=recovery, environment=self.meta(),
+                                                first_setup=True)
+            with self.assertRaisesRegex(runtime.RuntimePreparationError, 'invalid-v2-launch-binding'):
+                launcher.build_tart_command(self.name, None, plan, environment=self.meta())
+
+    def first_setup_launch(self, *flags):
+        self.run.side_effect = None
+        self.run.return_value = SimpleNamespace(stdout=json.dumps([
+            {'Name': self.name, 'Source': 'local', 'Running': False, 'State': 'stopped'}]))
+        plan = SimpleNamespace(shares=[], arguments=[], record_launch=mock.Mock())
+        child = SimpleNamespace(pid=8002, poll=lambda: 0)
+        stopped = []
+        self.spawn.side_effect = None
+        self.spawn.return_value = child
+        with mock.patch.object(launcher, 'BASE', self.base), \
+                mock.patch.object(sys, 'argv', ['launcher.py', '--first-setup-normal-network', *flags]), \
+                mock.patch.object(runtime_shares, 'prepare_vm_shares', return_value=plan), \
+                mock.patch.object(launcher.tempfile, 'mkdtemp', side_effect=AssertionError('no backend runtime')), \
+                mock.patch.object(launcher.signal, 'signal'), \
+                mock.patch.object(launcher, 'stop_process', side_effect=lambda proc, signum: stopped.append(proc)):
+            result = launcher.main()
+        return result, plan, child, stopped
+
+    def test_first_setup_launch_runs_tart_on_its_normal_network_and_never_the_backend(self):
+        self.prepare()
+        result, plan, child, stopped = self.first_setup_launch()
+        self.assertEqual(result, 0)
+        self.assertEqual(self.spawn.call_count, 1)  # Tart only; the backend is never executed.
+        argv = self.spawn.call_args[0][0]
+        self.assertEqual(argv[:4], [str(self.tart), 'run', self.name, '--no-clipboard'])
+        self.assertFalse(any(arg.startswith('--net') for arg in argv))
+        self.assertIn('--dir=gold-status:' + str(self.base / 'guest-status'), argv)
+        self.assertNotIn('pass_fds', self.spawn.call_args[1])
+        self.assertEqual(self.spawn.call_args[1]['env']['TART_HOME'], str(self.tart_home))
+        plan.record_launch.assert_called_once_with(child.pid)
+        self.assertEqual(stopped, [child])
+        status = json.loads((self.base / 'status.json').read_text())
+        self.assertEqual((status['state'], status['network_mode'], status['tart_pid']),
+                         ('guest-exited', 'first-setup-normal-network', child.pid))
+        self.assertFalse(status['native_execution_approved'])
+        self.assertFalse(status['network_independently_verified'])
+        self.assertEqual(stat.S_IMODE((self.base / 'gvproxy-darwin').stat().st_mode), 0o600)
+        self.assertEqual(self.quarantines[str(self.base / 'gvproxy-darwin')], Q)
+        self.assertTrue(runtime.first_setup_pending(self.base))  # Only the person marks it finished.
+
+    def test_first_setup_launch_refused_once_finished_or_mixed_with_backend_or_recovery(self):
+        self.prepare()
+        for flags in (('--acknowledge-reviewed-unsigned-backend',), ('--recovery',),
+                      ('--acknowledge-reviewed-unsigned-backend', '--enable-reviewed-backend-owner-execute')):
+            with self.subTest(flags=flags), self.assertRaisesRegex(RuntimeError, 'First-setup normal network'):
+                self.first_setup_launch(*flags)
+        self.assertFalse((self.base / 'status.json').exists())
+        runtime.finish_first_setup(self.base)
+        with self.assertRaisesRegex(runtime.RuntimePreparationError, 'first-setup-finished'):
+            self.first_setup_launch()
+        status = json.loads((self.base / 'status.json').read_text())
+        self.assertEqual((status['state'], status['reason'], status['vm_started']),
+                         ('failed-closed', 'first-setup-finished', False))
+        self.spawn.assert_not_called()
+
     def test_exact_explicit_tart_and_config_binding_not_home_defaults(self):
         self.prepare()
         meta = self.meta()

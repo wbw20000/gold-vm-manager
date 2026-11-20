@@ -42,6 +42,13 @@ _META_KEYS = frozenset({
     'guest_status_identity', 'guest_status_share', 'setup_active',
 })
 _MAX_RECORD = 4 * 1024 * 1024
+# Host-only record outside the reviewed manifest. Absent: first setup is still
+# pending and runs on Tart's normal network (owner's decision, 2026-11-19), so
+# Setup Assistant can reach Apple before Clash exists. Once the person marks it
+# finished, every later start is protected; the record never reverts.
+NETWORK_MODE_NAME = 'network-mode.json'
+_FINISHED_MODE = {'version': 1, 'mode': 'protected'}
+FIRST_SETUP_NETWORK = 'first-setup-normal-network'
 
 
 class RuntimePreparationError(RuntimeError):
@@ -447,6 +454,127 @@ def validate_environment_for_refresh(base):
     return _validate_environment(base, refreshable=True)
 
 
+def first_setup_pending(base):
+    """True until the person marks first setup finished; then always False.
+
+    Only the exact private record {"version":1,"mode":"protected"} ends first
+    setup. Anything else at that name fails closed and is never overwritten.
+    """
+    try:
+        base = _directory(base)
+        record = base / NETWORK_MODE_NAME
+        if not os.path.lexists(str(record)):
+            return True
+        raw, _ = _read(record, cap=4096)
+        _need(_json(_parse(raw)) == _json(_FINISHED_MODE), 'invalid-network-mode')
+        return False
+    except Exception:
+        raise RuntimePreparationError('invalid-network-mode') from None
+
+
+def require_first_setup(base):
+    _need(first_setup_pending(base), 'first-setup-finished')
+
+
+def finish_first_setup(base):
+    """Record, once, that every later start is protected. Returns False if already recorded."""
+    staged = None
+    try:
+        base = _directory(base)
+        if not first_setup_pending(base):
+            return False
+        staged = base / ('.' + NETWORK_MODE_NAME + '-' + uuid.uuid4().hex)
+        _write(staged, _json(_FINISHED_MODE))
+        os.replace(str(staged), str(base / NETWORK_MODE_NAME))
+        staged = None
+        _sync(base)
+        _need(not first_setup_pending(base), 'network-mode-write-failed')
+        return True
+    except RuntimePreparationError:
+        raise
+    except Exception:
+        raise RuntimePreparationError('network-mode-write-failed') from None
+    finally:
+        if staged is not None:
+            try:
+                os.unlink(str(staged))  # Only this call's own unpublished temporary file.
+            except OSError:
+                pass
+
+
+def _current_sources():
+    files = {name: _read(HERE / source, private=False)[0] for name, source in _SOURCE_NAMES.items()}
+    _need(_sha(files['packet_policy.py']) == PACKET_SHA256, 'reviewed-policy-digest-mismatch')
+    return files
+
+
+def _publish_files(base, meta, files, staged, *, backend_source=None, source_q=None, **updates):
+    """Write each file as a new private temporary, atomically replace, then rewrite the record."""
+    manifest = dict(meta['source_sha256'])
+    pending = []
+    for name, raw in files.items():
+        temporary = base / ('.' + name + '-' + uuid.uuid4().hex)
+        staged.append(temporary)
+        _write(temporary, raw, 0o700 if name == 'launcher.py' else 0o600)
+        if name == 'gvproxy-darwin':
+            _preserve_quarantine(backend_source, temporary, source_q)
+        manifest[name] = _sha(raw)
+        pending.append((temporary, name))
+    for temporary, name in pending:
+        os.replace(str(temporary), str(base / name))
+        staged.remove(temporary)
+    _sync(base)
+    record = base / ('.environment-' + uuid.uuid4().hex)
+    staged.append(record)
+    _write(record, _json(dict(meta, source_sha256=manifest, **updates)))
+    os.replace(str(record), str(base / 'environment.json'))
+    staged.remove(record)
+    _sync(base)
+
+
+def _discard(staged):
+    for path in staged:
+        try:
+            os.unlink(str(path))  # Only this call's own unpublished temporary files.
+        except OSError:
+            pass
+
+
+def environment_sources_outdated(base):
+    """True if an intact, signed environment holds older launcher code than this build.
+
+    Raises if anything in the environment changed; that is never repaired.
+    """
+    meta = validate_environment(base)
+    return any(meta['source_sha256'][name] != _sha(raw) for name, raw in _current_sources().items())
+
+
+def refresh_sources(base):
+    """Give an intact, signed environment this build's reviewed code; nothing else.
+
+    The backend copy and its quarantine, packet-filter policy, receipts, VM and
+    Tart bindings and the mailbox are kept and must validate before and after.
+    Returns True if any code file was replaced.
+    """
+    staged = []
+    try:
+        base = _directory(base)
+        meta = validate_environment(base)
+        files = {name: raw for name, raw in _current_sources().items()
+                 if _sha(raw) != meta['source_sha256'][name]}
+        if not files:
+            return False
+        _publish_files(base, meta, files, staged)
+        _validate_environment(base)
+        return True
+    except RuntimePreparationError:
+        raise
+    except Exception:
+        raise RuntimePreparationError('environment-refresh-failed') from None
+    finally:
+        _discard(staged)
+
+
 def environment_needs_refresh(base):
     """True if a published environment must take the current launcher code and backend.
 
@@ -481,30 +609,10 @@ def refresh_environment(base, gvproxy_path):
         backend, _ = _verified_backend(gvproxy_path)
         source_q = _quarantine(_path(gvproxy_path))
         _need(bool(source_q), 'backend-source-quarantine-required')
-        files = {name: _read(HERE / source, private=False)[0] for name, source in _SOURCE_NAMES.items()}
-        _need(_sha(files['packet_policy.py']) == PACKET_SHA256, 'reviewed-policy-digest-mismatch')
+        files = _current_sources()
         files['gvproxy-darwin'] = backend
-        manifest = dict(meta['source_sha256'])
-        pending = []
-        for name, raw in files.items():
-            temporary = base / ('.' + name + '-' + uuid.uuid4().hex)
-            staged.append(temporary)
-            _write(temporary, raw, 0o700 if name == 'launcher.py' else 0o600)
-            if name == 'gvproxy-darwin':
-                _preserve_quarantine(_path(gvproxy_path), temporary, source_q)
-            manifest[name] = _sha(raw)
-            pending.append((temporary, name))
-        for temporary, name in pending:
-            os.replace(str(temporary), str(base / name))
-            staged.remove(temporary)
-        _sync(base)
-        record = base / ('.environment-' + uuid.uuid4().hex)
-        staged.append(record)
-        _write(record, _json(dict(meta, source_sha256=manifest, backend_assessment=BACKEND_ASSESSMENT,
-                                  backend_quarantine_sha256=_qhash(source_q))))
-        os.replace(str(record), str(base / 'environment.json'))
-        staged.remove(record)
-        _sync(base)
+        _publish_files(base, meta, files, staged, backend_source=_path(gvproxy_path), source_q=source_q,
+                       backend_assessment=BACKEND_ASSESSMENT, backend_quarantine_sha256=_qhash(source_q))
         _validate_environment(base)
         return True
     except RuntimePreparationError:
@@ -512,11 +620,7 @@ def refresh_environment(base, gvproxy_path):
     except Exception:
         raise RuntimePreparationError('environment-refresh-failed') from None
     finally:
-        for path in staged:
-            try:
-                os.unlink(str(path))  # Only this call's own unpublished temporary files.
-            except OSError:
-                pass
+        _discard(staged)
 
 
 def status_directory(base, meta):
@@ -567,10 +671,16 @@ def authorize_backend_execution_bit(base, meta, *, acknowledged=False):
     _need(_quarantine_kept(path, meta), 'backend-quarantine-changed')
 
 
-def build_tart_command(base, meta, vm_name, network_fd, share_plan, no_graphics=False, recovery=False):
-    _need(vm_name == meta['vm_name'] and type(network_fd) is int and network_fd >= 0,
-          'invalid-v2-launch-binding')
-    command = [meta['tart_binding']['path'], 'run', vm_name, '--net-fd=' + str(network_fd), '--no-clipboard']
+def build_tart_command(base, meta, vm_name, network_fd, share_plan, no_graphics=False, recovery=False,
+                       *, first_setup=False):
+    _need(vm_name == meta['vm_name'], 'invalid-v2-launch-binding')
+    if first_setup:
+        # Tart's own normal network for first setup only: no fenced NIC, no filter.
+        _need(network_fd is None and not recovery, 'invalid-v2-launch-binding')
+        command = [meta['tart_binding']['path'], 'run', vm_name, '--no-clipboard']
+    else:
+        _need(type(network_fd) is int and network_fd >= 0, 'invalid-v2-launch-binding')
+        command = [meta['tart_binding']['path'], 'run', vm_name, '--net-fd=' + str(network_fd), '--no-clipboard']
     if recovery:
         command.append('--recovery')
     else:

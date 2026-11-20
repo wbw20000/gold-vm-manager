@@ -393,8 +393,12 @@ class Controller:
     def _preinstalled_status(self, base, runtime):
         # Guest mailbox is untrusted evidence from one purpose-built private share.
         # It must never elevate guest claims to a verified connection or desktop.
-        from preinstall_runtime import read_guest_status
-        result = {'configuration_staged': True, 'configuration': 'not_observed',
+        from preinstall_runtime import read_guest_status, first_setup_pending, RuntimePreparationError
+        try:
+            pending = first_setup_pending(base)
+        except RuntimePreparationError:
+            pending = None  # Reported as an error; no start chooses a network for it.
+        result = {'first_setup_pending': pending, 'configuration_staged': True, 'configuration': 'not_observed',
                   'application': 'not_observed', 'system_authorization': 'user_action_may_be_required',
                   'host_authorization_pending': runtime.get('state') in (None, 'awaiting_host_authorization'),
                   'desktop_verified': False, 'vpn_connected': False, 'network_independently_verified': False}
@@ -482,6 +486,9 @@ class Controller:
                     profile = setup_profile.validate()
                     error = '初始化模板无效，请重新选择，不自动执行'
                 recovery_mode = runtime.get('recovery_mode') is True and vm_state == 'running'
+                preinstall_status = self._preinstalled_status(base, runtime) if preinstalled else None
+                if preinstall_status is not None and preinstall_status['first_setup_pending'] is None:
+                    error = '首次设置记录（network-mode.json）异常；不会启动，请检查私有运行目录。'
                 pause_supported = vm not in ISOLATED_VMS and not managed_environment and not effective_shares(active)
                 protected_ready = (base / 'launcher.py').is_file()
                 if vm_state == 'running':
@@ -504,12 +511,13 @@ class Controller:
                     'disk_gb': item.get('Disk'), 'allocated_gb': item.get('Size'),
                     'network': {'protected': protected_ready,
                                 'blocked': control.get('drop_proxy') is True,
-                                'management_enabled': runtime.get('management_enabled') is True and vm_state == 'running'},
+                                'management_enabled': runtime.get('management_enabled') is True and vm_state == 'running',
+                                'normal_network': vm_state == 'running' and runtime.get('network_mode') == 'first-setup-normal-network'},
                     'shares': desired, 'active_shares': active, 'shares_locked': vm in ISOLATED_VMS, 'pending_share_changes': pending,
                     'pause_supported': pause_supported, 'busy': vm in self.operations or self.build_busy(vm),
                     'rebuild_supported': not preinstalled and vm not in ISOLATED_VMS and settings.get('os', 'darwin') == 'darwin',
                     'setup_required': setup_active, 'setup_profile': profile,
-                    'preinstalled': self._preinstalled_status(base, runtime) if preinstalled else None,
+                    'preinstalled': preinstall_status,
                     'recovery_supported': setup_active and vm not in ISOLATED_VMS,
                     'recovery_mode': recovery_mode,
                     'operation': self.operations.get(vm), 'last_error': error, 'last_event': latest,
@@ -597,10 +605,12 @@ class Controller:
 
     def action(self, vm, payload):
         self._vm(vm)
-        if not isinstance(payload, dict) or set(payload) - {'action', 'confirm_name', 'acknowledge_reviewed_unsigned_backend'}:
+        if not isinstance(payload, dict) or set(payload) - {'action', 'confirm_name', 'acknowledge_reviewed_unsigned_backend',
+                                                            'first_setup_normal_network'}:
             raise AppError('操作请求格式错误')
         action = payload.get('action')
-        if action not in ('start', 'pause', 'shutdown', 'force-stop', 'discard-state', 'focus', 'recovery-start'):
+        if action not in ('start', 'pause', 'shutdown', 'force-stop', 'discard-state', 'focus', 'recovery-start',
+                          'finish-first-setup'):
             raise AppError('不支持此 VM 操作')
         if action in ('force-stop', 'discard-state', 'recovery-start') and payload.get('confirm_name') != vm:
             raise AppError('请输入完整 VM 名称以确认可能丢失未保存内容的操作', 'confirmation_required')
@@ -614,12 +624,29 @@ class Controller:
             base = self._vm(vm)
             preinstalled = self._environment(vm).get('version') == 2
             launch_ack = False
+            first_setup = False
             if 'acknowledge_reviewed_unsigned_backend' in payload and (not preinstalled or action != 'start'):
                 raise AppError('此操作不接受后端授权字段', 'invalid_execution_consent')
+            if 'first_setup_normal_network' in payload and (not preinstalled or action != 'start'):
+                raise AppError('此操作不接受首次设置字段', 'invalid_execution_consent')
+            if action == 'finish-first-setup':
+                return self._finish_first_setup(vm, base, preinstalled, state)
             if preinstalled and action == 'start' and state != 'running':
-                if (state != 'stopped' or payload.get('confirm_name') != vm
-                        or payload.get('acknowledge_reviewed_unsigned_backend') is not True):
-                    raise AppError('请确认完整 VM 名称和此台 VM 的后端执行提示；不会自动启动。', 'host_authorization_required', 409)
+                # First setup runs on Tart's normal network until the person marks it
+                # finished (owner's decision, 2026-11-19); after that only protected starts.
+                if self._first_setup_pending(base):
+                    if (state != 'stopped' or payload.get('confirm_name') != vm
+                            or payload.get('first_setup_normal_network') is not True
+                            or 'acknowledge_reviewed_unsigned_backend' in payload):
+                        raise AppError('首次设置使用普通网络：请确认这一点并输入完整 VM 名称；不会自动启动。',
+                                       'first_setup_confirmation_required', 409)
+                    first_setup = True
+                else:
+                    if 'first_setup_normal_network' in payload:
+                        raise AppError('首次设置已完成，之后只走受保护启动，不再使用普通网络。', 'first_setup_finished', 409)
+                    if (state != 'stopped' or payload.get('confirm_name') != vm
+                            or payload.get('acknowledge_reviewed_unsigned_backend') is not True):
+                        raise AppError('请确认完整 VM 名称和此台 VM 的后端执行提示；不会自动启动。', 'host_authorization_required', 409)
                 self._require_preinstall_publication(vm, base)
                 launch_ack = True
             if action == 'recovery-start':
@@ -660,12 +687,39 @@ class Controller:
                     raise AppError(str(e), 'share_preflight_failed', 409) from None
             self.operations[vm] = {'action': action, 'started_at': now()}
             self.errors.pop(vm, None)
-            worker = threading.Thread(target=self._perform, args=(vm, action, True) if launch_ack else (vm, action), daemon=True)
+            worker = threading.Thread(target=self._perform, daemon=True, args=(
+                (vm, action, True, True) if first_setup else (vm, action, True) if launch_ack else (vm, action)))
             worker.start()
+            if first_setup:
+                return {'ok': True, 'message': '正在用普通网络启动首次设置；这次不经过网络过滤'}
             return {'ok': True, 'message': {'start': '正在启动或恢复 VM', 'pause': '正在保存暂停状态',
                     'shutdown': '已请求正常关机，请留意客机提示（macOS 可能需要确认）',
                     'force-stop': '正在强制停止 VM', 'discard-state': '正在丢弃已确认的暂停状态',
                     'focus': '正在打开 VM 窗口', 'recovery-start': '正在以受保护恢复模式启动；未抹盘或更改密码'}[action]}
+
+    def _first_setup_pending(self, base):
+        import preinstall_runtime
+        try:
+            return preinstall_runtime.first_setup_pending(base)
+        except preinstall_runtime.RuntimePreparationError:
+            raise AppError('首次设置记录（network-mode.json）未通过核对；不会启动，也不会自动选择网络方式。',
+                           'invalid_network_mode', 409) from None
+
+    def _finish_first_setup(self, vm, base, preinstalled, state):
+        import preinstall_runtime
+        if not preinstalled:
+            raise AppError('只有预装的 VM 有首次设置。', 'first_setup_unavailable', 409)
+        try:
+            changed = preinstall_runtime.finish_first_setup(base)
+        except preinstall_runtime.RuntimePreparationError as error:
+            raise AppError('首次设置记录未通过核对（' + error.code + '）；没有更改。', 'invalid_network_mode', 409) from None
+        if not changed:
+            return {'ok': True, 'message': '首次设置早已标记完成；之后都走受保护启动。'}
+        message = '已记录首次设置完成：之后每次启动都走受保护启动，客机只能连到你的 VPN 节点。'
+        if state == 'running':
+            message += '当前这次运行仍是普通网络，关机后生效。'
+        self.event(vm, 'finish-first-setup', message)
+        return {'ok': True, 'message': message}
 
     def _refresh_runtime(self, vm):
         """Before a confirmed preinstalled start, move an older environment to the signed backend.
@@ -680,13 +734,15 @@ class Controller:
         import preinstall_runtime
         base = self.bases()[vm]
         try:
-            if not preinstall_runtime.environment_needs_refresh(base):
-                return
-            self.event(vm, 'start', '正在获取 Red Hat 签名并经公证的网络后端（Podman 官方安装包，约 77 MB）；不安装 Podman')
-            package = host_artifacts.acquire('podman-installer', STATE_DIR / 'host-materials')
-            backend = host_tools.ensure_gvproxy(STATE_DIR / 'tools', artifact_receipt=package)
-            if preinstall_runtime.refresh_environment(base, backend.executable_path):
-                self.event(vm, 'start', '已换用签名版网络后端并更新受保护启动文件；VM 磁盘和网络过滤规则未改动')
+            if preinstall_runtime.environment_needs_refresh(base):
+                self.event(vm, 'start', '正在获取 Red Hat 签名并经公证的网络后端（Podman 官方安装包，约 77 MB）；不安装 Podman')
+                package = host_artifacts.acquire('podman-installer', STATE_DIR / 'host-materials')
+                backend = host_tools.ensure_gvproxy(STATE_DIR / 'tools', artifact_receipt=package)
+                if preinstall_runtime.refresh_environment(base, backend.executable_path):
+                    self.event(vm, 'start', '已换用签名版网络后端并更新受保护启动文件；VM 磁盘和网络过滤规则未改动')
+            elif preinstall_runtime.refresh_sources(base):
+                # An intact signed environment takes this build's launcher code only.
+                self.event(vm, 'start', '已把受保护启动文件更新到当前版本；网络后端、VM 磁盘和网络过滤规则未改动')
         except host_artifacts.ArtifactError as error:
             raise AppError('无法获取签名版网络后端（' + error.code + '）；未启动 VM。', 'backend_refresh_failed', 409) from None
         except host_tools.HostToolError as error:
@@ -694,7 +750,7 @@ class Controller:
         except preinstall_runtime.RuntimePreparationError as error:
             raise AppError('受保护启动文件未通过核对（' + error.code + '）；未启动 VM。', 'backend_refresh_failed', 409) from None
 
-    def _perform(self, vm, action, launch_ack=False):
+    def _perform(self, vm, action, launch_ack=False, first_setup=False):
         try:
             if launch_ack:
                 self._refresh_runtime(vm)
@@ -706,7 +762,9 @@ class Controller:
                     argv = ['/usr/bin/python3', '-B', str(self.bases()[vm] / 'launcher.py')]
                     if action == 'recovery-start':
                         argv.append('--recovery')
-                    if launch_ack:
+                    if launch_ack and first_setup:
+                        argv.append('--first-setup-normal-network')
+                    elif launch_ack:
                         argv += ['--acknowledge-reviewed-unsigned-backend', '--enable-reviewed-backend-owner-execute']
                     proc = subprocess.Popen(argv,
                         stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
@@ -716,11 +774,15 @@ class Controller:
                 deadline = time.monotonic() + 25
                 while time.monotonic() < deadline:
                     if proc.poll() is not None:
-                        if launch_ack and self._runtime(vm).get('state') == 'awaiting_host_authorization':
+                        if first_setup and self._runtime(vm).get('reason') == 'first-setup-finished':
+                            raise AppError('首次设置已标记完成；没有用普通网络启动。', 'first_setup_finished', 409)
+                        if launch_ack and not first_setup and self._runtime(vm).get('state') == 'awaiting_host_authorization':
                             raise AppError('后端未获得本机执行许可或启动未就绪；未启动 VM，也不会重试、移除隔离属性或改用普通网络。', 'host_authorization_required', 409)
                         raise AppError('受保护启动器提前退出；没有使用无保护网络回退。请查看应用日志。', 'launcher_exited', 500)
                     if self.inventory(fresh=True).get(vm, {}).get('State') == 'running':
-                        self.event(vm, action, '恢复模式已启动，未附加宿主共享目录' if action == 'recovery-start' else 'VM 已运行，保留原网络防护')
+                        self.event(vm, action, '恢复模式已启动，未附加宿主共享目录' if action == 'recovery-start'
+                                   else 'VM 已运行：首次设置使用普通网络，未经过网络过滤' if first_setup
+                                   else 'VM 已运行，保留原网络防护')
                         return
                     time.sleep(0.3)
                 raise AppError('VM 启动仍未确认；不会自动重试或重复启动，请刷新状态', 'startup_unconfirmed', 504)

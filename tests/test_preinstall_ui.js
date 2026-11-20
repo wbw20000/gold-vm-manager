@@ -736,3 +736,64 @@ test('a failure while re-attaching with ownership enabled is named as its own st
   assert.match(text, /失败步骤：以启用所有权方式重新挂载（owners-on-reattach）/);
   assert.match(text, /代码：offline-vpn-failed-retained \/ seed-changed-before-ownership-apply/);
 });
+
+test('first setup starts on the normal network with its own named consent; marking it finished switches to protected starts', async () => {
+  const nodes = new Map();
+  const node = (id) => {
+    if (!nodes.has(id)) nodes.set(id, { id, value: '', hidden: false, disabled: false, textContent: '', className: '', required: false,
+      open: false, showModal() { this.open = true; }, close() { this.open = false; }, focus() {}, querySelectorAll() { return []; } });
+    return nodes.get(id);
+  };
+  const calls = [];
+  let current = { id: 'gold', state: 'stopped', preinstalled: { first_setup_pending: true } };
+  const sandbox = { $: node, connected: true, confirmContext: null, confirmBusy: false, lastActionError: '', busyVMs: new Set(),
+    buildActive: () => false, locked: () => false, vmById: () => current, render: () => {},
+    api: async (route, options) => { calls.push(JSON.stringify([route, options.method, options.body])); return { ok: true, message: 'ok' }; },
+    refresh: async () => {}, toast: () => {}, showError: (id, message) => { throw new Error(message); } };
+  vm.createContext(sandbox);
+  vm.runInContext(appSource.match(/^ {2}const ACTION_LABELS = .*;$/m)[0].replace('const ', 'var '), sandbox);
+  for (const name of ['openActionConfirm', 'confirmSubmitDisabled', 'submitConfirm', 'runAction']) vm.runInContext(declaration(name), sandbox);
+  const submit = () => sandbox.submitConfirm({ preventDefault() {} });
+
+  sandbox.openActionConfirm('gold', 'start');
+  assert.equal(node('confirm-dialog').open, true);
+  assert.match(node('confirm-description').textContent, /普通网络/);
+  assert.match(node('confirm-description').textContent, /真实 IP/);
+  assert.match(node('confirm-description').textContent, /标记首次设置完成/);
+  assert.equal(node('confirm-submit').textContent, '用普通网络启动首次设置');
+  assert.equal(node('confirm-input-group').hidden, false);
+  node('confirm-name').value = 'gold';
+  await submit();
+  assert.equal(calls.pop(), JSON.stringify(['/api/vms/gold/action', 'POST', { action: 'start', confirm_name: 'gold', first_setup_normal_network: true }]));
+  assert.equal(node('confirm-dialog').open, false);
+
+  // A stale or forged call can never mix the two consents or skip the typed name.
+  for (const args of [['gold', true, false], ['gold', true, true], ['gold ', false, true], [undefined, false, true]]) {
+    assert.equal(await sandbox.runAction('gold', 'start', args[0], args[1], args[2]), false, JSON.stringify(args));
+  }
+  assert.equal(calls.length, 0);
+
+  sandbox.openActionConfirm('gold', 'finish-first-setup');
+  assert.match(node('confirm-description').textContent, /不能撤销/);
+  assert.match(node('confirm-description').textContent, /连上节点/);
+  assert.equal(node('confirm-input-group').hidden, true);
+  await submit();
+  assert.equal(calls.pop(), JSON.stringify(['/api/vms/gold/action', 'POST', { action: 'finish-first-setup' }]));
+
+  current = { id: 'gold', state: 'stopped', preinstalled: { first_setup_pending: false } };
+  sandbox.openActionConfirm('gold', 'finish-first-setup');
+  assert.equal(node('confirm-dialog').open, false, 'nothing to mark once first setup is finished');
+  sandbox.openActionConfirm('gold', 'start');
+  assert.equal(node('confirm-submit').textContent, '同意尝试受保护启动');
+  assert.doesNotMatch(node('confirm-description').textContent, /普通网络启动首次设置/);
+  node('confirm-name').value = 'gold';
+  await submit();
+  assert.equal(calls.pop(), JSON.stringify(['/api/vms/gold/action', 'POST', { action: 'start', confirm_name: 'gold', acknowledge_reviewed_unsigned_backend: true }]));
+  assert.equal(await sandbox.runAction('gold', 'start', 'gold', false, true), false, 'no normal network once first setup is finished');
+  assert.equal(calls.length, 0);
+
+  const card = declaration('renderMachine');
+  assert.match(card, /标记首次设置完成…/);
+  assert.match(card, /首次设置 · 普通网络，未过滤/);
+  assert.match(card, /network\.normal_network/);
+});

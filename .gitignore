@@ -78,6 +78,8 @@ shares.last-start.json
 *.yaml
 *.yml
 !/examples/vpn/clash.yaml
+# Public build automation, not a VPN configuration.
+!/.github/workflows/update-usage-days.yml
 *.local.json
 .env
 .env.*

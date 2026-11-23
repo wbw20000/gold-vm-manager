@@ -1,5 +1,9 @@
 # Gold VM Manager
 
+**[Join the Gold VM WeChat group](https://weixin.qq.com/g/AQYAAMoC6cPVM_wJbKwTY4TAaGCjDxIoHfW81qVt9QjcPD3nTesOm66syMumSJMb)** · Scan with WeChat, or long-press the code in WeChat on mobile. Group invitations expire.
+
+<a href="docs/media/wechat-group.png?raw=true"><img src="docs/media/wechat-group.png" width="180" alt="Gold VM WeChat group QR code; click to enlarge"></a>
+
 Run Claude Code in a dedicated macOS VM on an Apple Silicon Mac. First setup uses ordinary networking. After setup, Protected Start restricts outbound traffic to the configured proxy endpoints rather than falling back to a direct connection.
 
 **[Download v1.4.0 source](https://github.com/wbw20000/gold-vm-manager/releases/tag/v1.4.0) · [Watch the 23-second install guide](docs/media/guest-install.gif?raw=true) · [Download and fill in the YAML](#download-and-fill-in-the-yaml-host-mac) · [After installing the four apps](#after-installing-the-four-apps-guest) · [简体中文](README.md)**

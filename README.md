@@ -1,5 +1,9 @@
 # Gold VM Manager
 
+**[加入 Gold VM 微信交流群](https://weixin.qq.com/g/AQYAAMoC6cPVM_wJbKwTY4TAaGCjDxIoHfW81qVt9QjcPD3nTesOm66syMumSJMb)** · 用微信扫一扫；手机上可长按识别。群邀请有有效期。
+
+<a href="docs/media/wechat-group.png?raw=true"><img src="docs/media/wechat-group.png" width="180" alt="Gold VM 微信交流群二维码，点开放大"></a>
+
 在 Apple Silicon Mac 上创建独立的 macOS 虚拟机，在客机里使用 Claude Code。首次设置用普通网络；完成设置后，受保护启动只允许客机通过已配置的代理节点出站，不会在代理断开时自动直连。
 
 **[下载 v1.4.0 源码](https://github.com/wbw20000/gold-vm-manager/releases/tag/v1.4.0) · [看 23 秒安装演示](docs/media/guest-install.gif?raw=true) · [下载并填写 YAML](#下载并填写-yaml宿主-mac) · [四个应用装好后怎么用](#四个应用装好后怎么用客机) · [English](README.en.md)**

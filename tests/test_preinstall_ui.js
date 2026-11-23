@@ -29,6 +29,7 @@ function fixtureDOM() {
     get id() { return this._id; }
     set textContent(value) { this._text = String(value); this.children = []; }
     get textContent() { return this._text + this.children.map(n => n.textContent).join(''); }
+    get childElementCount() { return this.children.length; }
     setAttribute(name, value) { this.attributes[name] = value; }
     append(...items) { for (const item of items) { item.parentNode = this; this.children.push(item); } }
     replaceChildren(...items) { this._text = ''; this.children = []; this.append(...items); }
@@ -197,6 +198,29 @@ test('one explicit final button authorizes listed changes, never an implicit for
   assert.equal(payload.acknowledge_network_policy, true);
   assert.equal('acknowledge_guest_autoconfigure' in payload, false, 'nothing is configured inside the guest any more');
   assert.equal(f.n('normalization-note').hidden, true);
+});
+
+test('new VM disk shows its range and reason; only chosen integer GiB values reach create', async () => {
+  const f = fixture();
+  const disk = f.n('disk'), reason = f.n('disk-error');
+  assert.deepEqual([disk.min, disk.max, disk.step, disk.value], ['30', '1024', '1', '50']);
+  assert.match(disk.parentNode.children[0].textContent, /30–1024 GiB.*整数/);
+  assert.match(f.n('dialog').textContent, /较小的磁盘.*macOS.*更新/);
+  assert.match(f.n('dialog').textContent, /同一卷.*30 GiB.*缓存.*42 GiB.*导入.*62 GiB/);
+  f.context.host.free_disk_gib = 1; // Displayed snapshot alone is not a size-policy gate.
+  for (const [value, ok] of [[29, false], [30, true], [31, true], [49, true], [50, true], [1024, true], [1025, false], [30.5, false], ['', false]]) {
+    if (!f.n('dialog').open) {
+      await f.controller.open(); await f.set('name', 'new VM'); await f.set('deferVpn', true);
+    }
+    await f.set('disk', String(value));
+    assert.equal(reason.hidden, ok, `disk ${value}`);
+    assert.equal(f.n('submit').disabled, !ok);
+    if (ok) {
+      await f.n('submit').click();
+      assert.equal(f.calls.at(-1).options.body.disk_gib, value);
+    } else assert.match(reason.textContent, /磁盘容量无效.*30–1024 GiB.*整数/);
+  }
+  assert.deepEqual(f.calls.filter(c => c.route.endsWith('/create')).map(c => c.options.body.disk_gib), [30, 31, 49, 50, 1024]);
 });
 
 test('only new names, valid explicit local IPSW and credential-free loopback transport accepted', async () => {
@@ -440,6 +464,89 @@ function declaration(name) {
   const end = appSource.indexOf('\n  }', start) + 4;
   return appSource.slice(start, end);
 }
+
+// Only production dialog handlers and fake DOM/state/requests; no backend or disks.
+function growthFixture(bytes = 49 * 2 ** 30 + 512) {
+  const doc = fixtureDOM(), $ = id => doc.getElementById(id);
+  for (const [, tag, id] of html.matchAll(/<(\w+) id="(growth-[\w-]+)"/g)) doc.createElement(tag).id = id;
+  const item = { id: '测试 VM', state: 'stopped', busy: false, disk_capacity_bytes: bytes, disk_growth_supported: true, allocated_gb: 9 };
+  const posts = [], notices = [], reads = [];
+  const s = { $, GIB: 2 ** 30, selectedVM: item.id, growthContext: null, busyVMs: new Set(), pollFlight: null, connected: true,
+    state: { vms: [item] }, STATE_LABELS: {}, ACTION_LABELS: {}, buildActive: () => false, render() {}, toast: message => notices.push(message),
+    api: async (route, options) => posts.push(JSON.parse(JSON.stringify([route, options]))), refresh: async () => reads.push('state'),
+    el: (tag, cls, text) => { const e = doc.createElement(tag); if (text != null) e.textContent = text; return e; },
+    actionButton: (label, icon, cls, handler, disabled) => { const b = doc.createElement('button'); b.textContent = label; b.disabled = disabled; b.addEventListener('click', handler); return b; },
+  };
+  vm.createContext(s);
+  for (const name of ['vmById', 'activeShares', 'vmBusy', 'locked', 'stateLabel']) vm.runInContext(appSource.match(new RegExp('^  function ' + name + '\\(.*$', 'm'))[0], s);
+  for (const name of ['number', 'renderMachine', 'mountGrowth', 'canGrowDisk', 'openGrowth', 'updateGrowthForm', 'submitGrowth']) vm.runInContext(declaration(name), s);
+  s.mountGrowth();
+  function entry() { return s.renderMachine(item).children.flatMap(row => row.children).find(b => b.textContent === '扩容磁盘…'); }
+  async function target(value) { $('growth-target').value = String(value); await $('growth-target').fire('input'); }
+  return { s, $, item, entry, target, posts, notices, reads };
+}
+
+test('disk expansion requires a supported selected stopped VM with exact capacity and no pending work', () => {
+  const f = growthFixture();
+  for (const change of [{ disk_growth_supported: false }, { disk_growth_supported: 'yes' }, { state: 'running' }, { state: 'suspended' },
+    { busy: true }, { disk_capacity_bytes: null }, { disk_capacity_bytes: 0 }, { disk_capacity_bytes: 1024 * 2 ** 30 }]) {
+    const saved = { ...f.item }; Object.assign(f.item, change);
+    assert.equal(f.entry(), undefined); f.s.openGrowth(f.item.id); assert.equal(f.s.growthContext, null);
+    Object.assign(f.item, saved);
+  }
+  f.s.connected = false; assert.equal(f.entry(), undefined); f.s.connected = true;
+  f.s.selectedVM = 'other'; assert.equal(f.entry(), undefined); f.s.selectedVM = f.item.id;
+  f.s.buildActive = () => true; assert.equal(f.entry(), undefined); f.s.buildActive = () => false;
+  assert.ok(f.entry()); assert.deepEqual(f.posts, []);
+});
+
+test('expansion is an explicit once-only confirmation of total GiB against the exact current bytes', async () => {
+  const GIB = 2 ** 30, f = growthFixture(50 * GIB - 512);
+  await f.entry().click();
+  assert.match(f.$('growth-title').textContent, /测试 VM/);
+  assert.match(f.$('growth-current').textContent, new RegExp(`${50 * GIB - 512} 字节.*宿主已分配空间：9 GB`));
+  assert.match(html, /建议先备份.*不在宿主机挂载或格式化.*客机内扩展 GPT 分区和 APFS 容器/);
+  for (const [target, why] of [[29, /30–1024/], [49, /只能扩大.*至少为 50/], [50.1, /整数/], [1025, /30–1024/]]) {
+    await f.target(target); assert.equal(f.$('growth-submit').disabled, true); assert.match(f.$('growth-error').textContent, why);
+  }
+  await f.target(50); assert.equal(f.$('growth-submit').disabled, false); assert.equal(f.$('growth-error').hidden, true);
+  assert.match(html, /id="growth-submit"[^>]*type="button"/);
+  assert.equal((await f.$('growth-form').fire('submit')).prevented, true); assert.deepEqual(f.posts, []);
+  const send = f.s.api; let finish;
+  f.s.api = (route, opts) => { send(route, opts); return new Promise(resolve => { finish = resolve; }); };
+  const posting = f.$('growth-submit').click(); await f.s.submitGrowth();
+  assert.deepEqual(f.posts, [[`/api/vms/${encodeURIComponent(f.item.id)}/expand-disk`, { method: 'POST',
+    body: { target_gib: 50, expected_bytes: 50 * GIB - 512, acknowledge_growth: true } }]]);
+  assert.equal(f.$('growth-target').disabled, true); assert.equal(f.$('growth-cancel').disabled, true);
+  assert.equal((await f.$('growth-dialog').fire('cancel')).prevented, true); assert.equal(f.entry(), undefined);
+  let drain; f.s.pollFlight = new Promise(resolve => { drain = resolve; });
+  finish(); await Promise.resolve(); assert.deepEqual(f.reads, []);
+  drain(); await posting;
+  assert.deepEqual(f.reads, ['state']); assert.equal(f.$('growth-dialog').open, false); assert.equal(f.s.busyVMs.size, 0);
+});
+
+test('stale growth dialogs cannot recover their confirmation when state changes back', async () => {
+  for (const change of [f => { f.item.disk_capacity_bytes += 512; }, f => { f.item.state = 'running'; }, f => { f.s.selectedVM = 'other'; }, f => { f.s.connected = false; }]) {
+    const f = growthFixture(); await f.entry().click(); await f.target(1024);
+    const bytes = f.item.disk_capacity_bytes;
+    change(f); f.s.updateGrowthForm();
+    assert.equal(f.$('growth-submit').disabled, true); assert.match(f.$('growth-error').textContent, /已变化.*重新打开/);
+    f.item.disk_capacity_bytes = bytes; f.item.state = 'stopped'; f.s.selectedVM = f.item.id; f.s.connected = true;
+    f.s.updateGrowthForm(); await f.s.submitGrowth(); assert.deepEqual(f.posts, []);
+  }
+});
+
+test('growth conflicts refresh authoritative capacity without local changes, retries, or silent errors', async () => {
+  const f = growthFixture(50 * 2 ** 30), send = f.s.api;
+  f.s.api = async (route, opts) => { await send(route, opts); throw new Error('容量冲突'); };
+  await f.entry().click(); await f.target(50); assert.equal(f.$('growth-submit').disabled, true, 'no equal-size growth');
+  await f.target(1024); await f.$('growth-submit').click();
+  assert.deepEqual(f.reads, ['state']); assert.equal(f.item.disk_capacity_bytes, 50 * 2 ** 30);
+  assert.equal(f.$('growth-dialog').open, true); assert.match(f.$('growth-error').textContent, /容量冲突.*核对/);
+  assert.equal(f.$('growth-target').disabled, true); assert.equal(f.$('growth-submit').disabled, true);
+  assert.equal(f.$('growth-cancel').disabled, false); assert.equal(f.s.busyVMs.size, 0);
+  await f.s.submitGrowth(); assert.equal(f.posts.length, 1); assert.deepEqual(f.notices, []);
+});
 
 test('shared folders keep management actions but offer no host Claude command', () => {
   const choices = declaration('renderShares');

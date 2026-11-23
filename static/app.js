@@ -25,6 +25,8 @@
   let nativePickerBusy = false;
   let deleteContext = null;
   let deleteBusy = false;
+  let growthContext = null;
+  const GIB = 2 ** 30;
   let initializeContext = null;
   const SETUP_LANGUAGES = [['en-US', 'English (United States)'], ['en-GB', 'English (United Kingdom)'], ['zh-Hans', '简体中文'], ['zh-Hant', '繁體中文'], ['ja', '日本語'], ['de', 'Deutsch'], ['fr', 'Français']];
   const SETUP_COUNTRIES = [['US', 'United States'], ['GB', 'United Kingdom'], ['JP', 'Japan'], ['SG', 'Singapore'], ['DE', 'Germany'], ['CA', 'Canada'], ['AU', 'Australia'], ['FR', 'France'], ['NL', 'Netherlands'], ['HK', 'Hong Kong']];
@@ -65,6 +67,7 @@
       power: 'M12 3v8M6.3 5.7a8 8 0 1 0 11.4 0',
       stop: 'M6 6h12v12H6Z',
       rebuild: 'M20 7v5h-5M20 12a8 8 0 1 0-2.3 5.7',
+      expand: 'M4 9V4h5M4 4l6 6m10 5v5h-5m5 0-6-6',
       recovery: 'M12 3a9 9 0 1 0 9 9M12 7v5l3 3M16 3h5v5',
       trash: 'M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7',
       check: 'M5 12l5 5L20 7',
@@ -146,6 +149,7 @@
     $('preinstall-new').disabled = !connected || !preinstallUI || buildActive();
     preinstallUI?.update();
     if (buildContext) updateBuildForm();
+    if (growthContext) updateGrowthForm();
     if (confirmContext && ['action', 'remove'].includes(confirmContext.type)) $('confirm-submit').disabled = confirmBusy || buildActive();
     const banner = $('connection-banner');
     banner.hidden = connected;
@@ -208,7 +212,9 @@
     if (vmBusy(vm)) panel.append(el('div', 'machine-subtitle', `正在处理${ACTION_LABELS[vm.operation?.action || vm.operation] || '操作'}…`));
     else if (vm.setup_required) panel.append(el('span', 'setup-state', '待完成设置'));
     const resources = el('div', 'machine-resources');
-    [['CPU', vm.cpu, ' 核'], ['内存', vm.memory_gib, ' GiB'], ['虚拟磁盘', vm.disk_gb, ' GB']].forEach(([label, value, unit]) => {
+    const capacity = Number.isSafeInteger(vm.disk_capacity_bytes) && vm.disk_capacity_bytes > 0
+      ? ['虚拟磁盘容量', vm.disk_capacity_bytes / GIB, ' GiB'] : ['虚拟磁盘容量', vm.disk_gb, ' GB'];
+    [['CPU', vm.cpu, ' 核'], ['内存', vm.memory_gib, ' GiB'], capacity].forEach(([label, value, unit]) => {
       const resource = el('div');
       const strong = el('strong', '', number(value));
       strong.append(el('small', '', unit));
@@ -240,6 +246,7 @@
     const maintenance = el('div', 'maintenance-actions');
     if (firstSetup) maintenance.append(actionButton('标记首次设置完成…', 'check', 'button button-secondary', () => openActionConfirm(vm.id, 'finish-first-setup'), locked(vm), `finish-setup-${vm.id}`));
     if (vm.recovery_supported) maintenance.append(actionButton('恢复模式…', 'recovery', 'button button-secondary', () => openActionConfirm(vm.id, 'recovery-start'), locked(vm) || vm.state !== 'stopped', `recovery-${vm.id}`));
+    if (canGrowDisk(vm)) maintenance.append(actionButton('扩容磁盘…', 'expand', 'button button-secondary', () => openGrowth(vm.id), false, `grow-${vm.id}`));
     if (vm.rebuild_supported) maintenance.append(actionButton('彻底重建…', 'rebuild', 'button button-secondary', () => openBuild(vm.id), locked(vm) || buildActive(), `rebuild-${vm.id}`));
     if (maintenance.childElementCount) panel.append(maintenance);
     const danger = el('div', 'danger-actions');
@@ -438,6 +445,77 @@
       toast(error.message, true);
       return false;
     } finally { busyVMs.delete(id); render(); }
+  }
+
+  function mountGrowth() {
+    $('growth-target').addEventListener('input', updateGrowthForm);
+    $('growth-form').addEventListener('submit', (event) => event.preventDefault());
+    $('growth-submit').addEventListener('click', submitGrowth);
+    $('growth-dialog').addEventListener('cancel', (event) => { if (growthContext?.pending) event.preventDefault(); });
+    $('growth-dialog').addEventListener('close', () => { growthContext = null; });
+  }
+
+  function canGrowDisk(vm) {
+    return vm?.disk_growth_supported === true && vm.id === selectedVM && vm.state === 'stopped' && !locked(vm) &&
+      Number.isSafeInteger(vm.disk_capacity_bytes) && vm.disk_capacity_bytes > 0 && vm.disk_capacity_bytes < 1024 * GIB;
+  }
+
+  function openGrowth(id) {
+    const vm = vmById(id);
+    if (growthContext || !canGrowDisk(vm)) return;
+    const bytes = vm.disk_capacity_bytes;
+    growthContext = { id, bytes, pending: false, blocker: '' };
+    $('growth-title').textContent = `扩容磁盘 · ${id}`;
+    const allocated = number(vm.allocated_gb, ' GB');
+    $('growth-current').textContent = `当前虚拟磁盘容量：${number(bytes / GIB, ' GiB')}（${bytes} 字节）。宿主已分配空间：${allocated}，不是虚拟磁盘容量，也不是客机剩余空间。`;
+    $('growth-target').value = '';
+    $('growth-dialog').showModal(); updateGrowthForm(); $('growth-target').focus();
+  }
+
+  function updateGrowthForm() {
+    const ctx = growthContext;
+    if (!ctx) return;
+    const vm = vmById(ctx.id), input = $('growth-target');
+    if (!ctx.pending && !ctx.blocker && (!canGrowDisk(vm) || vm.disk_capacity_bytes !== ctx.bytes)) {
+      ctx.blocker = '所选 VM、磁盘容量或操作状态已变化。请关闭并重新打开扩容对话框，核对当前容量。';
+    }
+    const target = Number(input.value);
+    const invalid = !/^\d+$/.test(input.value) || target < 30 || target > 1024 ? '请输入 30–1024 GiB 范围内的整数总容量。' :
+      target * GIB <= ctx.bytes ? `只能扩大磁盘：目标总容量至少为 ${Math.max(30, Math.floor(ctx.bytes / GIB) + 1)} GiB。` : '';
+    const message = ctx.blocker || invalid;
+    $('growth-error').textContent = message; $('growth-error').hidden = !message;
+    input.disabled = ctx.pending || Boolean(ctx.blocker);
+    input.setAttribute('aria-invalid', String(Boolean(invalid)));
+    $('growth-cancel').disabled = ctx.pending;
+    $('growth-submit').disabled = ctx.pending || Boolean(message);
+    $('growth-submit').textContent = ctx.pending ? '正在核对扩容结果…' : invalid ? '确认扩容' : `确认扩容至 ${target} GiB`;
+  }
+
+  async function submitGrowth() {
+    const ctx = growthContext;
+    if (!ctx || ctx.pending || !$('growth-dialog').open) return;
+    updateGrowthForm();
+    if ($('growth-submit').disabled) return;
+    const target = Number($('growth-target').value);
+    ctx.pending = true; busyVMs.add(ctx.id); updateGrowthForm(); render();
+    let success = false;
+    try {
+      await api(`/api/vms/${encodeURIComponent(ctx.id)}/expand-disk`, { method: 'POST',
+        body: { target_gib: target, expected_bytes: ctx.bytes, acknowledge_growth: true } });
+      success = true;
+    } catch (error) {
+      ctx.blocker = `${error.message} 请关闭此窗口，核对最新磁盘容量后再决定是否重新扩容。`;
+    } finally {
+      // A poll started before the POST cannot confirm its outcome. Never update capacity optimistically or retry a POST.
+      if (pollFlight) await pollFlight;
+      await refresh(true);
+      ctx.pending = false; busyVMs.delete(ctx.id);
+      if (success) {
+        $('growth-dialog').close();
+        toast(`${ctx.id} 的虚拟磁盘已扩容至 ${target} GiB。请在客机内检查分区和可用空间。`);
+      }
+      updateGrowthForm(); render();
+    }
   }
 
   function openActionConfirm(id, action) {
@@ -874,7 +952,11 @@
     if (offline) $('build-image-mode').value = 'local';
     $('build-image-mode').disabled = buildBusy || offline;
     $('build-image-local').hidden = $('build-image-mode').value !== 'local';
-    const resources = ['build-cpu', 'build-memory', 'build-disk'].every((id) => $(id).checkValidity() && Number.isInteger(Number($(id).value)));
+    const disk = $('build-disk');
+    const validDisk = /^\d+$/.test(disk.value) && disk.checkValidity();
+    $('build-disk-error').hidden = validDisk;
+    disk.setAttribute('aria-invalid', String(!validDisk));
+    const resources = validDisk && ['build-cpu', 'build-memory'].every((id) => $(id).checkValidity() && Number.isInteger(Number($(id).value)));
     const name = $('build-name').value;
     const validName = name.length > 0 && name.length <= 64 && name.trim() === name && name.normalize('NFC') === name && /^[\p{L}\p{N} _-]+$/u.test(name) && !/^[.-]/.test(name);
     const valid = resources && validName && (offline ? $('build-offline-ack').checked : $('build-setup-ack').checked) &&
@@ -927,6 +1009,7 @@
     const messages = { screen_recording_permission_required: '管理器当前进程的屏幕录制权限未生效，请按原生自检提示授权并重开 App。', accessibility_permission_required: '管理器当前进程的辅助功能权限未生效。', both_permissions_required: '管理器当前进程的两项权限均未生效；未打开密码框，也未操作客机。', native_secure_form_opened: '本机安全输入框已打开。只在原生框输入，不把账号密码发给模型。', desktop_ready_requires_profile_apply: '已到桌面，时区和最终配置仍需应用／验收，不能算全部完成。', existing_login_or_lock_screen: '检测到已有账户登录／锁屏，不会尝试密码。请使用恢复入口，或在确认后重建。', unsupported_language: '当前自动引擎仅支持英语美国，其他语言模板尚未自动验收。', checkbox_state_requires_user: '无法确认隐私开关状态，已停止，没有盲目切换。', timezone_requires_manual_selection: '系统出现单独时区页面，自动化已停止；未声称时区已配置。', bring_exact_vm_window_frontmost: '请保持这台 VM 完整位于单一屏幕且在前台，勿切换窗口或操作键鼠。' };
     pane.replaceChildren(el('strong', '', `自动初始化 ${d.vm} · ${labels[d.phase] || d.phase}`), el('span', '', messages[d.code] || d.code));
   });
+  mountGrowth();
   $('delete-form').addEventListener('input', updateDeleteForm);
   $('delete-form').addEventListener('submit', async (event) => {
     event.preventDefault();

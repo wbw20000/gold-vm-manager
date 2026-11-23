@@ -60,6 +60,7 @@ class CleanVMInstallerReadOnlyTests(unittest.TestCase):
         self.assertIn("--latest", result.stdout)
         self.assertIn("--inspect", result.stdout)
         self.assertIn("--cpu 2", result.stdout)
+        self.assertIn("30–1024 whole GiB", result.stdout)
         self.assertIn("zero NICs", result.stdout)
 
     def test_missing_input(self):
@@ -131,10 +132,19 @@ class CleanVMInstallerSourceContractTests(unittest.TestCase):
         self.assertNotIn("unlink(", SOURCE)
         self.assertNotIn("Process()", SOURCE)
 
+    def test_new_disk_uses_bounded_integer_request_without_resizing(self):
+        parser = SOURCE[SOURCE.index('static func parse('):SOURCE.index('// Traverse using')]
+        self.assertIn('result.diskGiB = try positive("--disk-gib")', parser)
+        self.assertIn('guard (30...1024).contains(result.diskGiB) else', parser)
+        self.assertIn('let disk = options.diskGiB * gib', SOURCE)
+        self.assertIn('try stage.createDisk(bytes: disk)', SOURCE)
+        create_disk = SOURCE[SOURCE.index('func createDisk('):SOURCE.index('func url(')]
+        self.assertLess(create_disk.index('try createFile("disk.img")'), create_disk.index('ftruncate(disk, off_t(bytes))'))
+
     def test_resources_checked_before_first_stage_write(self):
         create = SOURCE[SOURCE.index("private func create("):]
         claim = create.index("try stage.claim()")
-        for required in ("cpu_out_of_range", "memory_out_of_range", "disk_too_small", "try stage.checkEmpty()", "try stage.checkCapacity(", "try local.verifyUnchanged()"):
+        for required in ("cpu_out_of_range", "memory_out_of_range", "try stage.checkEmpty()", "try stage.checkCapacity(", "try local.verifyUnchanged()"):
             self.assertLess(create.index(required), claim)
         self.assertIn("configuration.cpuCount = options.cpu", create)
         self.assertNotIn("max(4,", create)

@@ -7,6 +7,7 @@ fixtures are private temporary directories, checked before recursive cleanup.
 """
 import copy
 import importlib.util
+import io
 import http.client
 import json
 import os
@@ -310,6 +311,229 @@ class ControllerTests(PrivateFixture):
         for action in ('force-stop', 'discard-state'):
             self.denied(self.controller.action, 'gold', {'action': action, 'confirm_name': 'gold'}, code='wrong_state')
         self.worker.assert_not_called()
+
+    def growth_fixture(self, *, real_inspect=False):
+        vm, jid = 'Disk fixture', 'b' * 32
+        base = self.state_dir / 'environments' / jid
+        journal_dir = self.state_dir / 'build-jobs' / jid
+        folder = self.vm_root / vm
+        for directory in (base, journal_dir, folder):
+            directory.mkdir(mode=0o700, parents=True)
+        self.write_json(self.state_dir / 'registry.json', {'version': 1, 'vms': {vm: {'environment_id': jid}}, 'retired': []})
+        config = folder / 'config.json'
+        self.write_json(config, {'os': 'darwin', 'arch': 'arm64', 'diskFormat': 'raw', 'version': 1})
+        st = config.stat()
+        meta = {'version': 3, 'vm_name': vm, 'tart_home': str(self.vm_root.parent), 'vm_config': str(config),
+                'vm_config_sha256': m.hashlib.sha256(config.read_bytes()).hexdigest(), 'vm_config_identity': [st.st_dev, st.st_ino]}
+        self.write_json(base / 'environment.json', meta)
+        self.write_json(journal_dir / 'commit.json', {'version': 1, 'id': jid, 'environment_id': jid,
+            'phase': 'committed_new_registered', 'mode': 'preinstall', 'name': vm, 'source_vm': None, 'target': str(folder)})
+        self.inventory[vm] = {'Name': vm, 'Source': 'local', 'State': 'stopped', 'Disk': 54, 'Size': 4}
+        size = 50 * 1024**3
+        inspect = None if real_inspect else self.start_patch(patch.object(m.vm_disk_growth, 'inspect', return_value=size))
+        fence = self.start_patch(patch.object(self.controller, '_require_preinstall_publication'))
+        self.start_patch(patch.object(self.controller, 'build_status', return_value=None))
+        return vm, base, {'target_gib': 51, 'expected_bytes': size, 'acknowledge_growth': True}, inspect, fence
+
+    def test_disk_growth_requires_exact_ack_and_integer_request(self):
+        vm, _, payload, inspect, _ = self.growth_fixture()
+        invalid = [None, {}, [], dict(payload, vm=vm), dict(payload, path='disk.img')]
+        invalid.extend({k: v for k, v in payload.items() if k != missing} for missing in payload)
+        for key, values in (('acknowledge_growth', [1, 'true', None, False]),
+                            ('target_gib', [True, 51.0, '51', None, 29, 1025]),
+                            ('expected_bytes', [True, '123', 0.5, 0, -1])):
+            invalid.extend(dict(payload, **{key: value}) for value in values)
+        for value in invalid:
+            with self.subTest(value=value):
+                self.assertEqual(self.denied(self.controller.expand_disk, vm, value).status, 400)
+        self.denied(self.controller.expand_disk, '../gold', payload, code='unknown_vm')
+        inspect.assert_not_called()
+        self.popen.assert_not_called()
+
+    def test_disk_growth_stale_noop_shrink_and_nonstopped_rejected(self):
+        vm, _, payload, _, _ = self.growth_fixture()
+        for changes in ({'expected_bytes': payload['expected_bytes'] - 512}, {'target_gib': 50}, {'target_gib': 49}):
+            with self.subTest(changes=changes):
+                self.assertEqual(self.denied(self.controller.expand_disk, vm, dict(payload, **changes),
+                                             code='disk_growth_rejected').status, 409)
+        for state in ('running', 'suspended', 'unknown'):
+            with self.subTest(state=state):
+                self.inventory[vm]['State'] = state
+                self.denied(self.controller.expand_disk, vm, payload, code='wrong_state')
+                self.controller.inventory.assert_called_with(fresh=True)
+        del self.inventory[vm]
+        self.denied(self.controller.expand_disk, vm, payload, code='missing_vm')
+        self.kill.assert_not_called()
+        self.popen.assert_not_called()
+
+    def test_disk_growth_blocked_by_busy_recovery_and_pending_jobs(self):
+        vm, _, payload, inspect, _ = self.growth_fixture()
+        self.controller.operations['gold'] = {'action': 'start'}
+        self.denied(self.controller.expand_disk, vm, payload, code='busy')
+        self.controller.operations.clear()
+        for job in ({'name': vm, 'recovery_required': True}, {'name': None, 'recovery_required': True},
+                    {'name': 'other', 'mode': 'create', 'phase': 'queued'},
+                    {'name': 'other', 'mode': 'preinstall', 'phase': 'awaiting_vpn_configuration'}):
+            with self.subTest(job=job):
+                self.controller.build_status.return_value = job
+                self.denied(self.controller.expand_disk, vm, payload, code='busy')
+        inspect.assert_not_called()
+        self.popen.assert_not_called()
+
+    def test_disk_growth_state_uses_pinned_apparent_bytes_not_tart_units(self):
+        vm, base, payload, inspect, fence = self.growth_fixture()
+        def selected():
+            return next(row for row in self.controller.state()['vms'] if row['id'] == vm)
+        row = selected()
+        self.assertEqual((row['disk_gb'], row['allocated_gb'], row['disk_capacity_bytes']), (54, 4, payload['expected_bytes']))
+        self.assertIs(row['disk_growth_supported'], True)
+        self.assertNotIn(str(base), repr(row))
+        inspect.assert_called_once_with(vm, vm_root=self.vm_root)
+        fence.assert_not_called()  # Never hash tools/read disk contents at poll time.
+        for row in self.controller.state()['vms']:
+            if row['id'] != vm:
+                self.assertIsNone(row['disk_capacity_bytes'])
+                self.assertIs(row['disk_growth_supported'], False)
+        for state in ('running', 'suspended'):
+            self.inventory[vm]['State'] = state
+            self.assertIs(selected()['disk_growth_supported'], False)
+        self.inventory[vm]['State'] = 'stopped'
+        for unexpected_size in (1, 29 * 1024**3, 32 * 1024**3 + 1, 1025 * 1024**3):
+            inspect.return_value = unexpected_size
+            self.assertIsNone(selected()['disk_capacity_bytes'])
+            self.assertIs(selected()['disk_growth_supported'], False)
+        inspect.side_effect = OSError('fixture-private-path-from-stat')
+        row = selected()
+        self.assertIsNone(row['disk_capacity_bytes'])
+        self.assertIs(row['disk_growth_supported'], False)
+        self.assertNotIn('fixture-private', repr(row))
+        self.popen.assert_not_called()
+
+    def test_poll_stats_real_private_sparse_fixture_without_opening_image(self):
+        vm, _, _, _, _ = self.growth_fixture(real_inspect=True)
+        image = self.vm_root / vm / 'disk.img'
+        apparent = 32 * 1024**3 + 512  # Deliberately neither whole GiB nor Tart's decimal GB.
+        with image.open('xb') as stream:
+            stream.truncate(apparent)
+        image.chmod(0o600)
+        def selected():
+            return next(row for row in self.controller.state()['vms'] if row['id'] == vm)
+        original = os.open
+        def no_image_fd(path, *args, **kwargs):
+            self.assertNotEqual(Path(path).name, 'disk.img', 'poll should only stat the image')
+            return original(path, *args, **kwargs)
+        with patch.object(os, 'open', side_effect=no_image_fd):
+            row = selected()
+            self.assertEqual(row['disk_capacity_bytes'], apparent)
+            self.assertIs(row['disk_growth_supported'], True)
+            os.link(image, self.root / 'fixture-hardlink')
+            row = selected()
+            self.assertIsNone(row['disk_capacity_bytes'])
+            self.assertIs(row['disk_growth_supported'], False)
+        self.popen.assert_not_called()
+
+    def test_disk_growth_rejects_wrong_publication_config_or_local_binding(self):
+        vm, base, payload, inspect, _ = self.growth_fixture()
+        meta_path = base / 'environment.json'
+        journal_path = self.state_dir / 'build-jobs' / base.name / 'commit.json'
+        for path, cases in ((meta_path, [{'vm_name': 'gold'}, {'vm_config': str(self.vm_root / 'gold' / 'config.json')},
+                                          {'vm_config_sha256': 'bad'}, {'vm_config_identity': [1, 1]}, {'version': 4}]),
+                            (journal_path, [{'name': 'gold'}, {'mode': 'create'}, {'phase': 'before_publish'},
+                                            {'target': str(self.vm_root / 'gold')}])):
+            valid = json.loads(path.read_text())
+            for changes in cases:
+                with self.subTest(changes=changes):
+                    self.write_json(path, dict(valid, **changes))
+                    self.denied(self.controller.expand_disk, vm, payload, code='disk_growth_rejected')
+                    row = next(r for r in self.controller.state()['vms'] if r['id'] == vm)
+                    self.assertIsNone(row['disk_capacity_bytes'])
+                    self.assertIs(row['disk_growth_supported'], False)
+            self.write_json(path, valid)
+        self.inventory[vm]['Source'] = 'remote'
+        self.denied(self.controller.expand_disk, vm, payload, code='disk_growth_rejected')
+        self.inventory[vm]['Source'] = 'local'
+        config_path = self.vm_root / vm / 'config.json'
+        self.write_json(config_path, dict(json.loads(config_path.read_text()), os='linux'))
+        self.write_json(meta_path, dict(json.loads(meta_path.read_text()), vm_config_sha256=m.hashlib.sha256(config_path.read_bytes()).hexdigest()))
+        self.denied(self.controller.expand_disk, vm, payload, code='disk_growth_rejected')
+        self.denied(self.controller.expand_disk, 'gold', payload, code='disk_growth_rejected')
+        inspect.assert_not_called()
+        self.popen.assert_not_called()
+
+    def growth_child(self, raw, status=0):
+        # Inert child with fixture bytes, no Python helper or host Tart process.
+        child = self.popen.return_value
+        child.stdout = io.BytesIO(raw)
+        child.returncode = status
+        self.popen.side_effect = None
+        self.popen.reset_mock()
+        return child
+
+    def test_disk_growth_returns_only_confirmed_worker_result(self):
+        vm, base, payload, inspect, fence = self.growth_fixture()
+        success = {'ok': True, 'virtual_capacity_bytes': payload['target_gib'] * 1024**3}
+        self.growth_child(json.dumps(success).encode())
+        self.assertEqual(self.controller.expand_disk(vm, payload), success)
+        self.controller.inventory.assert_called_once_with(fresh=True)
+        inspect.assert_called_once_with(vm, vm_root=self.vm_root)
+        fence.assert_called_once_with(vm, base)
+        self.popen.assert_called_once()
+        cmd = self.popen.call_args.args[0]
+        self.assertEqual(cmd, ['/usr/bin/python3', '-B', '-E', '-s', str(ROOT / 'vm_disk_growth.py'), '--grow',
+                               vm, '51', str(payload['expected_bytes']), base.name])
+        self.assertEqual(self.popen.call_args.kwargs['stderr'], m.subprocess.DEVNULL)
+        self.assertFalse(self.popen.call_args.kwargs.get('shell'))
+        self.run.assert_not_called()
+        self.worker.assert_not_called()
+
+    def test_disk_growth_reserves_target_until_the_child_exits(self):
+        vm, _, payload, _, _ = self.growth_fixture()
+        def worker(*_args):
+            self.assertEqual(self.controller.operations[vm]['action'], 'expand-disk')
+            self.denied(self.controller.action, vm, {'action': 'start'}, code='busy')
+            self.denied(self.controller.expand_disk, vm, payload, code='busy')
+            self.denied(self.controller.create_build, {}, code='busy')
+            self.denied(self.controller.delete_vm, vm, {'confirm_name': vm, 'acknowledge_erase': True}, code='busy')
+            row = next(r for r in self.controller.state()['vms'] if r['id'] == vm)
+            self.assertIs(row['busy'], True)
+            self.assertIs(row['disk_growth_supported'], False)
+            raise m.AppError('fixture refusal', 'disk_growth_rejected', 409)
+        with patch.object(self.controller, '_grow_disk_worker', side_effect=worker):
+            self.denied(self.controller.expand_disk, vm, payload, code='disk_growth_rejected')
+        self.assertNotIn(vm, self.controller.operations)
+        self.popen.assert_not_called()
+
+    def test_disk_growth_errors_are_sanitized_and_never_retried(self):
+        vm, _, payload, inspect, fence = self.growth_fixture()
+        private = 'fixture-internal-path-and-secret'
+        for boundary in (inspect, fence):
+            boundary.side_effect = RuntimeError(private)
+            refusal = self.denied(self.controller.expand_disk, vm, payload, code='disk_growth_rejected')
+            self.assertNotIn(private, str(refusal))
+            boundary.side_effect = None
+        self.popen.side_effect = OSError(private)
+        unavailable = self.denied(self.controller.expand_disk, vm, payload, code='disk_growth_unavailable')
+        self.assertNotIn(private, str(unavailable))
+        public_reason = next(iter(m.vm_disk_growth.PUBLIC_REJECTIONS))
+        self.growth_child(json.dumps({'ok': False, 'uncertain': False, 'error': public_reason}).encode())
+        refusal = self.denied(self.controller.expand_disk, vm, payload, code='disk_growth_rejected')
+        self.assertEqual(str(refusal), public_reason)
+        result = {'ok': False, 'uncertain': False, 'error': private}
+        self.growth_child(json.dumps(result).encode())
+        refusal = self.denied(self.controller.expand_disk, vm, payload, code='disk_growth_rejected')
+        self.assertNotIn(private, str(refusal))
+        self.assertEqual(refusal.status, 409)
+        for raw, rc in ((json.dumps(dict(result, uncertain=True)).encode(), 0), (b'{}', 1), (b'', -9),
+                        (private.encode() * 100, 0), (b'{"ok":true,"virtual_capacity_bytes":123}', 0),
+                        (b'{"ok":true,"virtual_capacity_bytes":54760833024,"path":"private"}', 0)):
+            with self.subTest(rc=rc, raw=raw[:60]):
+                self.growth_child(raw, rc)
+                error = self.denied(self.controller.expand_disk, vm, payload, code='growth_outcome_uncertain')
+                self.assertEqual(error.status, 500)
+                self.assertIn('不要直接重试', str(error))
+                self.assertNotIn(private, str(error))
+                self.popen.assert_called_once()
+                self.assertFalse(self.controller.events)
 
     def test_normal_shutdown_never_automatically_dispatches_force_stop(self):
         self.inventory['gold']['State'] = 'running'
@@ -798,6 +1022,10 @@ class FakeController:
         self.calls.append(('delete', vm, value))
         return {'ok': True, 'job_id': 'unit-only-delete'}
 
+    def expand_disk(self, vm, value):
+        self.calls.append(('expand-disk', vm, value))
+        return {'ok': True, 'virtual_capacity_bytes': value['target_gib'] * 1024**3}
+
     def save_shares(self, vm, value):
         self.calls.append(('shares', vm, value))
         return {'ok': True, 'shares': value.get('shares', [])}
@@ -966,6 +1194,23 @@ class HTTPSecurityTests(unittest.TestCase):
                 self.assertEqual(self.request(path)[0], 404)
         self.assertEqual(self.fake.calls, [])
 
+    def test_expand_disk_requires_loopback_host_auth_same_origin_and_exact_route(self):
+        path = '/api/vms/My%20fixture/expand-disk'
+        payload = {'target_gib': 81, 'expected_bytes': 80 * 1024**3, 'acknowledge_growth': True}
+        for headers, status in (({'Origin': self.origin, 'Content-Type': 'application/json'}, 401),
+                                ({**self.auth(), 'Content-Type': 'application/json'}, 403),
+                                ({**self.mutation_headers(), 'Host': 'other.invalid'}, 403),
+                                ({**self.mutation_headers(), 'Origin': 'https://other.invalid'}, 403)):
+            self.assertEqual(self.request(path, 'POST', payload, headers)[0], status)
+        self.assertEqual(self.request(path, headers=self.auth())[0], 404)
+        self.assertEqual(self.request('/api/vms/..%2fgold/expand-disk', 'POST', payload, self.mutation_headers())[0], 404)
+        self.assertEqual(self.request(path, 'POST', headers=self.mutation_headers(),
+            raw=b'{"target_gib":81,"target_gib":82,"expected_bytes":100,"acknowledge_growth":true}')[0], 400)
+        self.assertEqual(self.fake.calls, [])
+        status, result, _ = self.request(path, 'POST', payload, self.mutation_headers())
+        self.assertEqual((status, result['virtual_capacity_bytes']), (200, 81 * 1024**3))
+        self.assertEqual(self.fake.calls, [('expand-disk', 'My fixture', payload)])
+
     def test_create_route_is_authenticated_and_origin_checked(self):
         status, result, _ = self.request('/api/build', 'POST', {'mode':'create'}, {'Content-Type':'application/json','Origin':self.origin})
         self.assertEqual(status,401)
@@ -1102,8 +1347,9 @@ class BootstrapTests(PrivateFixture):
         self.kill.side_effect = None
         self.response({'ok': True, 'app': {'name': 'Gold VM Manager', 'version': m.VERSION}})
         self.assertEqual(b.running_info(required_version=b.CONTROLLER_VERSION), info)
-        self.response({'ok': True, 'app': {'name': 'Gold VM Manager', 'version': '1.3.0'}})
-        self.assertIsNone(b.running_info(required_version=b.CONTROLLER_VERSION))
+        for stale in ('1.3.0', '1.5.0'):
+            self.response({'ok': True, 'app': {'name': 'Gold VM Manager', 'version': stale}})
+            self.assertIsNone(b.running_info(required_version=b.CONTROLLER_VERSION))
 
     def test_absent_or_unsafe_server_info_does_not_contact_any_process(self):
         self.assertIsNone(b.running_info())

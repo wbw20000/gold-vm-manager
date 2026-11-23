@@ -43,6 +43,7 @@ ACTIVE = ('queued', 'preflight', 'downloading', 'inspecting', 'installing', 'pro
 TERMINAL = ('awaiting_user_setup', 'awaiting_offline_preinstall', 'awaiting_first_desktop_acceptance', 'failed', 'interrupted', 'deleted')
 OFFLINE_MODE = 'offline_validate'
 PREINSTALL_MODE = 'preinstall'
+DISK_GIB_MIN, DISK_GIB_MAX, DISK_GIB_DEFAULT = 30, 1024, 50
 PREINSTALL_ACTIVE = ('queued', 'preflight', 'acquiring', 'inspecting', 'installing',
                      'awaiting_offline_preinstall', 'preinstalling', 'configuring_vpn',
                      'awaiting_system_authorization', 'verifying', 'preparing_runtime', 'publishing',
@@ -117,6 +118,12 @@ def inventory():
     return {v['Name']: v for v in json.loads(r.stdout) if v.get('Source') == 'local'}
 
 
+def validate_disk_gib(value):
+    if type(value) is not int or not DISK_GIB_MIN <= value <= DISK_GIB_MAX:
+        raise ValueError(f'新磁盘容量必须是 {DISK_GIB_MIN} 到 {DISK_GIB_MAX} GiB 的整数')
+    return value
+
+
 def validated_request(payload, known_names, host_cpu=None, host_memory=None):
     keys = {'mode', 'source_vm', 'name', 'cpu', 'memory_gib', 'disk_gib', 'ipsw', 'confirm_name', 'acknowledge_erase', 'acknowledge_setup', 'setup_profile', 'acknowledge_offline'}
     if type(payload) is not dict or set(payload) - keys: raise ValueError('新建请求格式错误')
@@ -131,10 +138,11 @@ def validated_request(payload, known_names, host_cpu=None, host_memory=None):
             raise ValueError('请确认仅恢复暂存系统，不开机、不迁移凭据，软件预装与桌面验收尚未完成')
         if any(existing.casefold() == d['name'].casefold() for existing in known_names):
             raise ValueError('此名称已存在；离线验证只能使用全新名称')
+    d['disk_gib'] = validate_disk_gib(d.get('disk_gib', DISK_GIB_DEFAULT))
     for key, low, high, default in [('cpu', 2, host_cpu or os.cpu_count() or 2, 2),
-                                    ('memory_gib', 4, host_memory or 64, 4), ('disk_gib', 50, 1024, 50)]:
+                                    ('memory_gib', 4, host_memory or 64, 4)]:
         value = d.get(key, default)
-        if type(value) is not int or not low <= value <= high: raise ValueError('CPU、内存或磁盘大小超出允许范围')
+        if type(value) is not int or not low <= value <= high: raise ValueError('CPU 或内存大小超出允许范围')
         d[key] = value
     if not offline and d.get('acknowledge_setup') is not True: raise ValueError('请确认首次 macOS 设置、客机安装及本地代理配置迁移说明')
     if d['mode'] == 'rebuild':
@@ -388,7 +396,7 @@ def verify_install_output(stage, request):
     if (int(c['macAddress'][:2],16) & 3) != 2: raise ValueError('新 MAC 必须为随机本地管理单播地址')
     if c.get('cpuCount') != request['cpu'] or c.get('memorySize') != request['memory_gib'] * 1024**3:
         raise ValueError('新系统资源大小不匹配')
-    if (stage / 'disk.img').stat().st_size != request['disk_gib'] * 1024**3: raise ValueError('新磁盘容量不匹配')
+    if (stage / 'disk.img').stat().st_size != validate_disk_gib(request.get('disk_gib')) * 1024**3: raise ValueError('新磁盘容量不匹配')
     return c
 
 
@@ -606,6 +614,7 @@ def worker(jid, lock_fd):
         d = registry.read_private(jobdir / 'request.json')
         if type(d) is not dict or d.get('id') != jid: raise ValueError('任务请求无效或状态冲突')
         if current.get('mode', d.get('mode')) != d.get('mode'): raise ValueError('任务模式已变化，拒绝执行')
+        validate_disk_gib(d.get('disk_gib'))  # Recheck the persisted size before any installer work.
         offline = d.get('mode') == OFFLINE_MODE
         values = inventory()
         if offline:

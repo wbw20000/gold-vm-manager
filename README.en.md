@@ -19,7 +19,7 @@ Run Claude Code in a dedicated macOS VM on an Apple Silicon Mac. First setup use
 
 ## Install the manager (host Mac)
 
-1. **Check first:** Apple Silicon, macOS **26.6.2** (validated version), Apple Command Line Tools or Xcode, system Python 3.9+, and system Ruby with Psych. The default 50 GiB guest disk needs at least **82 GiB** free on the host. Leave additional room for the restore image and cache.
+1. **Check first:** Apple Silicon, macOS **26.6.2** (validated version), Apple Command Line Tools or Xcode, system Python 3.9+, and system Ruby with Psych. The local 1.6 build accepts whole-number disk sizes from **30 to 1024 GiB**, default 50. For a 30 GiB guest on a single host volume, allow **42 GiB** free when reusing the reviewed IPSW cache, or **62 GiB** for a new download or local import. Small disks leave less room for apps and updates. The published 1.5.0 still has a 50 GiB minimum and an 82 GiB preflight.
 2. On the [v1.5.0 release page](https://github.com/wbw20000/gold-vm-manager/releases/tag/v1.5.0), download **Source code (zip)** and extract it. Double-click [Install.command](Install.command) or run `./Install.command` from the source directory. Open **Gold VM 管理器** in `~/Applications`.
 3. This is a **locally ad-hoc signed source build**, not a notarized app download. It neither overwrites an existing app nor starts a VM. Leave Gatekeeper enabled. See [build options](SOURCE_INSTALL.md) for a side-by-side installation.
 
@@ -91,6 +91,7 @@ Click the VM's **name on the left** or its **card at the top**. Both select the 
 | What you need | What to click and what to expect |
 | --- | --- |
 | Start today's session | For a finished one-click VM showing **已关机**, use **受保护启动… → 同意尝试受保护启动**. For a non-preinstalled VM the button is **启动虚拟机**. At **运行中**, **打开窗口** brings the VM window forward; it doesn't boot another VM. |
+| Grow the disk (1.6) | Back up important files and shut the guest down normally. On an eligible one-click VM select **扩容磁盘…** and enter the **new total size** in GiB (to go from 30 to 40, enter `40`, not `10`). Free host space must cover the increase plus 2 GiB. Only virtual device capacity grows: the manager does not shrink disks, boot the guest, mount it or edit its partitions. After boot, use Disk Utility → View → Show All Devices to compare the device size with its APFS container. If the container did not grow automatically, back up and review that specific partition layout; do not erase the disk. |
 | End the session | Save work inside the guest. Use its Apple menu → Shut Down, or click **正常关机 → 正常关机** on the host and answer any prompt **inside the guest**. Wait for **已关机**; sending the request isn't the same as being off. |
 | Pause or resume a supported VM | **暂停** saves a running session; **已暂停 → 继续运行** resumes it. Resume is **not** a cold start. Pause is disabled on managed preinstalls, isolated VMs, unsupported sessions and sessions with active folder mounts. Use normal shutdown instead. |
 | Recover a forgotten guest password | Only if shown on a supported, stopped older managed VM: **恢复模式… → 恢复模式启动**. Complete macOS recovery **in the guest**; you may need a FileVault key or Apple Account. It mounts no host shares, doesn't erase the disk or reset the password for you, and isn't offered on one-click preinstalls. Don't send anyone your key or password. |

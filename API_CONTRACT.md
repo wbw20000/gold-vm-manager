@@ -27,6 +27,12 @@ POST /api/pick-directory `{vm:"gold"}` -> {ok:true,path:"/canonical/path"} OR {o
 
 POST /api/reveal-directory `{vm:"gold",share_id:"uuid"}` -> {ok:true} opens Finder for EXISTING configured share only. The manager does not offer a host Claude launch or command-copy action and does not read shared file contents.
 
+### New disk size and offline expansion (1.6)
+
+`disk_gib` on creation is a whole integer **30–1024** (default 50). In one-click preflight on one filesystem, allow disk + 12 GiB when reusing the cached, reviewed IPSW, otherwise disk + 32 GiB. With separate filesystems: disk + 2 GiB for VM storage and 10 / 30 GiB on the materials volume. Cache metadata is only a budgeting hint: image hashing and the native pre-create space check still run.
+
+`GET /api/state` includes `disk_capacity_bytes` (apparent bytes, nullable) and `disk_growth_supported`. Host allocated blocks and free space inside the guest are different measurements. `POST /api/vms/<id>/expand-disk` accepts exactly `{target_gib:40,expected_bytes:32212254720,acknowledge_growth:true}` to grow a 30 GiB published managed macOS VM to 40 GiB **total**. It is authenticated and same-origin; only eligible, stopped VMs with their original bound environment and no busy/saved/attached/open disk can proceed. No shrink, resize-in-place of a running guest, partition repair, automatic retry, backup creation, mount or launch. Only report success on durable raw-size readback (`virtual_capacity_bytes`). Ambiguous completion requires refreshing and checking actual disk size before any new request. A larger virtual block device does not guarantee a larger APFS volume; see the [user guide](ONE_CLICK_PREINSTALL.md).
+
 POST /api/vms/<id>/delete body `{confirm_name:"exact VM name",acknowledge_erase:true}` queues a dedicated deletion job. Requires the trusted inventory target to be stopped or suspended; it does not stop running VMs. Completion is reported through `build_job`, not inferred from HTTP success. Exact retention and journal semantics: [VM_DELETION.md](<VM_DELETION.md>).
 
 POST /api/build accepts explicit create/rebuild requests, user-selected names/resources, acknowledged setup materials, and additional exact-name/erase confirmation for rebuild. `build_job` reports progress, terminal results, and recovery interlocks; incomplete journals must not be hidden. See [CREATE_REBUILD_GUIDE.md](<CREATE_REBUILD_GUIDE.md>) and current request validation in [manager.py](<manager.py>).

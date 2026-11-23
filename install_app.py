@@ -15,7 +15,7 @@ ROOT=Path(__file__).resolve().parent
 APP=Path('/Applications/Gold VM 管理器.app')
 FILES=('manager.py','bootstrap.py','runtime_shares.py','discard_state.py',
        'managed_registry.py','lifecycle.py','process_identity.py','provisioning.py','protected_launcher.py','packet_policy.py',
-       'setup_profile.py','vm_deletion.py','vpn_config.py','vpn_store.py',
+       'setup_profile.py','vm_deletion.py','vm_disk_growth.py','vpn_config.py','vpn_store.py',
        'preinstall_materials.py','host_artifacts.py','host_tools.py','preinstall_runtime.py',
        'oneclick.py','offline_volume.py','offline_payload.py',
        'guest_app_artifacts.py','guest_app_pins.py','quarantine_policy.py','error_codes.py')
@@ -85,10 +85,10 @@ def package_app(output, private_build_root):
     portable_receipts={host_tools.HELPERS_PORTABLE_RECEIPT:hashlib.sha256(raw).hexdigest()}
     info={
         'CFBundleName':'Gold VM Manager','CFBundleDisplayName':'Gold VM 管理器',
-        'CFBundleIdentifier':'local.gold.vm-manager','CFBundleVersion':'8',
+        'CFBundleIdentifier':'local.gold.vm-manager','CFBundleVersion':'9',
         'CFBundleIconFile':'AppIcon',
         'LSApplicationCategoryType':'public.app-category.developer-tools',
-        'CFBundleShortVersionString':'1.5.0','CFBundleExecutable':'GoldVMManager',
+        'CFBundleShortVersionString':'1.6.0','CFBundleExecutable':'GoldVMManager',
         'CFBundlePackageType':'APPL','LSMinimumSystemVersion':'26.6.2',
         'NSHighResolutionCapable':True,
         'NSAppTransportSecurity':{'NSAllowsLocalNetworking':True},

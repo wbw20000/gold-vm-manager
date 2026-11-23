@@ -29,6 +29,12 @@
     need(Number.isSafeInteger(n) && n >= low && n <= high, `${label}超出允许范围。`);
     return n;
   }
+  const DISK_MIN = 30, DISK_MAX = 1024;
+  const diskRange = `${DISK_MIN}–${DISK_MAX} GiB`;
+  const diskError = `磁盘容量无效：请输入 ${diskRange} 范围内的整数。`;
+  function validDisk(value) {
+    return /^\d+$/.test(String(value)) && Number(value) >= DISK_MIN && Number(value) <= DISK_MAX;
+  }
   function secret(value, label) {
     need(typeof value === 'string' && value.length > 0 && value.length <= 4096 && !/[\x00-\x1f\x7f]/.test(value), `请填写有效的${label}。`);
     return value; // Never trim passwords or interpolate submitted text into errors.
@@ -125,7 +131,8 @@
     need(!(context.names || []).some(n => String(n).normalize('NFC').toLowerCase() === name.toLowerCase()), '已有同名 VM；一键预装只能创建新名字，不能重建或覆盖。');
     const cpu = integer(v.cpu, 2, Number(context.host?.cpu_count) || 1024, 'CPU');
     const memory = integer(v.memory, 4, Number(context.host?.memory_gib) || 1024, '内存');
-    const disk = integer(v.disk, 50, 1024, '磁盘');
+    need(validDisk(v.disk), diskError);
+    const disk = Number(v.disk);
     need(v.imageMode === 'reviewed' || v.imageMode === 'local', '恢复镜像来源无效。');
     const ipsw = v.imageMode === 'reviewed' ? 'reviewed' : text(v.ipsw);
     need(ipsw === 'reviewed' || (ipsw.startsWith('/') && !ipsw.startsWith('//') && !/[\x00-\x1f\x7f]/.test(ipsw) && !ipsw.split('/').includes('..') && /\.ipsw$/i.test(ipsw)), '本地 IPSW 须为你信任的规范绝对路径。');
@@ -212,8 +219,11 @@
     const resourceGrid = node('div', 'preinstall-grid'); machine.append(resourceGrid);
     field(resourceGrid, 'cpu', 'CPU（vCPU）', { type: 'number', min: 2, value: '2' });
     field(resourceGrid, 'memory', '内存（GiB）', { type: 'number', min: 4, value: '4' });
-    field(resourceGrid, 'disk', '磁盘（GiB）', { type: 'number', min: 50, max: 1024, value: '50' });
-    machine.append(node('p', 'form-note', '默认 2 vCPU / 4 GiB / 50 GiB；不会偷偷增加资源。2 核性能有限，实际最低要求由系统镜像检查决定。'));
+    const disk = field(resourceGrid, 'disk', `磁盘容量（${diskRange}，整数）`, { type: 'number', min: DISK_MIN, max: DISK_MAX, value: '50' });
+    const diskFeedback = node('p', 'form-error', diskError); diskFeedback.id = 'preinstall-disk-error';
+    diskFeedback.setAttribute('role', 'status'); disk.setAttribute('aria-describedby', diskFeedback.id); rows.disk.append(diskFeedback);
+    machine.append(node('p', 'form-note', '默认 2 vCPU / 4 GiB / 50 GiB；不会偷偷增加资源。较小的磁盘可能放不下 macOS 或后续系统更新。2 核性能有限，实际最低要求由系统镜像检查决定。'));
+    machine.append(node('p', 'form-note', '宿主空间示例：虚拟磁盘与安装材料在同一卷时，创建 30 GiB 磁盘，复用已缓存的默认镜像约需 42 GiB 可用空间；重新下载或导入镜像约需 62 GiB。不同卷分别检查，以安装时的实际可用空间为准。'));
     field(machine, 'imageMode', '系统镜像来源', { choices: [['reviewed', '经审核的固定 Apple 恢复镜像'], ['local', '我信任的本机 IPSW 绝对路径']] });
     const imageNote = node('p', 'form-note'); imageNote.id = 'preinstall-image-note'; imageNote.hidden = true; machine.append(imageNote);
     field(machine, 'ipsw', '可信本地 IPSW 路径', { placeholder: '/绝对路径/macOS.ipsw', note: '不上传镜像文件，不使用开发者证据路径；本机来源与完整性仍须后端校验。' });
@@ -355,6 +365,8 @@
       const resuming = resumeTarget !== null, skip = deferred();
       const unavailable = busy || !canOperate(context);
       machine.hidden = resuming;
+      diskFeedback.hidden = resuming || validDisk(disk.value);
+      disk.setAttribute('aria-invalid', String(!diskFeedback.hidden));
       rows.deferVpn.hidden = resuming;
       deferNote.hidden = !skip;
       vpnInputs.hidden = skip;

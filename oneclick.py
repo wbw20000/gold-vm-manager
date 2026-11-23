@@ -162,7 +162,8 @@ def validated_request(payload, known_names, *, host_cpu=None, host_memory=64):
     _need(type(d.get('acknowledge_normalization', False)) is bool, 'invalid-normalization-consent')
     for key, low, high, default in (
             ('cpu', 2, host_cpu or os.cpu_count() or 2, 2),
-            ('memory_gib', 4, host_memory, 4), ('disk_gib', 50, 1024, 50)):
+            ('memory_gib', 4, host_memory, 4),
+            ('disk_gib', lifecycle.DISK_GIB_MIN, lifecycle.DISK_GIB_MAX, lifecycle.DISK_GIB_DEFAULT)):
         value = d.get(key, default)
         _need(type(value) is int and low <= value <= high, 'invalid-resource-size')
         d[key] = value
@@ -819,6 +820,39 @@ def _finish_preinstall(c, d, stored, service, update):
                   desktop_verified=False, vpn_connected=False, network_independently_verified=False)
 
 
+class StagingSpaceError(OneClickError):
+    def __init__(self, volume, required, free):
+        super().__init__('insufficient-safe-staging-space')
+        # Only static volume labels and numeric sizes may reach the UI.
+        self.detail = ('%s空间不足：需要 %.2f GiB，当前 %.2f GiB，还差 %.2f GiB。尚未开始恢复，不会删除已有 VM。'
+                       % (volume, required / 2**30, free / 2**30, (required - free) / 2**30))
+
+
+def _require_staging_space(c, request, *, prepared=False):
+    """Estimate cache and restore budgets on their own filesystems; this is not a reservation."""
+    import host_artifacts
+    gib = 2**30
+    disk_bytes = (request['disk_gib'] + 2) * gib  # Preserves the native pre-create reserve.
+    def check(label, path, required):
+        free = shutil.disk_usage(path).free
+        if free < required:
+            raise StagingSpaceError(label, required, free)
+    if prepared:
+        # Fresh bytes in cache can no longer reduce the restore volume unnoticed.
+        check('虚拟磁盘所在卷', c.tart_home, disk_bytes)
+        return
+    # Leave 10 GiB for materials/tools/workspace; 20 GiB covers one new pinned
+    # IPSW (including import_local, which always creates a copy).
+    warm = (request['ipsw'] == 'reviewed'
+            and host_artifacts.cached('ipsw', c.state / 'host-materials'))
+    materials = (10 if warm else 30) * gib
+    if c.state.stat().st_dev == c.tart_home.stat().st_dev:
+        check('宿主', c.tart_home, disk_bytes + materials)
+    else:
+        check('虚拟磁盘所在卷', c.tart_home, disk_bytes)
+        check('安装材料所在卷', c.state, materials)
+
+
 def _worker_failure(c, update, error):
     value = registry.read_private(c.state / 'build-current.json', {})
     phase = value.get('phase')
@@ -828,6 +862,8 @@ def _worker_failure(c, update, error):
     message = ('原始材料下载或校验未完成，尚未创建虚拟磁盘；已保留下载，不会自动重试。'
                if phase == 'acquiring' and not value.get('stage_path') else
                '预装未完成；保留所有暂存文件，不自动覆盖重试。请查看失败步骤。')
+    if isinstance(error, StagingSpaceError):
+        message = error.detail
     return update('failed', message, failure_code=code, failed_phase=phase, failed_product=failed_product,
                   recovery_required=bool(value.get('stage_path')) or (c.jobdir / 'commit.json').exists(),
                   desktop_verified=False, vpn_connected=False, network_independently_verified=False)
@@ -856,9 +892,11 @@ def execute(context, *, services=None):
         checked = validated_request({k: v for k, v in d.items() if k in KEYS}, known, host_memory=_host_memory())
         _need(dict(checked, id=c.job_id) == d, 'stored-request-changed')
         update('preflight', '核对全新名称、空间与显式配置；不读取宿主 VPN 资料。')
-        _need(shutil.disk_usage(c.tart_home).free >= (d['disk_gib'] + 32) * 1024**3, 'insufficient-safe-staging-space')
+        _require_staging_space(c, d)
         update('acquiring', '准备固定版本系统、完整应用及工具；尚未创建或启动客机。')
         service.prepare(d, update)
+        update('preflight', '材料已就绪，重新检查虚拟磁盘所在卷的实际剩余空间。')
+        _require_staging_space(c, d, prepared=True)
         update('inspecting', '验证 Apple 恢复兼容性。')
         service.restore(d, update)
         value = update('installing', '全新 macOS 已恢复到暂存盘；不往客机磁盘写入任何东西。', 1,

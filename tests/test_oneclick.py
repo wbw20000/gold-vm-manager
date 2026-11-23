@@ -188,11 +188,13 @@ class ValidationAndStartTests(Fixture):
                 self.validate(dict(request, **{key: True}))
 
     def test_sizes_opaque_vpn_id_and_explicit_download_proxy_are_strict(self):
-        for key, values in (('cpu', (True, 1, 9)), ('memory_gib', ('4', 3, 33)), ('disk_gib', (50.0, 49, 1025))):
+        for key, values in (('cpu', (True, 1, 9)), ('memory_gib', ('4', 3, 33)), ('disk_gib', (True, '30', 30.0, 31.5, 29, 1025))):
             for invalid in values:
                 with self.subTest(key=key, invalid=invalid), self.assertRaisesRegex(
                         oneclick.OneClickError, 'invalid-resource-size'):
                     self.validate(payload(**{key: invalid}))
+        for accepted in (30, 31, 49, 50, 1024):
+            self.assertEqual(self.validate(payload(disk_gib=accepted))['disk_gib'], accepted)
         for invalid in (None, True, 'A' * 32, 'a' * 31, '../' + 'a' * 32):
             with self.subTest(id=invalid), self.assertRaisesRegex(
                     oneclick.OneClickError, 'validated-vpn-configuration-required'):
@@ -632,6 +634,51 @@ class WorkerTests(Fixture):
         self.acquire.assert_not_called()
         self.spawn.assert_not_called()
         self.assertEqual(self.job(), self.queued)
+
+    def test_disk_30_reuses_cached_image_budget_but_not_an_explicit_local_import(self):
+        self.disk_usage.return_value = SimpleNamespace(free=42 * GIB)
+        request = {'disk_gib': 30, 'ipsw': 'reviewed'}
+        with mock.patch.object(host_artifacts, 'cached', return_value=True) as cached:
+            oneclick._require_staging_space(self.context, request)
+            cached.assert_called_once_with('ipsw', self.state / 'host-materials')
+            self.disk_usage.return_value = SimpleNamespace(free=42 * GIB - 1)
+            with self.assertRaises(oneclick.StagingSpaceError):
+                oneclick._require_staging_space(self.context, request)
+            self.disk_usage.return_value = SimpleNamespace(free=56 * GIB)
+            with self.assertRaises(oneclick.StagingSpaceError) as failure:
+                oneclick._require_staging_space(self.context, dict(request, ipsw=str(self.restore_source)))
+            self.assertIn('62.00 GiB', failure.exception.detail)
+            self.assertIn('6.00 GiB', failure.exception.detail)
+        with mock.patch.object(host_artifacts, 'cached', return_value=False):
+            with self.assertRaises(oneclick.StagingSpaceError):
+                oneclick._require_staging_space(self.context, request)
+
+    def test_two_volumes_are_budgeted_separately_and_shortfall_identifies_volume(self):
+        request = {'disk_gib': 30, 'ipsw': 'reviewed'}
+        def volume(device):
+            obj = mock.MagicMock(spec=Path)
+            obj.stat.return_value = SimpleNamespace(st_dev=device)
+            return obj
+        c = SimpleNamespace(tart_home=volume(1), state=volume(2))
+        with mock.patch.object(host_artifacts, 'cached', return_value=True):
+            self.disk_usage.side_effect = [SimpleNamespace(free=32 * GIB), SimpleNamespace(free=10 * GIB)]
+            oneclick._require_staging_space(c, request)
+            self.disk_usage.side_effect = [SimpleNamespace(free=32 * GIB), SimpleNamespace(free=9 * GIB)]
+            with self.assertRaises(oneclick.StagingSpaceError) as failed:
+                oneclick._require_staging_space(c, request)
+            self.assertIn('安装材料所在卷', failed.exception.detail)
+            self.disk_usage.side_effect = [SimpleNamespace(free=31 * GIB)]
+            with self.assertRaises(oneclick.StagingSpaceError) as failed:
+                oneclick._require_staging_space(c, request)
+            self.assertIn('虚拟磁盘所在卷', failed.exception.detail)
+
+    def test_pre_restore_rechecks_actual_free_space_after_acquisition(self):
+        self.disk_usage.side_effect = [SimpleNamespace(free=100 * GIB), SimpleNamespace(free=51 * GIB)]
+        self.assert_failed(self.execute(), 'preflight', 'insufficient-safe-staging-space', recovery=False)
+        self.assertIn('52.00 GiB', self.job()['message'])
+        self.assertIn('还差 1.00 GiB', self.job()['message'])
+        self.spawn.assert_not_called()
+        self.assertFalse(self.context.stage.exists())
 
     def test_insufficient_staging_space_stops_before_acquiring_materials(self):
         self.disk_usage.return_value = SimpleNamespace(free=81 * GIB)

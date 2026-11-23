@@ -28,12 +28,13 @@ import managed_registry
 import lifecycle
 import process_identity
 import vm_deletion
+import vm_disk_growth
 import setup_profile
 import oneclick
 import vpn_store
 
 APP = 'gold-vm-manager'
-VERSION = '1.5.0'
+VERSION = '1.6.0'
 VPN_VALIDATE_PATH = '/api/preinstall/vpn/validate'
 # Cover JSON escaping for the 256 KiB input limit without raising other routes' caps.
 VPN_VALIDATE_MAX_WIRE = 6 * 256 * 1024 + 16384
@@ -440,25 +441,141 @@ class Controller:
             pass
         return result
 
+    def _check_publication_journal(self, vm, base):
+        jid = base.name
+        if not re.fullmatch(r'[0-9a-f]{32}', jid):
+            raise ValueError('uncommitted')
+        journal = managed_registry.read_private(STATE_DIR / 'build-jobs' / jid / 'commit.json')
+        if (type(journal) is not dict or type(journal.get('version')) is not int or journal['version'] != 1
+                or journal.get('phase') != 'committed_new_registered' or journal.get('id') != jid
+                or journal.get('mode') != 'preinstall' or journal.get('name') != vm
+                or journal.get('source_vm') is not None or journal.get('environment_id') != jid
+                or journal.get('target') != str(VM_ROOT / vm)):
+            raise ValueError('uncommitted')
+
     def _require_preinstall_publication(self, vm, base):
         # Launcher code and backend may still be the older unnotarized set here;
         # _refresh_runtime replaces them before launch, then the launcher validates all.
         from preinstall_runtime import validate_environment_for_refresh as validate_environment
         try:
-            jid = base.name
-            journal = managed_registry.read_private(STATE_DIR / 'build-jobs' / jid / 'commit.json')
-            if (not re.fullmatch(r'[0-9a-f]{32}', jid) or type(journal) is not dict
-                    or type(journal.get('version')) is not int or journal['version'] != 1
-                    or journal.get('phase') != 'committed_new_registered' or journal.get('id') != jid
-                    or journal.get('mode') != 'preinstall' or journal.get('name') != vm
-                    or journal.get('source_vm') is not None or journal.get('environment_id') != jid
-                    or journal.get('target') != str(VM_ROOT / vm)):
-                raise ValueError('uncommitted')
+            self._check_publication_journal(vm, base)
             meta = validate_environment(base)
             if meta['vm_name'] != vm or meta['vm_config'] != str(VM_ROOT / vm / 'config.json'):
                 raise ValueError('binding')
         except (ValueError, OSError, RuntimeError, TypeError, KeyError):
             raise AppError('预装发布记录或受保护启动文件未通过核对，不会启动或回退到普通网络。', 'preinstall_start_rejected', 409) from None
+
+    @staticmethod
+    def _disk_growth_busy(job):
+        # Growth shares the build lock with publication, deletion and recovery.
+        return bool(job and (job.get('recovery_required') or lifecycle.is_active(job) or lifecycle.waiting_for_vpn(job)))
+
+    @staticmethod
+    def _vm_settings(vm):
+        # A poll must never follow a substituted path, block on a FIFO, or read
+        # disk.img as configuration. Use the bounded/rechecked config FD for
+        # both the existing hardware display and the preinstalled config pin.
+        from preinstall_runtime import _read
+        raw, info = _read(VM_ROOT / vm / 'config.json', private=False, cap=1024 * 1024)
+        config = json.loads(raw, object_pairs_hook=strict_pairs)
+        if type(config) is not dict:
+            raise ValueError('invalid config')
+        pin = ([info.st_dev, info.st_ino], hashlib.sha256(raw).hexdigest()) if (
+            info.st_uid == os.getuid() and not info.st_mode & 0o077) else None
+        return config, pin
+
+    def _disk_capacity(self, vm, base, item, meta, config, config_pin):
+        # base is from registered_bases(), never from a client. Legacy VMs and
+        # partial/unpublished environments have no disk-growth capability.
+        if (base.parent != STATE_DIR / 'environments' or vm in managed_registry.LEGACY_NAMES or vm in ISOLATED_VMS
+                or item.get('Name') != vm or item.get('Source') != 'local'
+                or type(meta.get('version')) is not int or meta['version'] not in PROTECTED_VERSIONS
+                or meta.get('vm_name') != vm or meta.get('vm_config') != str(VM_ROOT / vm / 'config.json')
+                or meta.get('tart_home') != str(VM_ROOT.parent) or config_pin is None
+                or (meta.get('vm_config_identity'), meta.get('vm_config_sha256')) != config_pin
+                or type(config.get('version')) is not int or config['version'] != 1 or config.get('os') != 'darwin'
+                or config.get('diskFormat') != 'raw' or config.get('arch') != 'arm64'):
+            return None
+        try:
+            self._check_publication_journal(vm, base)
+            size = vm_disk_growth.inspect(vm, vm_root=VM_ROOT)
+            return size if (type(size) is int and lifecycle.DISK_GIB_MIN * 1024**3 <= size
+                            <= lifecycle.DISK_GIB_MAX * 1024**3 and size % 512 == 0) else None
+        except Exception:
+            # A single unsafe/replaced target never breaks polling, and native
+            # diagnostics and internal paths do not cross the API boundary.
+            return None
+
+    def expand_disk(self, vm, payload):
+        if (type(payload) is not dict or set(payload) != {'target_gib', 'expected_bytes', 'acknowledge_growth'}
+                or payload['acknowledge_growth'] is not True or type(payload['target_gib']) is not int
+                or type(payload['expected_bytes']) is not int or payload['expected_bytes'] <= 0
+                or not lifecycle.DISK_GIB_MIN <= payload['target_gib'] <= lifecycle.DISK_GIB_MAX):
+            raise AppError('扩容请求需要有效的整数容量和明确确认。')
+        target, expected = payload['target_gib'], payload['expected_bytes']
+        with self.lock:
+            base = self._vm(vm)
+            if self.operations or self._disk_growth_busy(self.build_status()):
+                raise AppError('有操作进行中或任务待恢复，暂不能扩容。', 'busy', 409)
+            item = self.inventory(fresh=True).get(vm)
+            if not item:
+                raise AppError('VM 不存在', 'missing_vm', 404)
+            if item.get('State') != 'stopped':
+                raise AppError('扩容前请先正常关机；暂停不等于关机。', 'wrong_state', 409)
+            try:
+                config, pin = self._vm_settings(vm)
+                capacity = self._disk_capacity(vm, base, item, self._environment(vm), config, pin)
+                if capacity is None:
+                    raise ValueError('unbound')
+                self._require_preinstall_publication(vm, base)
+            except Exception:
+                raise AppError('仅支持已发布、配置和磁盘通过核对的本机预装 macOS VM。', 'disk_growth_rejected', 409) from None
+            if capacity != expected or target * 1024**3 <= capacity:
+                raise AppError('当前容量已变化或目标不大于当前磁盘；请刷新后重新确认。', 'disk_growth_rejected', 409)
+            self.operations[vm] = {'action': 'expand-disk', 'started_at': now()}
+        # Reserve this VM without holding the server lock across fsync. A
+        # single-threaded child owns Tart's process-wide POSIX config lock; an
+        # unrelated config FD close in this server cannot drop it. The child
+        # rechecks publication, fresh inventory (before storage flock), and size.
+        try:
+            return self._grow_disk_worker(vm, target, expected, base.name)
+        finally:
+            with self.lock:
+                self.operations.pop(vm, None)
+                self._cache = None
+
+    @staticmethod
+    def _grow_disk_worker(vm, target, expected, environment_id):
+        helper = Path(__file__).resolve().with_name('vm_disk_growth.py')
+        try:
+            child = subprocess.Popen(['/usr/bin/python3', '-B', '-E', '-s', str(helper), '--grow', vm,
+                                      str(target), str(expected), environment_id], stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=ENV, cwd=str(helper.parent),
+                                     close_fds=True)
+        except OSError:
+            raise AppError('磁盘扩容程序未能启动。', 'disk_growth_unavailable', 503) from None
+        try:
+            with child, child.stdout as stream:
+                # Never render private output or buffer an unbounded traceback.
+                raw = stream.read(513)
+            if child.returncode == 0 and len(raw) <= 512:
+                result = json.loads(raw, object_pairs_hook=strict_pairs)
+                if (type(result) is dict and set(result) == {'ok', 'virtual_capacity_bytes'} and result['ok'] is True
+                        and type(result['virtual_capacity_bytes']) is int and result['virtual_capacity_bytes'] == target * 1024**3):
+                    return {'ok': True, 'virtual_capacity_bytes': result['virtual_capacity_bytes']}
+                if (type(result) is dict and set(result) == {'ok', 'uncertain', 'error'} and result['ok'] is False
+                        and result['uncertain'] is False and type(result['error']) is str):
+                    reason = result['error']
+                    if reason not in vm_disk_growth.PUBLIC_REJECTIONS:
+                        reason = '当前状态或磁盘未通过扩容核对；请刷新状态。'
+                    raise AppError(reason, 'disk_growth_rejected', 409)
+        except AppError:
+            raise
+        except Exception:
+            pass
+        # Broken pipe, killed child, fsync/readback failure, malformed/wrong
+        # capacity response: growth may already have happened. Never auto-retry.
+        raise AppError('无法确认扩容是否已持久完成；请先核对磁盘状态，不要直接重试。', 'growth_outcome_uncertain', 500)
 
     def state(self):
         inventory = self.inventory()
@@ -474,13 +591,11 @@ class Controller:
                 item = inventory.get(vm, {})
                 vm_state = item.get('State', 'missing')
                 error = self.errors.get(vm)
-                settings = {}
+                settings, config_pin = {}, None
                 try:
-                    p = VM_ROOT / vm / 'config.json'
-                    if p.is_symlink():
-                        raise ValueError()
-                    settings = json.loads(p.read_text()) if item else {}
-                except (OSError, ValueError):
+                    if item:
+                        settings, config_pin = self._vm_settings(vm)
+                except (OSError, ValueError, RuntimeError):
                     error = '无法读取虚拟机配置'
                 desired = []
                 active = []
@@ -529,11 +644,15 @@ class Controller:
                         protected_ready = False
                 pending = vm_state in ('running', 'suspended') and effective_shares(desired) != effective_shares(active)
                 latest = next((e for e in self.events if e['vm'] == vm), None)
+                capacity = self._disk_capacity(vm, base, item, environment, settings, config_pin)
                 vms.append({
                     'id': vm, 'name': vm, 'state': vm_state,
                     'cpu': settings.get('cpuCount'),
                     'memory_gib': round(settings.get('memorySize', 0) / (1024 ** 3), 1),
                     'disk_gb': item.get('Disk'), 'allocated_gb': item.get('Size'),
+                    'disk_capacity_bytes': capacity,
+                    'disk_growth_supported': (capacity is not None and capacity < lifecycle.DISK_GIB_MAX * 1024**3
+                                              and vm_state == 'stopped' and not self.operations and not self._disk_growth_busy(build)),
                     'network': {'protected': protected_ready,
                                 'blocked': control.get('drop_proxy') is True,
                                 'management_enabled': runtime.get('management_enabled') is True and vm_state == 'running',
@@ -1000,11 +1119,13 @@ class Handler(BaseHTTPRequestHandler):
             elif path == '/api/reveal-directory':
                 value = self.server.controller.reveal(payload)
             else:
-                match = re.fullmatch(r'/api/vms/([^/]+)/(action|shares|delete)', unquote(path, errors='strict'))
+                match = re.fullmatch(r'/api/vms/([^/]+)/(action|shares|delete|expand-disk)', unquote(path, errors='strict'))
                 if not match:
                     raise AppError('未找到操作', 'not_found', 404)
                 vm, route = match.groups()
-                if route == 'delete':
+                if route == 'expand-disk':
+                    value = self.server.controller.expand_disk(vm, payload)
+                elif route == 'delete':
                     value = self.server.controller.delete_vm(vm, payload)
                 elif route == 'action':
                     value = self.server.controller.action(vm, payload)

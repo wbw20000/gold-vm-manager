@@ -75,7 +75,10 @@ private struct Options {
             result.cpu = Int(cpu)
             result.memoryGiB = try positive("--memory-gib")
             result.diskGiB = try positive("--disk-gib")
-            guard result.memoryGiB <= UInt64(Int64.max) / gib, result.diskGiB <= UInt64(Int64.max) / gib else {
+            guard (30...1024).contains(result.diskGiB) else {
+                throw fail("disk_out_of_range", "New disk capacity must be an integer from 30 to 1024 GiB.")
+            }
+            guard result.memoryGiB <= UInt64(Int64.max) / gib else {
                 throw fail("usage", "Resource size overflows supported byte counts.")
             }
             result.directory = fields["--directory"]
@@ -333,7 +336,6 @@ private func create(_ options: Options, image: VZMacOSRestoreImage, local: Local
           memory <= min(VZVirtualMachineConfiguration.maximumAllowedMemorySize, ProcessInfo.processInfo.physicalMemory) else {
         throw fail("memory_out_of_range", "Requested memory is outside IPSW/host limits; it will not be silently raised.")
     }
-    guard options.diskGiB >= 50 else { throw fail("disk_too_small", "Helper policy requires at least 50 GiB; IPSW does not expose a disk minimum.") }
     let stage = try Stage(path: options.directory!)
     try stage.checkEmpty()
     try stage.checkCapacity(diskBytes: disk)
@@ -440,7 +442,8 @@ private struct CleanVMInstaller {
                 --inspect is read-only and emits one JSON object, including macOS version and requirements.
                 --create requires a precreated empty user-owned 0700 directory; no symlinks or overwrite.
                 Creation is offline at the guest-device level: zero NICs, shares, sockets or clipboard.
-                CPU/memory are strict; sizes are GiB (2^30 bytes). Failed stages are never resumed or removed.
+                CPU/memory are strict; new disk capacity is 30–1024 whole GiB (2^30 bytes per GiB).
+                Failed stages are never resumed or removed.
                 """)
                 return
             }

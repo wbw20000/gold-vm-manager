@@ -397,8 +397,9 @@ class HostToolFixtures(unittest.TestCase):
         self.assertFalse(result['notarized'])
         self.assertFalse(result['launched'])
         info = plistlib.loads((output / 'Contents' / 'Info.plist').read_bytes())
-        self.assertEqual(info['CFBundleShortVersionString'], '1.5.0')
-        self.assertEqual(info['CFBundleVersion'], '8')
+        self.assertEqual(info['CFBundleShortVersionString'], '1.6.0')
+        self.assertEqual(info['CFBundleVersion'], '9')
+        self.assertTrue((payload / 'vm_disk_growth.py').is_file())
         self.assertTrue(Path(result['package_receipt']).is_file())
         self.assertNotIn('evidence', str(result['package_receipt']))
         commands = [c[0][0] for c in self.native.call_args_list]

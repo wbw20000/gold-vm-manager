@@ -71,6 +71,18 @@ class LifecycleTests(unittest.TestCase):
             with self.subTest(key=key,value=value),self.assertRaises(ValueError):
                 l.validated_request(self.payload(**{key:value}),set(),host_cpu=10,host_memory=64)
 
+    def test_new_disk_range_for_create_rebuild_and_offline(self):
+        image = self.root / 'synthetic.ipsw'
+        image.write_bytes(b'fixture only')
+        for payload in (self.payload(), self.payload(mode='rebuild', source_vm='gold', confirm_name='gold', acknowledge_erase=True),
+                        self.payload(mode=l.OFFLINE_MODE, ipsw=str(image), acknowledge_offline=True)):
+            for size in (30, 31, 49, 50, 137, 1024):
+                with self.subTest(mode=payload['mode'], size=size):
+                    self.assertEqual(l.validated_request(dict(payload, disk_gib=size), {'gold'})['disk_gib'], size)
+            for size in (29, 1025, True, 30.0, 30.5, '30', None):
+                with self.subTest(mode=payload['mode'], size=size), self.assertRaises(ValueError):
+                    l.validated_request(dict(payload, disk_gib=size), {'gold'})
+
     def test_names_reject_paths_and_unsafe_characters(self):
         for name in ['', '../gold', '.hidden','-flag','a/b','a\\b','a:b','a,b','a\n',' gold','gold ','a"b','a\x00b','x'*65]:
             with self.subTest(name=name),self.assertRaises(ValueError):r.validate_name(name)
@@ -172,15 +184,22 @@ class LifecycleTests(unittest.TestCase):
         r.write_private(p,{'version':1,'vms':{},'retired':[]});p.chmod(0o644)
         with self.assertRaises(ValueError):r.load_registry()
 
-    def valid_install_output(self):
+    def valid_install_output(self, disk_gib=50):
         stage=self.root/'install-output';stage.mkdir(mode=0o700)
         for name in ('disk.img','nvram.bin'):
             fd=os.open(str(stage/name),os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
-            try:os.ftruncate(fd,50*1024**3 if name=='disk.img' else 1)
+            try:os.ftruncate(fd,disk_gib*1024**3 if name=='disk.img' else 1)
             finally:os.close(fd)
         r.write_private(stage/'.clean-vm-installer.complete.json',{'schemaVersion':1,'status':'complete','installer':'CleanVMInstaller','networkDeviceCount':0,'directorySharingDeviceCount':0,'socketDeviceCount':0})
         r.write_private(stage/'config.json',{'version':1,'os':'darwin','arch':'arm64','diskFormat':'raw','cpuCountMin':2,'cpuCount':2,'memorySizeMin':4*1024**3,'memorySize':4*1024**3,'ecid':'bmV3LWlk','hardwareModel':'bW9kZWw=','macAddress':'a2:00:00:00:00:02','display':{'width':1024,'height':768,'unit':'px'}})
-        return stage,{'cpu':2,'memory_gib':4,'disk_gib':50}
+        return stage,{'cpu':2,'memory_gib':4,'disk_gib':disk_gib}
+
+    def test_verify_custom_disk_size_never_repairs_mismatch(self):
+        stage, request = self.valid_install_output(disk_gib=30)
+        l.verify_install_output(stage, request)
+        with self.assertRaisesRegex(ValueError, '新磁盘容量不匹配'):
+            l.verify_install_output(stage, dict(request, disk_gib=31))
+        self.assertEqual((stage/'disk.img').stat().st_size, 30 * 1024**3)
 
     def test_complete_receipt_and_private_outputs_required(self):
         stage,request=self.valid_install_output()
@@ -200,12 +219,12 @@ class LifecycleTests(unittest.TestCase):
         target.symlink_to(stage/'config.json')
         with self.assertRaises(ValueError):l.verify_install_output(stage,request)
 
-    def assert_legacy_worker(self, mode):
+    def assert_legacy_worker(self, mode, disk_gib):
         import provisioning
         import io
         from types import SimpleNamespace
         jid='c'*32;jobdir=self.state/'build-jobs'/jid;r.private_dir(jobdir)
-        request=self.payload(mode=mode,id=jid,source_vm=None,source_identity=None,cpu=2,memory_gib=4,disk_gib=50,ipsw='latest')
+        request=self.payload(mode=mode,id=jid,source_vm=None,source_identity=None,cpu=2,memory_gib=4,disk_gib=disk_gib,ipsw='latest')
         values={}
         if mode=='rebuild':
             self.fake_vm('gold')
@@ -223,9 +242,14 @@ class LifecycleTests(unittest.TestCase):
             return {'status':'awaiting_user_setup'}
         child=SimpleNamespace(stdout=io.StringIO('{"event":"complete","schemaVersion":1}\n'),wait=lambda:0)
         try:
-            with patch.object(l,'inventory',return_value=values),patch.object(l.shutil,'disk_usage',return_value=SimpleNamespace(free=200*1024**3)),patch.object(provisioning,'preflight') as preflight,patch.object(provisioning,'prepare_environment',side_effect=prepare) as provision,patch.object(l,'offline_image',return_value=self.root/'fake.ipsw'),patch.object(l,'helper_json',return_value={'supported':True,'minimumCPUCount':2,'minimumMemorySize':4*1024**3}),patch.object(l.subprocess,'Popen',return_value=child),patch.object(l,'verify_install_output') as verify,patch.object(l,'new_identity_check',return_value={'cpuCount':2,'memorySize':4*1024**3}),patch.object(l,'commit') as commit:
+            with patch.object(l,'inventory',return_value=values),patch.object(l.shutil,'disk_usage',return_value=SimpleNamespace(free=(disk_gib+20)*1024**3)),patch.object(provisioning,'preflight') as preflight,patch.object(provisioning,'prepare_environment',side_effect=prepare) as provision,patch.object(l,'offline_image',return_value=self.root/'fake.ipsw'),patch.object(l,'helper_json',return_value={'supported':True,'minimumCPUCount':2,'minimumMemorySize':4*1024**3}),patch.object(l.subprocess,'Popen',return_value=child) as install,patch.object(l,'verify_install_output') as verify,patch.object(l,'new_identity_check',return_value={'cpuCount':2,'memorySize':4*1024**3}),patch.object(l,'commit') as commit:
                 l.worker(jid,fd)
-                verify.assert_called_once();commit.assert_called_once()
+                stage = self.tart/'.gold-manager-staging'/jid/'new-environment'
+                self.assertEqual(install.call_args.args[0], [str(l.HELPER), '--create', '--directory', str(stage),
+                    '--ipsw', str(self.root/'fake.ipsw'), '--cpu', '2', '--memory-gib', '4', '--disk-gib', str(disk_gib)])
+                verify.assert_called_once_with(stage, request);commit.assert_called_once()
+                if mode == 'rebuild':
+                    self.assertEqual((self.vms/'gold'/'disk.img').stat().st_size, len(b'fake disk not a real VM'))
                 preflight.assert_called_once();provision.assert_called_once()
             current=r.read_private(self.state/'build-current.json')
             self.assertEqual(current['phase'],'awaiting_user_setup')
@@ -239,10 +263,10 @@ class LifecycleTests(unittest.TestCase):
         finally:os.close(fd)
 
     def test_first_create_makes_private_environment_parent(self):
-        self.assert_legacy_worker('create')
+        self.assert_legacy_worker('create', 30)
 
     def test_legacy_rebuild_still_provisions_and_commits(self):
-        self.assert_legacy_worker('rebuild')
+        self.assert_legacy_worker('rebuild', 1024)
 
     def test_interrupted_job_never_auto_resumes(self):
         r.write_private(self.state/'build-current.json',{'id':'b'*32,'phase':'installing','pid':123,'name':'new'})

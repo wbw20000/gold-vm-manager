@@ -20,6 +20,7 @@ function fixture() {
   function node(id) {
     if (!nodes.has(id)) nodes.set(id, { value: '', checked: false, hidden: false, disabled: false,
       textContent: '', children: [], classList: { toggle() {} }, checkValidity: () => true,
+      setAttribute(name, value) { this[name] = value; },
       focus() {}, showModal() { this.open = true; }, close() { this.open = false; },
       querySelectorAll() { return []; }, reset() {
         for (const n of nodes.values()) { n.value = ''; n.checked = false; }
@@ -28,6 +29,10 @@ function fixture() {
     });
     return nodes.get(id);
   }
+  // Model native number-input validity from the real form, not a fixture policy.
+  const disk = node('build-disk'), tag = html.match(/<input id="build-disk"[^>]*>/)[0];
+  const [min, max, step] = ['min', 'max', 'step'].map(key => Number(tag.match(new RegExp(` ${key}="(\\d+)"`))[1]));
+  disk.checkValidity = () => disk.value !== '' && Number(disk.value) >= min && Number(disk.value) <= max && (Number(disk.value) - min) % step === 0;
   const bodies = [];
   const sandbox = {
     $: node, connected: true, buildBusy: false, buildContext: null, selectedVM: 'other',
@@ -94,12 +99,38 @@ test('legacy creation is no longer opened by the UI; explicit rebuild keeps its 
   f.node('build-name').value = 'new-fixture'; f.node('build-setup-ack').checked = true;
   f.sandbox.updateBuildForm();
   assert.equal(f.node('build-submit').disabled, true);
-  f.node('build-erase-ack').checked = true; f.node('build-confirm').value = 'old-fixture';
+  f.node('build-erase-ack').checked = true;
   await f.sandbox.submitBuild({ preventDefault() {} });
   assert.equal(f.bodies[0].mode, 'rebuild');
   assert.equal(f.bodies[0].source_vm, 'old-fixture');
   assert.equal(f.bodies[0].acknowledge_setup, true);
   assert.equal('acknowledge_offline' in f.bodies[0], false);
+});
+
+test('offline installation and legacy rebuild explain invalid disk sizes and send the chosen integer', async () => {
+  assert.match(html, /<label for="build-disk">[^<]*30–1024 GiB[^<]*整数/);
+  assert.match(html, /id="build-disk-note"[^>]*>[^<]*较小[^<]*macOS[^<]*更新/);
+  assert.match(html, /id="build-disk-error"[^>]*>磁盘容量无效：[^<]*30–1024 GiB[^<]*整数/);
+  for (const offline of [true, false]) {
+    const f = fixture();
+    for (const [disk, ok] of [[29, false], [30, true], [31, true], [49, true], [50, true], [1024, true], [1025, false], [30.5, false], ['', false]]) {
+      if (!f.node('build-dialog').open) {
+        f.sandbox.openBuild(offline ? null : 'old-fixture', offline);
+        assert.equal(f.node('build-disk').value, '50');
+        f.node('build-name').value = 'new-fixture';
+        if (offline) { f.node('build-ipsw').value = '/fixture/approved.ipsw'; f.node('build-offline-ack').checked = true; }
+        else { f.node('build-setup-ack').checked = true; f.node('build-erase-ack').checked = true; }
+      }
+      f.node('build-disk').value = String(disk); f.sandbox.updateBuildForm();
+      assert.equal(f.node('build-submit').disabled, !ok, `disk ${disk}`);
+      assert.equal(f.node('build-disk-error').hidden, ok);
+      if (ok) {
+        await f.sandbox.submitBuild({ preventDefault() {} });
+        assert.equal(f.bodies.at(-1).disk_gib, disk);
+      }
+    }
+    assert.deepEqual(f.bodies.map(body => body.disk_gib), [30, 31, 49, 50, 1024]);
+  }
 });
 
 test('restored-only job is never labelled preinstalled or linked to VM startup', () => {

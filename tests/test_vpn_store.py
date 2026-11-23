@@ -123,6 +123,62 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(list(self.inputs.iterdir()), [self.path])
         self.run.assert_not_called()
 
+    def test_saved_configuration_gets_its_own_ticket_with_nothing_to_normalize(self):
+        first = self.submit()
+        original = self.read(now=NOW)
+        later = NOW + 2 * store.MAX_AGE_SECONDS  # The first ticket has long expired; its VM keeps the nodes.
+        self.reject(self.read, now=later)
+        with mock.patch('vpn_store.resolve_public_hostname', side_effect=AssertionError('no DNS for a copy')):
+            result = store.store_saved(self.state, copy.deepcopy(original.private_config), list(original.endpoints), now=later)
+        self.assertEqual(set(result), set(first))
+        self.assertNotEqual(result['configuration_id'], first['configuration_id'])
+        self.assertEqual(result['summary'], {'node_count': 1, 'endpoint_count': 1, 'protocols': ['tuic'],
+                                             'warnings': [], 'normalization_required': False})
+        self.assertEqual(result['expires_in_seconds'], store.MAX_AGE_SECONDS)
+        copied = store.load_configuration(self.state, result['configuration_id'], now=later)
+        self.assertEqual(copied.private_config, original.private_config)
+        self.assertEqual(copied.endpoints, original.endpoints)
+        self.assertEqual(copied.digest, original.digest)
+        self.assertEqual(copied.summary, result['summary'])
+        self.assertIsNone(copied.bound_job)
+        claimed = store.claim_configuration(self.state, result['configuration_id'], OTHER_JOB, now=later)
+        self.assertEqual(claimed.bound_job, OTHER_JOB)
+        self.assertEqual(len(list(self.inputs.iterdir())), 2)
+        self.assert_redacted(json.dumps(result), repr(copied))
+        ticket = self.inputs / (result['configuration_id'] + '.json')
+        self.assertEqual(stat.S_IMODE(ticket.stat().st_mode), 0o600)
+        self.reject(store.load_configuration, self.state,
+                    store.store_saved(self.state, original.private_config, original.endpoints, now=later)['configuration_id'],
+                    now=later + store.MAX_AGE_SECONDS + 1)
+        self.run.assert_not_called()
+
+    def test_saved_configuration_is_refused_unless_reparsing_changes_nothing(self):
+        self.submit()
+        original = self.read(now=NOW)
+        config, endpoints = original.private_config, list(original.endpoints)
+
+        def changed(**node):
+            value = copy.deepcopy(config)
+            value['proxies'][0].update(node)
+            return value
+        errors = (store.VPNStoreError, VPNConfigurationError)
+        for label, candidate, pinned in (
+                ('not yet normalized', {'proxies': payload()['nodes']}, endpoints),
+                ('only the nodes', {'proxies': config['proxies']}, endpoints),
+                ('unsupported option', changed(extra=SECRET), endpoints),
+                ('another server', changed(server='9.9.9.9'), endpoints),
+                ('another endpoint set', config, [('udp', '9.9.9.9', 443)]),
+                ('no endpoints', config, []),
+                ('extra policy', dict(config, extra=SECRET), endpoints),
+                ('no nodes', dict(config, proxies=None), endpoints),
+                ('not a mapping', [config], endpoints),
+                ('endpoints not a list', config, 'udp')):
+            with self.subTest(label):
+                self.reject(store.store_saved, self.state, candidate, pinned, now=NOW, error=errors)
+        self.reject(store.store_saved, self.state, config, endpoints, now='soon')
+        self.assertEqual(list(self.inputs.iterdir()), [self.path])
+        self.run.assert_not_called()
+
     def test_unexpected_parser_summary_is_not_exposed_or_written(self):
         parsed = store.parse_submission(payload())
         for summary in (dict(parsed.summary, extra=SECRET), dict(parsed.summary, warnings=[SECRET])):

@@ -276,6 +276,62 @@ class HostArtifactTests(unittest.TestCase):
         self.assertEqual(self.quarantine.call_count, 2)
         self.assertEqual({e.phase for e in events}, {'cache-verify'})
 
+    def test_cached_is_a_read_only_hint_for_what_reuse_would_pick(self):
+        self.assertFalse(artifacts.cached('podman-installer', self.cache))
+        self.assertFalse(self.cache.exists(), 'asking never creates the cache')
+        with self.assertRaises(artifacts.ArtifactError):
+            self.acquire(Response(payload=BODY[:3]))
+        self.assertFalse(artifacts.cached('podman-installer', self.cache), 'a partial attempt is not a cached copy')
+        receipt = self.acquire(Response())
+        path = Path(receipt.artifact_path)
+        before = path.stat()
+        self.quarantine.reset_mock()
+        self.build.reset_mock()
+        with mock.patch.object(artifacts, '_hash_file', side_effect=AssertionError('a hint never hashes')), \
+                mock.patch.object(artifacts, '_lock', side_effect=AssertionError('a hint never locks')), \
+                open(receipt.artifact_path, 'rb') as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)  # In use by a build: still only a hint.
+            self.assertTrue(artifacts.cached('podman-installer', self.cache))
+        after = path.stat()
+        self.assertEqual((before.st_ino, before.st_mtime_ns, before.st_ctime_ns), (after.st_ino, after.st_mtime_ns, after.st_ctime_ns))
+        self.assertEqual(len(self.attempts()), 2)
+        self.quarantine.assert_not_called()
+        self.build.assert_not_called()
+        with self.assertRaisesRegex(artifacts.ArtifactError, 'unknown-spec-key'):
+            artifacts.cached('other', self.cache)
+
+    def test_cached_counts_a_local_import_and_follows_reuse_on_altered_entries(self):
+        receipt = artifacts.import_local('podman-installer', self.source(), self.cache)
+        self.assertTrue(artifacts.cached('podman-installer', self.cache))
+        path, record, accepted = (Path(getattr(receipt, name)) for name in ('artifact_path', 'receipt_path', 'acceptance_path'))
+        original = {item: item.read_bytes() for item in (record, accepted)}
+
+        def altered(item, **changes):
+            item.write_text(json.dumps(dict(json.loads(original[item]), **changes)))
+            try:
+                self.assertFalse(artifacts.cached('podman-installer', self.cache))
+                with self.assertRaisesRegex(artifacts.ArtifactError, 'invalid-cache-receipt'):
+                    self.acquire()
+            finally:
+                item.write_bytes(original[item])
+        altered(record, native_execution_approved=True)
+        altered(accepted, digest_verified=1)
+        altered(accepted, final_host='example.invalid')
+        self.assertTrue(artifacts.cached('podman-installer', self.cache))
+        os.link(str(path), str(self.root / 'alias.fixture'))
+        self.assertFalse(artifacts.cached('podman-installer', self.cache))
+        os.unlink(str(self.root / 'alias.fixture'))
+        self.assertTrue(artifacts.cached('podman-installer', self.cache))
+        # Replaced bytes are a different inode than the one both records name.
+        replacement = path.with_name('replacement.fixture')
+        replacement.write_bytes(BODY)
+        replacement.chmod(0o600)
+        os.replace(str(replacement), str(path))
+        self.assertFalse(artifacts.cached('podman-installer', self.cache))
+        self.cache.chmod(0o755)
+        self.assertFalse(artifacts.cached('podman-installer', self.cache))
+        self.cache.chmod(0o700)
+
     def test_cache_content_mutation_with_restored_mtime_fails_digest(self):
         receipt = self.acquire()
         path = Path(receipt.artifact_path)

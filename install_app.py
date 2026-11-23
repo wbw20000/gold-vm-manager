@@ -85,10 +85,10 @@ def package_app(output, private_build_root):
     portable_receipts={host_tools.HELPERS_PORTABLE_RECEIPT:hashlib.sha256(raw).hexdigest()}
     info={
         'CFBundleName':'Gold VM Manager','CFBundleDisplayName':'Gold VM 管理器',
-        'CFBundleIdentifier':'local.gold.vm-manager','CFBundleVersion':'7',
+        'CFBundleIdentifier':'local.gold.vm-manager','CFBundleVersion':'8',
         'CFBundleIconFile':'AppIcon',
         'LSApplicationCategoryType':'public.app-category.developer-tools',
-        'CFBundleShortVersionString':'1.4.0','CFBundleExecutable':'GoldVMManager',
+        'CFBundleShortVersionString':'1.5.0','CFBundleExecutable':'GoldVMManager',
         'CFBundlePackageType':'APPL','LSMinimumSystemVersion':'26.6.2',
         'NSHighResolutionCapable':True,
         'NSAppTransportSecurity':{'NSAllowsLocalNetworking':True},

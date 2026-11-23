@@ -706,3 +706,110 @@ test('an older preinstalled VM keeps its own first-setup wording without the ins
   assert.match(node('confirm-description').textContent, /自动导入节点/);
   assert.doesNotMatch(node('confirm-description').textContent, /gold-installers/);
 });
+
+test('a VM that kept its nodes is the starting choice; validating sends only its name and creating sends only the id', async () => {
+  const f = fixture(); f.context.nodeSources = ['first VM', 'second VM'];
+  await f.controller.open();
+  const source = f.n('nodeSource');
+  assert.equal(source.parentNode.hidden, false);
+  assert.deepEqual(source.children.map(o => [o.value, o.textContent]),
+    [['', '填写新的节点'], ['first VM', '沿用「first VM」的节点'], ['second VM', '沿用「second VM」的节点']]);
+  assert.equal(source.value, 'first VM');
+  assert.equal(f.n('yaml-panel').hidden, true); assert.equal(f.n('manual-fields').hidden, true);
+  assert.equal(f.n('validate').textContent, '沿用并校验这组节点（来源：first VM）');
+  assert.equal(f.calls.some(c => c.route.endsWith('/vpn/validate')), false);
+  await f.set('name', 'new VM');
+  assert.equal(f.n('submit').disabled, true, 'copying still needs its own explicit validation');
+  await f.controller.validate();
+  const check = f.calls.find(c => c.route.endsWith('/vpn/validate'));
+  assert.deepEqual(check.options.body, { submission: { input_mode: 'vm', vm: 'first VM' }, allow_resolve: false });
+  assert.match(f.n('summary').textContent, /已沿用「first VM」的 1 个节点 \/ 1 个端点 · tuic/);
+  assert.equal(f.n('submit').disabled, false);
+  await f.n('submit').click();
+  assert.deepEqual(f.calls.find(c => c.route.endsWith('/create')).options.body, { name: 'new VM', cpu: 2, memory_gib: 4, disk_gib: 50,
+    ipsw: 'reviewed', vpn_configuration_id: ID, download_loopback_proxy: null, acknowledge_preinstall: true, acknowledge_network_policy: true });
+});
+
+test('choosing new nodes brings the YAML path back and drops the copied validation', async () => {
+  const f = fixture(); f.context.nodeSources = ['first VM'];
+  await f.controller.open(); await f.set('name', 'new VM'); await f.controller.validate();
+  assert.equal(f.n('submit').disabled, false);
+  await f.set('nodeSource', '', 'change');
+  assert.equal(f.n('submit').disabled, true);
+  assert.equal(f.n('yaml-panel').hidden, false); assert.equal(f.n('manual-fields').hidden, false);
+  assert.equal(f.n('validate').textContent, '校验并私有保存节点');
+  await f.set('yamlPath', YAML_PATH); await f.controller.validate();
+  assert.deepEqual(f.calls.filter(c => c.route.endsWith('/vpn/validate'))[1].options.body,
+    { submission: { input_mode: 'yaml_path', path: YAML_PATH }, allow_resolve: false });
+  await f.set('nodeSource', 'first VM', 'change');
+  assert.equal(f.n('submit').disabled, true, 'the YAML validation does not carry over to a copied source either');
+});
+
+test('without a VM to copy from the choice is hidden and the YAML path stays the default', async () => {
+  const f = fixture(); await f.controller.open();
+  assert.equal(f.n('nodeSource').parentNode.hidden, true); assert.equal(f.n('nodeSource').value, '');
+  assert.equal(f.n('yaml-panel').hidden, false);
+  assert.deepEqual(ui.nodeSources({ nodeSources: ['a', 'a', '', 7, null, 'x'.repeat(65)] }), ['a']);
+  assert.deepEqual(ui.nodeSources({}), []);
+  assert.throws(() => ui.submission({ mode: 'vm', nodeSource: 'other', sources: ['first VM'] }), /保存了节点配置/);
+  assert.throws(() => ui.submission({ mode: 'vm', nodeSource: 'first VM' }), /保存了节点配置/);
+});
+
+test('copying never authorizes DNS resolution, and a source that disappears is deselected', async () => {
+  const f = fixture(); f.context.nodeSources = ['first VM'];
+  await f.controller.open(); await f.set('name', 'new VM');
+  await f.set('nodeSource', '', 'change'); await f.set('allowResolve', true, 'change');
+  await f.set('nodeSource', 'first VM', 'change');
+  await f.controller.validate();
+  assert.equal(f.calls.find(c => c.route.endsWith('/vpn/validate')).options.body.allow_resolve, false);
+  assert.equal(f.n('submit').disabled, false);
+  f.context.nodeSources = []; f.controller.update();
+  assert.equal(f.n('nodeSource').value, ''); assert.equal(f.n('nodeSource').parentNode.hidden, true);
+  assert.equal(f.n('submit').disabled, true);
+  await f.n('submit').click();
+  assert.equal(f.calls.filter(c => c.route.endsWith('/create')).length, 0);
+});
+
+test('a refused copy says so without pointing at a YAML path, and reopening starts from the copy again', async () => {
+  const f = fixture(); f.context.nodeSources = ['first VM'];
+  f.handlers['/api/preinstall/vpn/validate'] = () => { throw new Error('PRIVATE detail'); };
+  await f.controller.open(); await f.set('name', 'new VM'); await f.controller.validate();
+  assert.match(f.n('error').textContent, /无法沿用这台 VM 的节点.*填写新的节点/);
+  assert.equal(f.n('error').textContent.includes('PRIVATE'), false);
+  assert.equal(f.n('submit').disabled, true);
+  await f.set('nodeSource', '', 'change');
+  f.n('dialog').close(); await f.controller.open();
+  assert.equal(f.n('nodeSource').value, 'first VM');
+});
+
+test('a waiting job can also continue with a copied configuration', async () => {
+  const f = fixture(); f.context.nodeSources = ['first VM']; f.wait();
+  await f.controller.openResume(JOB_ID);
+  assert.equal(f.n('nodeSource').value, 'first VM');
+  await f.controller.validate(); await f.n('submit').click();
+  assert.deepEqual(f.calls.find(c => c.route.endsWith('/vpn/validate')).options.body,
+    { submission: { input_mode: 'vm', vm: 'first VM' }, allow_resolve: false });
+  assert.deepEqual(f.calls.find(c => c.route.endsWith('/resume')).options.body,
+    { job_id: JOB_ID, vpn_configuration_id: ID, acknowledge_network_policy: true });
+});
+
+test('an already verified system image is announced instead of asking for a path again', async () => {
+  const f = fixture(); await f.controller.open();
+  assert.equal(f.n('image-note').hidden, true);
+  f.n('dialog').close();
+  f.handlers['/api/preinstall/capabilities'] = () => ({ ...capabilities(), restore_image_cached: true });
+  await f.controller.open();
+  assert.equal(f.n('imageMode').value, 'reviewed'); assert.equal(f.n('ipsw').parentNode.hidden, true);
+  assert.equal(f.n('image-note').hidden, false);
+  assert.match(f.n('image-note').textContent, /直接使用，不再下载，也不用选文件/);
+  await f.set('imageMode', 'local', 'change');
+  assert.match(f.n('image-note').textContent, /不必再选文件.*另存一份/);
+  f.n('dialog').close();
+  f.handlers['/api/preinstall/capabilities'] = () => ({ ...capabilities(), restore_image_cached: 'yes' });
+  await f.controller.open();
+  assert.equal(f.n('image-note').hidden, true, 'only an exact true counts');
+});
+
+test('the page offers only VMs that kept an installers folder as node sources', () => {
+  assert.match(appSource, /nodeSources: \(state\?\.vms \|\| \[\]\)\.filter\(\(vm\) => vm\.preinstalled\?\.installers_share === true\)\.map\(\(vm\) => vm\.id\)/);
+});

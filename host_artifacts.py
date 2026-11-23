@@ -535,6 +535,22 @@ def _ensure_quarantine(root, root_fd, path, directory_fd, spec, fd, budget):
     _directory_still(path, directory_fd)
 
 
+def _recorded(spec, path, name, info, data, accepted):
+    """The receipt that both of an entry's records must spell out for its file as it is now."""
+    _need(isinstance(data, dict) and data.get('source_kind') in ('download', 'local-import'),
+          'invalid-cache-receipt')
+    host = data.get('final_host')
+    allowed = ('', _https_url(spec.url).hostname) + spec.redirect_hosts
+    _need(host in allowed and ((data['source_kind'] == 'local-import') == (host == '')),
+          'invalid-cache-receipt')
+    expected = _receipt(spec, name, path, info, data['source_kind'], host)
+    # Compare canonical JSON, not Python equality (True must not equal 1).
+    _need(_json_bytes(data) == _json_bytes(dataclasses.asdict(expected))
+          and _json_bytes(accepted) == _json_bytes(dataclasses.asdict(
+              dataclasses.replace(expected, quarantine_ensured=True))), 'invalid-cache-receipt')
+    return expected
+
+
 def _reuse(spec, root, root_fd, budget):
     names = os.listdir(root_fd)
     _need(len(names) <= _MAX_ATTEMPTS, 'too-many-cache-attempts')
@@ -555,17 +571,7 @@ def _reuse(spec, root, root_fd, budget):
             fd = _file_at(directory_fd, spec.filename)
             _lock(fd)
             info = _same_file(directory_fd, spec.filename, fd)
-            _need(isinstance(data, dict) and data.get('source_kind') in ('download', 'local-import'),
-                  'invalid-cache-receipt')
-            host = data.get('final_host')
-            allowed = ('', _https_url(spec.url).hostname) + spec.redirect_hosts
-            _need(host in allowed and ((data['source_kind'] == 'local-import') == (host == '')),
-                  'invalid-cache-receipt')
-            expected = _receipt(spec, name, root / name, info, data['source_kind'], host)
-            # Compare canonical JSON, not Python equality (True must not equal 1).
-            _need(_json_bytes(data) == _json_bytes(dataclasses.asdict(expected))
-                  and _json_bytes(accepted) == _json_bytes(dataclasses.asdict(
-                      dataclasses.replace(expected, quarantine_ensured=True))), 'invalid-cache-receipt')
+            expected = _recorded(spec, root / name, name, info, data, accepted)
             verified = _hash_file(fd, spec, name, budget, 'cache-verify')
             _need(_unchanged(verified) == _unchanged(_same_file(directory_fd, spec.filename, fd)),
                   'file-changed')
@@ -581,6 +587,43 @@ def _reuse(spec, root, root_fd, budget):
                 os.close(fd)
             os.close(directory_fd)
     return None
+
+
+def cached(spec_key, private_cache_root):
+    """Whether acquire() would find an accepted copy of this pinned artifact in the cache.
+
+    A hint for the interface only. It looks at the first accepted entry, the
+    one reuse would pick, and checks its records against the file's current
+    identity and size exactly as reuse does. Nothing is hashed, locked or
+    created here; acquire() still verifies the whole file before any use.
+    """
+    spec = _spec(spec_key)
+    root_fd = directory_fd = None
+    try:
+        root, root_fd = _open_directory(private_cache_root)
+        names = os.listdir(root_fd)
+        _need(len(names) <= _MAX_ATTEMPTS, 'too-many-cache-attempts')
+        for name in sorted(names):
+            if re.fullmatch(re.escape(spec.key) + r'-[0-9a-f]{32}', name) is None:
+                continue
+            directory_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+            _directory(os.fstat(directory_fd))
+            if 'accepted.json' in os.listdir(directory_fd):
+                data = _read_json(directory_fd, 'receipt.json')
+                accepted = _read_json(directory_fd, 'accepted.json')
+                info = os.stat(spec.filename, dir_fd=directory_fd, follow_symlinks=False)
+                _regular(info, True)
+                _recorded(spec, root / name, name, info, data, accepted)
+                return info.st_size == spec.size_bytes
+            os.close(directory_fd)
+            directory_fd = None
+        return False
+    except Exception:
+        return False
+    finally:
+        for fd in (directory_fd, root_fd):
+            if fd is not None:
+                os.close(fd)
 
 
 def _acquire(spec_key, private_cache_root, *, source=None, loopback_proxy=None,

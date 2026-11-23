@@ -97,7 +97,15 @@
     }
     return { input_mode: 'fields', nodes: [node] };
   }
+  function nodeSources(context) {
+    const names = Array.isArray(context?.nodeSources) ? context.nodeSources : [];
+    return [...new Set(names.filter(n => typeof n === 'string' && n.length >= 1 && n.length <= 64))].slice(0, 64);
+  }
   function submission(v) {
+    if (v.mode === 'vm') {
+      need(typeof v.nodeSource === 'string' && Array.isArray(v.sources) && v.sources.includes(v.nodeSource), '请选择一台保存了节点配置的 VM。');
+      return { input_mode: 'vm', vm: v.nodeSource };
+    }
     if (v.mode === 'fields') return fieldSubmission(v, v.allowResolve);
     need(v.mode === 'yaml', '请选择参数或本地 YAML 路径。');
     const path = text(v.yamlPath);
@@ -161,7 +169,7 @@
   function mount({ document, api, getContext, onBusy = () => {}, onQueued = async () => {}, clock = Date.now, saveExample }) {
     const controls = {}, rows = {}, allControls = [];
     let busy = false, revision = 0, validated = null, capabilities = null, requestUncertain = false;
-    let resumeTarget = null, resumeStale = false, lastDefer = false, lastMode = 'yaml';
+    let resumeTarget = null, resumeStale = false, lastDefer = false, lastMode = 'yaml', sources = [];
     const node = (tag, cls, value) => { const n = document.createElement(tag); if (cls) n.className = cls; if (value !== undefined) n.textContent = String(value); return n; };
     const dialog = node('dialog', 'modal preinstall-modal'); dialog.id = 'preinstall-dialog'; dialog.setAttribute('aria-labelledby', 'preinstall-title');
     const form = node('form'); form.noValidate = true; form.setAttribute('autocomplete', 'off');
@@ -207,6 +215,7 @@
     field(resourceGrid, 'disk', '磁盘（GiB）', { type: 'number', min: 50, max: 1024, value: '50' });
     machine.append(node('p', 'form-note', '默认 2 vCPU / 4 GiB / 50 GiB；不会偷偷增加资源。2 核性能有限，实际最低要求由系统镜像检查决定。'));
     field(machine, 'imageMode', '系统镜像来源', { choices: [['reviewed', '经审核的固定 Apple 恢复镜像'], ['local', '我信任的本机 IPSW 绝对路径']] });
+    const imageNote = node('p', 'form-note'); imageNote.id = 'preinstall-image-note'; imageNote.hidden = true; machine.append(imageNote);
     field(machine, 'ipsw', '可信本地 IPSW 路径', { placeholder: '/绝对路径/macOS.ipsw', note: '不上传镜像文件，不使用开发者证据路径；本机来源与完整性仍须后端校验。' });
     const downloadSettings = node('details', 'preinstall-download-settings');
     downloadSettings.id = 'preinstall-download-settings';
@@ -219,6 +228,7 @@
     const deferNote = node('p', 'form-note', '系统与应用装好后会暂停，等待你回来配置 VPN。此时 VM 不会发布或开机，也不会配置客机网络。');
     deferNote.id = 'preinstall-defer-note'; vpn.append(deferNote);
     const vpnInputs = node('div'); vpnInputs.id = 'preinstall-vpn-inputs'; vpn.append(vpnInputs);
+    field(vpnInputs, 'nodeSource', '节点来源', { choices: [['', '填写新的节点']], note: '沿用时使用那台 VM 构建时校验过的同一组节点和端点，不用再填 YAML；那台 VM 不受影响。' });
     const yamlPanel = node('div', 'preinstall-yaml');
     yamlPanel.id = 'preinstall-yaml-panel'; vpnInputs.append(yamlPanel);
     yamlPanel.append(node('p', 'form-note', '可下载模板并在本机填好，再填写文件的绝对路径。用在线模型整理时只给占位值，真实密码、UUID 和订阅链接留在本机。'));
@@ -268,9 +278,9 @@
     submitButton.setAttribute('aria-describedby', 'preinstall-operation-note preinstall-normalization-note');
     footer.append(cancel, submitButton); form.append(footer); dialog.append(form); document.body.append(dialog);
     const defaults = Object.fromEntries(Object.entries(controls).map(([key, input]) => [key, input.type === 'checkbox' ? input.checked : input.value]));
-    const vpnKeys = new Set(['yamlPath', 'protocol', 'nodeName', 'server', 'port', 'uuid', 'password', 'sni', 'alpn', 'cipher', 'congestion', 'relay', 'security', 'flow', 'fingerprint', 'realityKey', 'shortId', 'up', 'down', 'obfs', 'obfsPassword', 'udp', 'allowResolve']);
+    const vpnKeys = new Set(['nodeSource', 'yamlPath', 'protocol', 'nodeName', 'server', 'port', 'uuid', 'password', 'sni', 'alpn', 'cipher', 'congestion', 'relay', 'security', 'flow', 'fingerprint', 'realityKey', 'shortId', 'up', 'down', 'obfs', 'obfsPassword', 'udp', 'allowResolve']);
     const machineKeys = new Set(['name', 'cpu', 'memory', 'disk', 'imageMode', 'ipsw', 'downloadProxy']);
-    const currentMode = () => manualSettings.open ? 'fields' : 'yaml';
+    const currentMode = () => controls.nodeSource.value ? 'vm' : manualSettings.open ? 'fields' : 'yaml';
     const deferred = () => !resumeTarget && controls.deferVpn.checked;
     function values(keys) {
       return Object.fromEntries([...keys].map(key => { const input = controls[key]; return [key, input.type === 'checkbox' ? input.checked : input.value]; }));
@@ -285,7 +295,20 @@
     }
     function clearVpnInputs() {
       resetControls(vpnKeys);
-      manualSettings.open = false; dnsSettings.open = false; lastMode = 'yaml'; invalidate();
+      // With a VM to copy from, that is the starting choice: nothing to type again.
+      controls.nodeSource.value = sources[0] || '';
+      manualSettings.open = false; dnsSettings.open = false; lastMode = currentMode(); invalidate();
+    }
+    function syncSources(context) {
+      const names = nodeSources(context);
+      if (names.length === sources.length && names.every((name, i) => name === sources[i])) return;
+      sources = names;
+      const select = controls.nodeSource, kept = select.value;
+      select.replaceChildren(...[['', '填写新的节点'], ...names.map(name => [name, `沿用「${name}」的节点`])].map(([value, label]) => {
+        const option = node('option', '', label); option.value = value; return option;
+      }));
+      // A source that is gone cannot stay selected; the mode change that follows drops its validation.
+      select.value = names.includes(kept) ? kept : '';
     }
     function syncInputMode() {
       const skip = deferred();
@@ -302,8 +325,15 @@
     }
     function visibility() {
       const p = controls.protocol.value;
-      yamlPanel.hidden = manualSettings.open;
-      rows.ipsw.hidden = controls.imageMode.value !== 'local';
+      const reuse = currentMode() === 'vm';
+      rows.nodeSource.hidden = sources.length === 0;
+      yamlPanel.hidden = reuse || manualSettings.open;
+      manualSettings.hidden = reuse; dnsSettings.hidden = reuse;
+      const local = controls.imageMode.value === 'local';
+      rows.ipsw.hidden = !local;
+      imageNote.hidden = capabilities?.imageCached !== true;
+      imageNote.textContent = local ? '本机已有核验过的系统镜像，不必再选文件；再选一次会另存一份约 20 GB 的副本。'
+        : '本机已有核验过的系统镜像：直接使用，不再下载，也不用选文件（每次构建仍会重新核对）。';
       const visible = { uuid: ['tuic', 'vless'].includes(p), password: p !== 'vless', sni: p !== 'ss', alpn: p !== 'ss', cipher: p === 'ss',
         congestion: p === 'tuic', relay: p === 'tuic', security: p === 'vless', flow: p === 'vless', fingerprint: ['vless', 'trojan'].includes(p),
         realityKey: p === 'vless' && controls.security.value === 'reality', shortId: p === 'vless' && controls.security.value === 'reality',
@@ -317,9 +347,11 @@
         resumeStale = true; clearVpnInputs();
         showError('待配置任务已变化，请关闭此窗口，刷新后从当前任务重新打开。');
       }
+      syncSources(context);
       syncInputMode();
       if (validated && clock() >= validated.expires) invalidate('节点校验已过期，请重新校验。');
       visibility();
+      validateButton.textContent = currentMode() === 'vm' ? `沿用并校验这组节点（来源：${controls.nodeSource.value}）` : '校验并私有保存节点';
       const resuming = resumeTarget !== null, skip = deferred();
       const unavailable = busy || !canOperate(context);
       machine.hidden = resuming;
@@ -349,7 +381,7 @@
       submitButton.textContent = busy ? '正在处理，请稍候…' : finalLabel;
     }
     function reset() {
-      resetControls(machineKeys); resetControls(['deferVpn']); clearVpnInputs();
+      resetControls(machineKeys); resetControls(['deferVpn']); syncSources(getContext()); clearVpnInputs();
       resumeTarget = null; resumeStale = false; lastDefer = false;
       downloadSettings.open = false;
       capabilities = null; requestUncertain = false; error.hidden = true; error.textContent = '';
@@ -369,7 +401,7 @@
         if (!dialog.open || !canOperate(getContext())) return;
         const apps = Array.isArray(result.applications) ? result.applications : [];
         const complete = apps.length === APPS.length && APPS.every(name => apps.some(app => app?.name === name && typeof app.version === 'string'));
-        capabilities = { ready: result.ready === true && complete };
+        capabilities = { ready: result.ready === true && complete, imageCached: result.restore_image_cached === true };
         if (!capabilities.ready) {
           const reasons = Array.isArray(result.checks) ? result.checks.filter(check => check?.ready === false)
             .map(check => text(check.message).trim().slice(0, 600)).filter(Boolean).slice(0, 8) : [];
@@ -382,7 +414,7 @@
     }
     async function openDialog(target) {
       reset(); resumeTarget = target; update(); dialog.showModal();
-      (target ? controls.yamlPath : controls.name).focus();
+      (target ? (sources.length ? controls.nodeSource : controls.yamlPath) : controls.name).focus();
       await checkCapabilities();
     }
     async function open() {
@@ -399,7 +431,9 @@
       update();
       if (busy || validateButton.disabled || !dialog.open) return;
       let body;
-      try { const v = values(vpnKeys); body = { submission: submission({ ...v, mode: currentMode() }), allow_resolve: v.allowResolve === true }; }
+      const mode = currentMode(), source = controls.nodeSource.value;
+      // Copying a VM's nodes resolves nothing, whatever the hidden DNS box holds.
+      try { const v = values(vpnKeys); body = { submission: submission({ ...v, mode, sources }), allow_resolve: mode !== 'vm' && v.allowResolve === true }; }
       catch (e) { showError(e.message); return; }
       invalidate('正在校验节点；此操作不会连接 VPN。');
       const sentRevision = revision;
@@ -414,13 +448,16 @@
         validated = validateResponse(result, clock());
         requestUncertain = false;
         const s = result.summary;
-        summary.replaceChildren(node('strong', '', `已私有保存 ${s.node_count} 个节点 / ${s.endpoint_count} 个端点 · ${s.protocols.join('、')}`),
-          node('p', '', '仅通过格式与端点校验，未连接 VPN。最终确认只发送不透明配置编号；修改输入后须重新校验。'));
+        const counts = `${s.node_count} 个节点 / ${s.endpoint_count} 个端点 · ${s.protocols.join('、')}`;
+        summary.replaceChildren(node('strong', '', mode === 'vm' ? `已沿用「${source}」的 ${counts}` : `已私有保存 ${counts}`),
+          node('p', '', mode === 'vm' ? '与那台 VM 是同一组节点和端点，已重新核对，未连接 VPN。改选节点来源后须重新校验。'
+            : '仅通过格式与端点校验，未连接 VPN。最终确认只发送不透明配置编号；修改输入后须重新校验。'));
         const list = node('ul'); s.warnings.slice(0, 32).forEach(w => list.append(node('li', '', WARNINGS[w] || '另有固定策略变更，请重新核对输入支持范围。'))); summary.append(list);
       } catch (_) {
         if (!stillValidating()) return;
         invalidate('校验未完成，未获得可用的配置编号。');
-        showError('节点校验失败。请核对本地 YAML 路径、文件大小、受支持字段及 DNS 授权；不会回显路径或凭据，也不会自动连接。');
+        showError(mode === 'vm' ? '无法沿用这台 VM 的节点：它没有保存节点配置，或配置已被改动。请把「节点来源」改为「填写新的节点」。'
+          : '节点校验失败。请核对本地 YAML 路径、文件大小、受支持字段及 DNS 授权；不会回显路径或凭据，也不会自动连接。');
       } finally { body = null; busy = false; update(); }
     }
     async function downloadExample(kind) {
@@ -473,5 +510,5 @@
     invalidate(); update();
     return { open, openResume, update, validate, downloadExample, checkCapabilities };
   }
-  return { mount, fieldSubmission, submission, createPayload, resumePayload, isWaitingVpnJob, validateResponse, MAX_BYTES, PROTOCOLS, APPS };
+  return { mount, fieldSubmission, submission, nodeSources, createPayload, resumePayload, isWaitingVpnJob, validateResponse, MAX_BYTES, PROTOCOLS, APPS };
 });

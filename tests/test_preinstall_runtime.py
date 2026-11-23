@@ -613,6 +613,124 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(runtime.RuntimePreparationError, 'installers-directory-changed'):
             runtime.validate_environment(self.base)
 
+    PROFILE = 'Clash 节点配置.yaml'
+
+    def profile_installers(self, config=None):
+        """As oneclick.build_installers writes it: the validated configuration as readable JSON, 0644."""
+        folder = self.new_installers()
+        profile = folder / self.PROFILE
+        profile.write_text(json.dumps(self.vpn.private_config if config is None else config,
+                                      ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+        profile.chmod(0o644)
+        return folder
+
+    def read_saved_profile(self, profile_name=PROFILE):
+        return runtime.saved_private_config(self.base, profile_name, expected_vm_name=self.name,
+                                            expected_vm_config=self.config)
+
+    def test_saved_private_config_is_exactly_what_the_environment_was_prepared_with(self):
+        self.prepare(installers=self.profile_installers())
+        before = {path.name: (path.stat().st_ino, path.stat().st_mtime_ns) for path in self.base.iterdir()}
+        config, endpoints = self.read_saved_profile()
+        self.assertEqual(config, self.vpn.private_config)
+        self.assertEqual(tuple(endpoints), self.vpn.endpoints)
+        self.assertEqual(runtime._private_config(config, endpoints), self.meta()['private_config_sha256'])
+        self.assertEqual({path.name: (path.stat().st_ino, path.stat().st_mtime_ns) for path in self.base.iterdir()}, before)
+        # First setup finished, sources due for a refresh: the nodes can still be read back.
+        self.assertTrue(runtime.finish_first_setup(self.base))
+        with mock.patch.object(runtime, 'validate_environment', side_effect=AssertionError('the launch check is stricter')):
+            self.assertEqual(self.read_saved_profile()[0], self.vpn.private_config)
+        self.run.assert_not_called()
+        self.spawn.assert_not_called()
+
+    def test_saved_private_config_refuses_misassociated_environment_before_profile_read(self):
+        self.prepare(installers=self.profile_installers())
+        profile = self.base / runtime.INSTALLERS_NAME / self.PROFILE
+        # The environment itself validates. Neither a different selected name nor
+        # the same name under a different controller Tart home grants access.
+        for name, config in (('other-vm', self.config),
+                             (self.name, self.root / 'other-home' / 'vms' / self.name / 'config.json')):
+            with self.subTest(name=name), mock.patch.object(runtime, '_read', wraps=runtime._read) as read:
+                with self.assertRaisesRegex(runtime.RuntimePreparationError, '^saved-source-vm-mismatch$'):
+                    runtime.saved_private_config(self.base, self.PROFILE, expected_vm_name=name,
+                                                 expected_vm_config=config)
+                self.assertNotIn(profile, [call.args[0] for call in read.call_args_list])
+
+    def test_saved_private_config_rechecks_the_policy_bytes_used_for_endpoints(self):
+        self.prepare(installers=self.profile_installers())
+        validate = runtime.validate_environment_for_refresh
+
+        def change_after_validation(base):
+            meta = validate(base)
+            policy = base / 'policy.json'
+            policy.write_bytes(policy.read_bytes() + b'\n')  # Same endpoints, no longer the pinned bytes.
+            return meta
+
+        with mock.patch.object(runtime, 'validate_environment_for_refresh', side_effect=change_after_validation), \
+                self.assertRaisesRegex(runtime.RuntimePreparationError, '^policy-binding-changed$'):
+            self.read_saved_profile()
+
+    def test_saved_private_config_fails_closed_on_any_difference(self):
+        self.prepare(installers=self.profile_installers())
+        profile = self.base / 'installers' / self.PROFILE
+        original = profile.read_bytes()
+        other = parse_submission({'input_mode': 'fields', 'nodes': [{
+            'type': 'trojan', 'server': '8.8.8.8', 'port': 443, 'password': 'another-fixture-secret', 'sni': 'vpn.example.com'}]})
+        moved = parse_submission({'input_mode': 'fields', 'nodes': [{
+            'type': 'trojan', 'server': '9.9.9.9', 'port': 443, 'password': SECRET, 'sni': 'vpn.example.com'}]})
+
+        def refused(code, name=None):
+            with self.assertRaises(runtime.RuntimePreparationError) as caught:
+                self.read_saved_profile(self.PROFILE if name is None else name)
+            self.assertEqual(str(caught.exception), code)
+            self.assertNotIn(SECRET, repr(caught.exception))
+        for config, code in ((other.private_config, 'saved-private-config-changed'),
+                             (moved.private_config, 'endpoint-config-mismatch'),
+                             ({'proxies': self.vpn.private_config['proxies']}, 'private-config-changed'),
+                             ([], 'validated-private-config-required')):
+            with self.subTest(code=code):
+                profile.write_text(json.dumps(config), encoding='utf-8')
+                refused(code)
+        profile.write_text('proxies: []\n', encoding='utf-8')
+        refused('saved-private-config-unavailable')
+        profile.write_bytes(original)
+        self.read_saved_profile()
+        for mode in (0o664, 0o646):
+            profile.chmod(mode)
+            refused('unsafe-source-file')
+        profile.chmod(0o644)
+        for name in ('', '.', '..', 'a/' + self.PROFILE, '../policy.json', 7):
+            with self.subTest(name=name):
+                refused('invalid-profile-name', name)
+        refused('missing-parent', 'missing.yaml')
+        elsewhere = self.root / 'elsewhere.yaml'
+        elsewhere.write_bytes(original)
+        profile.unlink()
+        profile.symlink_to(elsewhere)
+        refused('symlink-path-refused')
+        profile.unlink()
+        os.link(str(elsewhere), str(profile))
+        refused('unsafe-source-file')
+        profile.unlink()
+        profile.write_bytes(original)
+        profile.chmod(0o644)
+        self.read_saved_profile()
+        policy = self.base / 'policy.json'
+        kept = policy.read_bytes()
+        policy.write_bytes(kept.replace(b'8.8.8.8', b'9.9.9.9'))
+        refused('environment-source-integrity-mismatch')
+        policy.write_bytes(kept)
+        self.read_saved_profile()
+        self.run.assert_not_called()
+
+    def test_an_older_environment_has_no_saved_private_config(self):
+        self.prepare_v2()
+        with self.assertRaisesRegex(runtime.RuntimePreparationError, 'installers-unavailable'):
+            self.read_saved_profile()
+        with self.assertRaises(runtime.RuntimePreparationError):
+            runtime.saved_private_config(self.root / 'missing-environment', self.PROFILE,
+                                         expected_vm_name=self.name, expected_vm_config=self.config)
+
     def test_unshareable_private_or_symlinked_installers_refused(self):
         folder = self.new_installers()
         for mode in (0o700, 0o775, 0o777):

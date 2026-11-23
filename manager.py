@@ -33,7 +33,7 @@ import oneclick
 import vpn_store
 
 APP = 'gold-vm-manager'
-VERSION = '1.4.0'
+VERSION = '1.5.0'
 VPN_VALIDATE_PATH = '/api/preinstall/vpn/validate'
 # Cover JSON escaping for the 256 KiB input limit without raising other routes' caps.
 VPN_VALIDATE_MAX_WIRE = 6 * 256 * 1024 + 16384
@@ -211,7 +211,11 @@ class Controller:
                 raise AppError(str(e) if isinstance(e, ValueError) else '创建任务前置检查失败', 'build_rejected', 409) from None
 
     def preinstall_capabilities(self):
-        return {'ok': True, **oneclick.capabilities()}
+        # restore_image_cached only shapes the dialog's wording; every build still
+        # hashes the whole cached image before using it.
+        import host_artifacts
+        return {'ok': True, **oneclick.capabilities(),
+                'restore_image_cached': host_artifacts.cached('ipsw', STATE_DIR / 'host-materials')}
 
     def preinstall_examples(self):
         return {'ok': True, **oneclick.examples()}
@@ -220,12 +224,35 @@ class Controller:
         from vpn_config import VPNConfigurationError
         if type(payload) is not dict or set(payload) != {'submission', 'allow_resolve'} or type(payload['allow_resolve']) is not bool:
             raise AppError('节点校验请求无效', 'vpn_validation_failed')
+        submission = payload['submission']
+        if type(submission) is dict and submission.get('input_mode') == 'vm':
+            return {'ok': True, **self._reuse_vpn(submission, payload['allow_resolve'])}
         try:
-            stored = vpn_store.store_submission(STATE_DIR, payload['submission'], allow_resolve=payload['allow_resolve'])
+            stored = vpn_store.store_submission(STATE_DIR, submission, allow_resolve=payload['allow_resolve'])
         except (VPNConfigurationError, vpn_store.VPNStoreError):
             # No submitted value or underlying parser/OS output crosses the API boundary.
             raise AppError('节点或 YAML 未通过校验；请检查本地文件路径、权限及模板中的协议和节点字段。', 'vpn_validation_failed') from None
         return {'ok': True, **stored}
+
+    def _reuse_vpn(self, submission, allow_resolve):
+        # The nodes one of this manager's own v3 VMs was built with: read back from
+        # that VM's private environment, rechecked against its pins, and issued as
+        # a new one-hour ticket. The source VM is only read, running or not.
+        import preinstall_runtime
+        from vpn_config import VPNConfigurationError
+        if set(submission) != {'input_mode', 'vm'} or allow_resolve:
+            raise AppError('节点校验请求无效', 'vpn_validation_failed')
+        vm = submission['vm']
+        try:
+            base = self._vm(vm)
+            config, endpoints = preinstall_runtime.saved_private_config(
+                base, oneclick.INSTALLERS_PROFILE, expected_vm_name=vm,
+                expected_vm_config=VM_ROOT / vm / 'config.json')
+            return vpn_store.store_saved(STATE_DIR, config, endpoints)
+        except (AppError, OSError, preinstall_runtime.RuntimePreparationError, VPNConfigurationError, vpn_store.VPNStoreError):
+            # One answer for unknown VMs, older VMs and changed files alike.
+            raise AppError('无法沿用这台 VM 的节点：它没有保存节点配置，或配置已被改动。请改用本地 YAML 路径。',
+                           'vpn_validation_failed') from None
 
     def create_preinstall(self, payload):
         with self.lock:
@@ -273,9 +300,10 @@ class Controller:
             self.picker_lock.release()
 
     def _vm(self, vm):
-        if type(vm) is not str or vm not in self.bases():
+        base = self.bases().get(vm) if type(vm) is str else None
+        if base is None:
             raise AppError('未知虚拟机', 'unknown_vm', 404)
-        return self.bases()[vm]
+        return base
 
     def _load_config(self):
         d = private_json(CONFIG_PATH, {'version': 1, 'vms': {}})

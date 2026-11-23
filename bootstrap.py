@@ -15,7 +15,7 @@ HERE=Path(__file__).resolve().parent
 HOME=Path.home()
 STATE=HOME/'Library/Application Support/GoldVMManager'
 PORT=18765
-CONTROLLER_VERSION='1.4.0'
+CONTROLLER_VERSION='1.5.0'
 OPENER=build_opener(ProxyHandler({}))
 
 

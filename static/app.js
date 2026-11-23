@@ -971,7 +971,9 @@
 
   if (window.GoldPreinstall) preinstallUI = window.GoldPreinstall.mount({
     document, api,
-    getContext: () => ({ connected, active: buildActive(), waitingJob: waitingVpnJob(), names: VM_IDS, host: state?.host || {} }),
+    getContext: () => ({ connected, active: buildActive(), waitingJob: waitingVpnJob(), names: VM_IDS, host: state?.host || {},
+      // VMs that keep the node configuration they were built with (only the names leave here).
+      nodeSources: (state?.vms || []).filter((vm) => vm.preinstalled?.installers_share === true).map((vm) => vm.id) }),
     onBusy: (value) => { preinstallBusy = value; render(true); },
     onQueued: async (job, { resumed, deferred }) => {
       // Drain a poll that may predate the POST, especially a waiting snapshot

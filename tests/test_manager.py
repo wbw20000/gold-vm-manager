@@ -619,6 +619,101 @@ class ControllerTests(PrivateFixture):
         self.run.assert_not_called()
         self.denied(self.controller.validate_vpn, dict(payload, allow_resolve=1), code='vpn_validation_failed')
 
+    def kept_nodes(self, **node):
+        from vpn_config import parse_submission
+        return parse_submission({'input_mode': 'fields', 'nodes': [dict({
+            'type': 'trojan', 'server': '8.8.8.8', 'port': 443, 'password': 'fixture-only',
+            'sni': 'example.com', 'name': 'kept name'}, **node)]})
+
+    def test_validation_can_reissue_the_nodes_kept_with_one_of_the_managers_own_vms(self):
+        import preinstall_runtime
+        kept = self.kept_nodes()
+        payload = {'submission': {'input_mode': 'vm', 'vm': 'gold'}, 'allow_resolve': False}
+        with patch.object(preinstall_runtime, 'saved_private_config', autospec=True,
+                          return_value=(copy.deepcopy(kept.private_config), list(kept.endpoints))) as saved, \
+                patch.object(self.controller, 'bases', side_effect=[self.bases]) as bases, \
+                patch.object(m.vpn_store, 'store_submission', side_effect=AssertionError('nothing is submitted')):
+            result = self.controller.validate_vpn(payload)
+        bases.assert_called_once_with()
+        saved.assert_called_once_with(self.bases['gold'], m.oneclick.INSTALLERS_PROFILE, expected_vm_name='gold',
+                                      expected_vm_config=self.vm_root / 'gold' / 'config.json')
+        self.assertEqual(m.oneclick.INSTALLERS_PROFILE, 'Clash 节点配置.yaml')
+        self.assertEqual(result['summary'], {'node_count': 1, 'endpoint_count': 1, 'protocols': ['trojan'],
+                                             'warnings': [], 'normalization_required': False})
+        self.assertTrue(result['ok'] and result['configuration_stored_privately'])
+        self.assertFalse(result['vpn_connected'])
+        stored = m.vpn_store.load_configuration(self.state_dir, result['configuration_id'])
+        self.assertEqual(stored.private_config, kept.private_config)
+        self.assertEqual(stored.endpoints, kept.endpoints)
+        self.assertIsNone(stored.bound_job)
+        for private in ('fixture-only', '8.8.8.8', 'example.com'):
+            self.assertNotIn(private, repr(result))
+        self.run.assert_not_called()
+
+    def test_reissue_denies_misassociated_bindings_before_profile_read_or_ticket(self):
+        import preinstall_runtime
+        payload = {'submission': {'input_mode': 'vm', 'vm': 'gold'}, 'allow_resolve': False}
+        # Simulate a registry entry pointing to an intact but unrelated environment.
+        other_base = self.bases['gold-backup']
+        for name, config in (('gold-backup', self.vm_root / 'gold-backup' / 'config.json'),
+                             ('gold', self.root / 'other-home' / 'vms' / 'gold' / 'config.json')):
+            meta = {'version': 3, 'vm_name': name, 'vm_config': str(config)}
+            with self.subTest(name=name), patch.object(self.controller, 'bases', return_value={'gold': other_base}), \
+                    patch.object(preinstall_runtime, 'validate_environment_for_refresh', return_value=meta) as checked, \
+                    patch.object(preinstall_runtime, 'installers_directory') as folder, \
+                    patch.object(preinstall_runtime, '_read') as read, patch.object(m.vpn_store, 'store_saved') as issue:
+                error = self.denied(self.controller.validate_vpn, payload, code='vpn_validation_failed')
+                checked.assert_called_once_with(other_base)
+                folder.assert_not_called()
+                read.assert_not_called()
+                issue.assert_not_called()
+                for private in (str(config), 'saved-source-vm-mismatch', 'gold-backup'):
+                    self.assertNotIn(private, str(error))
+        self.assertFalse((self.state_dir / 'vpn-inputs').exists())
+
+    def test_reissue_gives_one_answer_for_unknown_older_or_changed_sources(self):
+        import preinstall_runtime
+        kept = self.kept_nodes()
+        changed = copy.deepcopy(kept.private_config)
+        changed['proxies'][0]['server'] = '9.9.9.9'
+        good = (kept.private_config, list(kept.endpoints))
+        source = {'input_mode': 'vm', 'vm': 'gold'}
+        messages = set()
+        for label, submission, resolve, answer in (
+                ('unknown VM', dict(source, vm='other'), False, good),
+                ('older VM', source, False, preinstall_runtime.RuntimePreparationError('installers-unavailable')),
+                ('changed file', source, False, preinstall_runtime.RuntimePreparationError('saved-private-config-changed')),
+                ('changed nodes', source, False, (changed, list(kept.endpoints))),
+                ('name not text', dict(source, vm=['gold']), False, good)):
+            with self.subTest(label), patch.object(preinstall_runtime, 'saved_private_config', autospec=True, side_effect=[answer]):
+                error = self.denied(self.controller.validate_vpn, {'submission': submission, 'allow_resolve': resolve},
+                                    code='vpn_validation_failed')
+                messages.add(str(error))
+                for private in ('fixture-only', '9.9.9.9', 'installers-unavailable', str(self.root)):
+                    self.assertNotIn(private, str(error))
+        self.assertEqual(len(messages), 1)
+        for label, submission, resolve in (('with a path', dict(source, path='/tmp/x.yaml'), False),
+                                           ('without a name', {'input_mode': 'vm'}, False),
+                                           ('asking for DNS', source, True)):
+            with self.subTest(label), patch.object(preinstall_runtime, 'saved_private_config', autospec=True,
+                                                   side_effect=AssertionError('refused before any read')):
+                self.denied(self.controller.validate_vpn, {'submission': submission, 'allow_resolve': resolve},
+                            code='vpn_validation_failed')
+        self.assertFalse((self.state_dir / 'vpn-inputs').exists(), 'no ticket for any refusal')
+        self.run.assert_not_called()
+
+    def test_capabilities_say_whether_a_verified_restore_image_is_already_cached(self):
+        import host_artifacts
+        for answer in (True, False):
+            with self.subTest(cached=answer), patch.object(m.oneclick, 'capabilities', return_value={'ready': True, 'checks': []}), \
+                    patch.object(host_artifacts, 'cached', return_value=answer) as cached, \
+                    patch.object(host_artifacts, 'acquire', side_effect=AssertionError('asking never downloads or hashes')):
+                self.assertEqual(self.controller.preinstall_capabilities(),
+                                 {'ok': True, 'ready': True, 'checks': [], 'restore_image_cached': answer})
+                cached.assert_called_once_with('ipsw', self.state_dir / 'host-materials')
+        self.assertFalse((self.state_dir / 'host-materials').exists())
+        self.run.assert_not_called()
+
     def test_picker_requires_explicit_controller_call_and_valid_vm(self):
         self.denied(self.controller.pick_directory, {'vm': 'other'}, code='unknown_vm')
         self.controller._run.assert_not_called()

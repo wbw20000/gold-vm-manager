@@ -1,7 +1,9 @@
 """Private tickets for explicit VPN submissions; never discovers host VPN profiles.
 
 Only opaque IDs and fixed summaries are public. Unclaimed tickets expire;
-claimed tickets can only be retrieved for the job that claimed them.
+claimed tickets can only be retrieved for the job that claimed them. A ticket
+can also be issued again for a configuration kept with one of the manager's
+own VMs (store_saved); that is still the person's explicit choice.
 """
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -445,13 +447,35 @@ def store_submission(state_dir, payload, *, allow_resolve=False, resolver=_DEFAU
         # that the offline seed and runtime validators apply before publishing.
         normalized = _check_policy(parsed.private_config, parsed.endpoints)
         _check_summary(parsed.summary, normalized.summary)
+    return _issue(state_dir, parsed.private_config, parsed.endpoints, parsed.summary, now)
+
+
+def store_saved(state_dir, private_config, endpoints, *, now=None):
+    """Issue a ticket for a configuration this manager validated earlier and kept with one of its own VMs.
+
+    The person asks for it by VM name; the caller reads it from that VM's
+    private environment. Nothing is read from the host here and no name is
+    resolved. It is accepted only if reparsing it without DNS changes nothing,
+    so the ticket carries exactly the nodes and endpoints already in use. With
+    nothing replaced, there is no normalization to report or to consent to.
+    """
+    if now is not None:
+        _timestamp(now)
+    with _private_io():
+        normalized = _check_policy(private_config, endpoints)
+        summary = dict(normalized.summary, warnings=[], normalization_required=False)
+        _check_summary(summary, normalized.summary)
+    return _issue(state_dir, normalized.private_config, normalized.endpoints, summary, now)
+
+
+def _issue(state_dir, private_config, endpoints, summary, now):
     with _private_io(), _locked_root(state_dir, create=True, exclusive=True) as (state, fd):
         ident = uuid.uuid4().hex
         record = {'version': _VERSION, 'configuration_id': ident, 'created_unix': _clock(now),
-                  'consent': _CONSENT, 'private_config': parsed.private_config, 'endpoints': parsed.endpoints,
-                  'summary': parsed.summary, 'digest': _digest(parsed.private_config, parsed.endpoints), 'bound_job': None}
+                  'consent': _CONSENT, 'private_config': private_config, 'endpoints': endpoints,
+                  'summary': summary, 'digest': _digest(private_config, endpoints), 'bound_job': None}
         _publish_record(state, fd, _ticket_name(ident), record)
-    return {'configuration_id': ident, 'summary': parsed.summary, 'expires_in_seconds': MAX_AGE_SECONDS,
+    return {'configuration_id': ident, 'summary': summary, 'expires_in_seconds': MAX_AGE_SECONDS,
             'configuration_stored_privately': True, 'vpn_connected': False}
 
 

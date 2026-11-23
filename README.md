@@ -6,7 +6,7 @@
 
 在 Apple Silicon Mac 上创建独立的 macOS 虚拟机，在客机里使用 Claude Code。首次设置用普通网络；完成设置后，受保护启动只允许客机通过已配置的代理节点出站，不会在代理断开时自动直连。
 
-**[下载 v1.4.0 源码](https://github.com/wbw20000/gold-vm-manager/releases/tag/v1.4.0) · [填写 YAML](#下载并填写-yaml宿主-mac) · [创建窗口逐项点](#创建窗口逐项点) · [看 23 秒安装演示](docs/media/guest-install.gif?raw=true) · [装好后怎么用](#四个应用装好后怎么用客机) · [删除与重建](#删除与重建) · [English](README.en.md)**
+**[下载 v1.5.0 源码](https://github.com/wbw20000/gold-vm-manager/releases/tag/v1.5.0) · [填写 YAML](#下载并填写-yaml宿主-mac) · [创建窗口逐项点](#创建窗口逐项点) · [看 23 秒安装演示](docs/media/guest-install.gif?raw=true) · [装好后怎么用](#四个应用装好后怎么用客机) · [删除与重建](#删除与重建) · [English](README.en.md)**
 
 > **我的使用记录（本人确认：2026-11-21）**：我现在就在用这台虚拟机跑 Claude Code。用 Pro 的 4 天没有被封；升级 Max 后，截至这次记录，用了 2 天，也没有被封。[我的使用分享 ↗](https://x.com/clarkwang258/status/2123747367639994757)
 >
@@ -18,14 +18,14 @@
 ## 安装管理器（宿主 Mac）
 
 1. **先核对：**Apple Silicon、macOS **26.6.2**（当前验证版本）、Apple Command Line Tools 或 Xcode、系统 Python 3.9+ 和 Ruby/Psych。默认 50 GiB 虚拟盘的创建门槛是 **82 GiB** 可用空间；下载或导入 IPSW 还要给镜像和缓存留空间。
-2. 在 [v1.4.0 发布页](https://github.com/wbw20000/gold-vm-manager/releases/tag/v1.4.0)下载 **Source code (zip)** 并解压。双击 [Install.command](Install.command)，或在源码目录运行 `./Install.command`。完成后，从 `~/Applications` 打开 **Gold VM 管理器**。
+2. 在 [v1.5.0 发布页](https://github.com/wbw20000/gold-vm-manager/releases/tag/v1.5.0)下载 **Source code (zip)** 并解压。双击 [Install.command](Install.command)，或在源码目录运行 `./Install.command`。完成后，从 `~/Applications` 打开 **Gold VM 管理器**。
 3. 这是**本地签名的源码构建**，不是 Apple 公证的成品安装包。安装器不覆盖已有 App，也不自动开机；不要关闭 Gatekeeper。另装新版本见[源码安装指南](SOURCE_INSTALL.md)。
 
 **打开后的第一屏：**在 Finder 的「前往 → 前往文件夹…」输入 `~/Applications`，双击 **Gold VM 管理器**。在「虚拟机控制台」看 **本机资源 → 可用磁盘**。右上角点 **新建 VM 及预装软件**；不要点旁边的「高级选项 → 仅安装 VM」，后者只生成系统暂存盘，不会发布可用的机器。左侧列表用于选择**已有**机器，不是创建入口。
 
 ## 下载并填写 YAML（宿主 Mac）
 
-1. **下载。** 在管理器点「新建 VM 及预装软件 → 下载 YAML 填写模板」，或打开 [GitHub 模板](examples/vpn/clash.yaml)，点右上角 **Download raw file（下载原始文件）**。[也可直接打开原始 YAML](https://raw.githubusercontent.com/wbw20000/gold-vm-manager/v1.4.0/examples/vpn/clash.yaml)；如果浏览器显示文本而没下载，按 `⌘S`。把文件存到仓库之外，命名为 `clash.local.yaml`，不要带 `.txt` 后缀。
+1. **下载。** 在管理器点「新建 VM 及预装软件 → 下载 YAML 填写模板」，或打开 [GitHub 模板](examples/vpn/clash.yaml)，点右上角 **Download raw file（下载原始文件）**。[也可直接打开原始 YAML](https://raw.githubusercontent.com/wbw20000/gold-vm-manager/v1.5.0/examples/vpn/clash.yaml)；如果浏览器显示文本而没下载，按 `⌘S`。把文件存到仓库之外，命名为 `clash.local.yaml`，不要带 `.txt` 后缀。
 2. **选协议。** 用纯文本编辑器打开文件，把 `proxies: []` 改为 `proxies:`。找到与你的节点协议一致的一组示例，只删除**那一组**每行开头的 `# `，保留剩下的空格缩进。不要把订阅链接粘进 `server`。
 3. **填节点服务商给你的值。** 例如 Trojan TLS/TCP 填好后的**格式**如下。`server` 是节点公网地址，`port` 是整数端口，`password` 是节点密码，`sni` 是服务商指定的 TLS 域名；以下全是占位值，不能直接连接。VLESS、TUIC 等请填模板里对应协议的字段，不要照搬 Trojan 密码栏。
 
@@ -43,6 +43,10 @@
 4. **复制路径。** 保存后，在宿主 Finder 选中 `clash.local.yaml`，按 `⌥⌘C`（Option + Command + C）复制完整路径，回到刚才的创建窗口。粘贴的是**路径**，不是文件内容或订阅网址。
 
 ## 创建窗口逐项点
+
+**1.5 新功能：再建一台 VM。** 如果本机有保存了构建时节点配置的 v3 VM，先核对「节点来源」中显示的 VM 名称（多台时默认是列表第一台），点 **沿用并校验这组节点**。看到「已沿用」后再确认创建，无需重填 YAML，也不会克隆或改变来源 VM。要换节点，选「填写新的节点」并按下面步骤操作。「继续配置 VPN」也支持这两种来源。
+
+**系统镜像已缓存？** 保留默认镜像选项，不必重新选文件。窗口提示只表示缓存记录匹配；实际创建仍会完整核对 SHA-256。再次选择本地 IPSW 会重新导入一份约 20 GB 的副本。
 
 <details>
 <summary>展开创建窗口截图：对照字段和底部提交按钮</summary>
@@ -98,7 +102,7 @@
 
 ## 删除与重建
 
-**删除一台 VM**（[看删除确认框](docs/media/manager-delete-confirm.png?raw=true)）：先备份需要的客机文件并正常关机。左侧点目标名称 → 在「虚拟机管理」点 **删除 VM…** → 核对弹窗标题「永久删除 *目标名称*？」→ 确定才点红色 **永久删除 VM**；点「取消」则不删。运行中不能提交；若删除已暂停的 VM，其暂停状态也会丢失。1.4.0 **不用再输入名字**。等任务显示「已删除」且目标从列表消失。删除不可撤销，不删宿主共享原目录，镜像、缓存和日志可能仍保留。
+**删除一台 VM**（[看删除确认框](docs/media/manager-delete-confirm.png?raw=true)）：先备份需要的客机文件并正常关机。左侧点目标名称 → 在「虚拟机管理」点 **删除 VM…** → 核对弹窗标题「永久删除 *目标名称*？」→ 确定才点红色 **永久删除 VM**；点「取消」则不删。运行中不能提交；若删除已暂停的 VM，其暂停状态也会丢失。自 1.4.0 起**不用再输入名字**。等任务显示「已删除」且目标从列表消失。删除不可撤销，不删宿主共享原目录，镜像、缓存和日志可能仍保留。
 
 **彻底重建**（[看旧版兼容 VM 的重建窗口](docs/media/manager-legacy-rebuild.png?raw=true)）：这是**替换旧系统**，不是重启。仅部分旧 macOS VM 有此按钮；通过 1.4.0 一键预装创建的 VM **没有**。对支持的 VM：
 

@@ -6,7 +6,7 @@
 
 Run Claude Code in a dedicated macOS VM on an Apple Silicon Mac. First setup uses ordinary networking. After setup, Protected Start restricts outbound traffic to the configured proxy endpoints rather than falling back to a direct connection.
 
-**[Download v1.4.0 source](https://github.com/wbw20000/gold-vm-manager/releases/tag/v1.4.0) · [Watch the 23-second install guide](docs/media/guest-install.gif?raw=true) · [Download and fill in the YAML](#download-and-fill-in-the-yaml-host-mac) · [After installing the four apps](#after-installing-the-four-apps-guest) · [简体中文](README.md)**
+**[Download v1.5.0 source](https://github.com/wbw20000/gold-vm-manager/releases/tag/v1.5.0) · [Watch the 23-second install guide](docs/media/guest-install.gif?raw=true) · [Download and fill in the YAML](#download-and-fill-in-the-yaml-host-mac) · [After installing the four apps](#after-installing-the-four-apps-guest) · [简体中文](README.md)**
 
 > **My experience (last personally confirmed: 2026-11-21):** I use this VM for Claude Code. I used Pro for four days without a ban, then upgraded to Max. On my second day of Max, my account was still active. [Why I built this ↗](https://x.com/clarkwang258/status/2123747367639994757)
 >
@@ -20,12 +20,12 @@ Run Claude Code in a dedicated macOS VM on an Apple Silicon Mac. First setup use
 ## Install the manager (host Mac)
 
 1. **Check first:** Apple Silicon, macOS **26.6.2** (validated version), Apple Command Line Tools or Xcode, system Python 3.9+, and system Ruby with Psych. The default 50 GiB guest disk needs at least **82 GiB** free on the host. Leave additional room for the restore image and cache.
-2. On the [v1.4.0 release page](https://github.com/wbw20000/gold-vm-manager/releases/tag/v1.4.0), download **Source code (zip)** and extract it. Double-click [Install.command](Install.command) or run `./Install.command` from the source directory. Open **Gold VM 管理器** in `~/Applications`.
+2. On the [v1.5.0 release page](https://github.com/wbw20000/gold-vm-manager/releases/tag/v1.5.0), download **Source code (zip)** and extract it. Double-click [Install.command](Install.command) or run `./Install.command` from the source directory. Open **Gold VM 管理器** in `~/Applications`.
 3. This is a **locally ad-hoc signed source build**, not a notarized app download. It neither overwrites an existing app nor starts a VM. Leave Gatekeeper enabled. See [build options](SOURCE_INSTALL.md) for a side-by-side installation.
 
 ## Download and fill in the YAML (host Mac)
 
-1. **Download.** In **新建 VM 及预装软件** (Create VM and Prepare Apps), click **下载 YAML 填写模板**. Alternatively, open the [template on GitHub](examples/vpn/clash.yaml) and click **Download raw file** at the top right. If the [raw YAML](https://raw.githubusercontent.com/wbw20000/gold-vm-manager/v1.4.0/examples/vpn/clash.yaml) opens as text in your browser, press `⌘S`. Save it **outside the repository** as `clash.local.yaml`, not `.yaml.txt`.
+1. **Download.** In **新建 VM 及预装软件** (Create VM and Prepare Apps), click **下载 YAML 填写模板**. Alternatively, open the [template on GitHub](examples/vpn/clash.yaml) and click **Download raw file** at the top right. If the [raw YAML](https://raw.githubusercontent.com/wbw20000/gold-vm-manager/v1.5.0/examples/vpn/clash.yaml) opens as text in your browser, press `⌘S`. Save it **outside the repository** as `clash.local.yaml`, not `.yaml.txt`.
 2. **Choose a protocol.** Open the file in a plain-text editor. Change `proxies: []` to `proxies:`. Find the block matching your node's protocol and remove the leading `# ` from its configuration lines, keeping the indentation. Leave the other blocks commented. Do not paste a subscription URL into `server`.
 3. **Fill in your provider's values.** For Trojan TLS/TCP, `server` is your node's public address, `port` is its numeric port, `password` is the node password, and `sni` is the provider's TLS hostname. This example shows the structure only; its values cannot connect. For VLESS, TUIC or another protocol, use that protocol's fields instead.
 
@@ -43,6 +43,10 @@ Run Claude Code in a dedicated macOS VM on an Apple Silicon Mac. First setup use
 4. **Copy the path.** Save the file. Select it in Finder on your Mac and press `⌥⌘C` to copy the absolute path for the next screen. Keep the filled YAML private: node credentials are stored in plaintext in private host files, in the read-only installer folder and, once imported, in the guest. Read-only is not encryption. Do not post the YAML, credentials or VM disk.
 
 ## Create your first VM (host Mac)
+
+**New in 1.5 — creating another VM:** When an eligible v3 VM exists, check its name under **节点来源** (the first listed VM is selected by default). Click **沿用并校验这组节点** to validate its saved build-time nodes, then confirm creation. This does not clone or modify the source VM. Choose **填写新的节点** for a different YAML or manual input. The same choices are available when resuming a deferred setup.
+
+**Cached restore image?** Keep the default reviewed image to reuse it. The dialog checks receipt metadata for its hint; the build still hashes the whole IPSW. Selecting a local IPSW again imports another copy of about 20 GB.
 
 **Host** means your physical Mac, where **Gold VM 管理器** runs. **Guest** means the new macOS inside the VM window. Start on the **host**; you won't need the guest until the manager says the VM is ready for first setup.
 
@@ -106,7 +110,7 @@ Use this to expose an existing project folder, **not** to install the four apps.
 
 ## Rebuild or delete a VM
 
-**Want a fresh four-app VM but still need the old one?** Use **新建 VM 及预装软件** with a new name. Neither of the actions below is necessary for day-to-day use. Back up guest files you need **before** proceeding. Dialogs name the selected VM; **取消** backs out. There is no “type the name again” safety step in v1.4.
+**Want a fresh four-app VM but still need the old one?** Use **新建 VM 及预装软件** with a new name. Neither of the actions below is necessary for day-to-day use. Back up guest files you need **before** proceeding. Dialogs name the selected VM; **取消** backs out. There is no “type the name again” safety step since v1.4.
 
 **彻底重建… (replace the selected VM).** Only offered for supported non-preinstalled macOS VMs, not one-click preinstalls. The old VM must be stopped or suspended. Keeping its *name* does **not** keep its contents. [View the rebuild dialog](docs/media/manager-legacy-rebuild.png?raw=true).
 

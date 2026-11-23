@@ -662,6 +662,34 @@ def installers_directory(base, meta):
     return path
 
 
+def saved_private_config(base, profile_name, *, expected_vm_name, expected_vm_config):
+    """Read the v3 installers profile only for the VM selected by the controller.
+
+    The copy in the installers folder is returned only while it still matches
+    the digest pinned at preparation and this environment's own endpoint
+    policy. Nothing is read from the guest disk or from the host's own proxies.
+    """
+    try:
+        meta = validate_environment_for_refresh(base)
+        _need(meta['vm_name'] == expected_vm_name and meta['vm_config'] == str(expected_vm_config),
+              'saved-source-vm-mismatch')
+        folder = installers_directory(base, meta)
+        _need(type(profile_name) is str and profile_name == Path(profile_name).name
+              and profile_name not in ('', '.', '..'), 'invalid-profile-name')
+        raw, _ = _read(folder / profile_name, private=False)
+        config = _parse(raw.decode('utf-8'))
+        policy_raw, _ = _read(_directory(base) / 'policy.json')
+        _need(_sha(policy_raw) == meta['source_sha256']['policy.json'], 'policy-binding-changed')
+        policy = _parse(policy_raw)
+        _need(_private_config(config, policy['endpoints']) == meta['private_config_sha256'],
+              'saved-private-config-changed')
+        return config, _endpoints(policy['endpoints'])
+    except RuntimePreparationError:
+        raise
+    except Exception:
+        raise RuntimePreparationError('saved-private-config-unavailable') from None
+
+
 def require_backend_authorization(meta, acknowledged):
     _need(type(acknowledged) is bool, 'invalid-authorization-acknowledgement')
     _need(meta.get('needs_host_security_authorization') is True

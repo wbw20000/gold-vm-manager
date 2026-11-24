@@ -219,10 +219,11 @@
     const resourceGrid = node('div', 'preinstall-grid'); machine.append(resourceGrid);
     field(resourceGrid, 'cpu', 'CPU（vCPU）', { type: 'number', min: 2, value: '2' });
     field(resourceGrid, 'memory', '内存（GiB）', { type: 'number', min: 4, value: '4' });
-    const disk = field(resourceGrid, 'disk', `磁盘容量（${diskRange}，整数）`, { type: 'number', min: DISK_MIN, max: DISK_MAX, value: '50' });
+    const disk = field(resourceGrid, 'disk', '磁盘（GiB）', { type: 'number', min: DISK_MIN, max: DISK_MAX, value: '50' });
     const diskFeedback = node('p', 'form-error', diskError); diskFeedback.id = 'preinstall-disk-error';
-    diskFeedback.setAttribute('role', 'status'); disk.setAttribute('aria-describedby', diskFeedback.id); rows.disk.append(diskFeedback);
-    machine.append(node('p', 'form-note', '默认 2 vCPU / 4 GiB / 50 GiB；不会偷偷增加资源。较小的磁盘可能放不下 macOS 或后续系统更新。2 核性能有限，实际最低要求由系统镜像检查决定。'));
+    diskFeedback.setAttribute('role', 'status'); rows.disk.append(diskFeedback);
+    const diskNote = node('p', 'form-note', `磁盘可填 ${diskRange} 的整数，默认 50 GiB。较小的磁盘可能放不下 macOS 或后续系统更新。`);
+    diskNote.id = 'preinstall-disk-note'; disk.setAttribute('aria-describedby', `${diskNote.id} ${diskFeedback.id}`); machine.append(diskNote);
     machine.append(node('p', 'form-note', '宿主空间示例：虚拟磁盘与安装材料在同一卷时，创建 30 GiB 磁盘，复用已缓存的默认镜像约需 42 GiB 可用空间；重新下载或导入镜像约需 62 GiB。不同卷分别检查，以安装时的实际可用空间为准。'));
     field(machine, 'imageMode', '系统镜像来源', { choices: [['reviewed', '经审核的固定 Apple 恢复镜像'], ['local', '我信任的本机 IPSW 绝对路径']] });
     const imageNote = node('p', 'form-note'); imageNote.id = 'preinstall-image-note'; imageNote.hidden = true; machine.append(imageNote);

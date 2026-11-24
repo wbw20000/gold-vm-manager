@@ -204,7 +204,8 @@ test('new VM disk shows its range and reason; only chosen integer GiB values rea
   const f = fixture();
   const disk = f.n('disk'), reason = f.n('disk-error');
   assert.deepEqual([disk.min, disk.max, disk.step, disk.value], ['30', '1024', '1', '50']);
-  assert.match(disk.parentNode.children[0].textContent, /30–1024 GiB.*整数/);
+  assert.equal(disk.parentNode.children[0].textContent, '磁盘（GiB）');
+  assert.match(f.n('disk-note').textContent, /30–1024 GiB.*整数/);
   assert.match(f.n('dialog').textContent, /较小的磁盘.*macOS.*更新/);
   assert.match(f.n('dialog').textContent, /同一卷.*30 GiB.*缓存.*42 GiB.*导入.*62 GiB/);
   f.context.host.free_disk_gib = 1; // Displayed snapshot alone is not a size-policy gate.
@@ -696,6 +697,24 @@ test('archiving a failed job is one click and sends only the job id and name', a
   await sandbox.submitConfirm({ preventDefault() {} });
   assert.equal(JSON.stringify(calls[0]), JSON.stringify(['/api/preinstall/archive', 'POST', { job_id: JOB_ID, confirm_name: 'backup1' }]));
   assert.equal(node('confirm-dialog').open, false);
+});
+
+test('only a proven interrupted pre-disk download gets the record-only archive option', () => {
+  const job = { id: JOB_ID, mode: 'preinstall', name: 'example', phase: 'interrupted',
+    interrupted_download_archivable: true, published: false };
+  assert.deepEqual(renderFailedJob(job).buttons.map(b => b.text), ['归档已中断的下载']);
+  for (const delta of [{ phase: 'acquiring' }, { published: true }, { interrupted_download_archivable: false }]) {
+    assert.equal(renderFailedJob({ ...job, ...delta }).buttons.filter(b => b.text.startsWith('归档')).length, 0);
+  }
+  const nodes = new Map();
+  const node = id => { if (!nodes.has(id)) nodes.set(id, { showModal() { this.open = true; } }); return nodes.get(id); };
+  const scope = { $: node, connected: true, confirmContext: null };
+  vm.createContext(scope); vm.runInContext(declaration('openArchiveJob'), scope);
+  scope.openArchiveJob(job);
+  assert.equal(node('confirm-dialog').open, true);
+  assert.equal(node('confirm-submit').textContent, '归档已中断的下载');
+  assert.match(node('confirm-description').textContent, /尚未创建虚拟磁盘/);
+  assert.match(node('confirm-description').textContent, /不删除共享下载缓存/);
 });
 
 test('no dialog asks to type a VM name, and the retired administrator pause is gone', () => {

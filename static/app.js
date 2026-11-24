@@ -213,7 +213,7 @@
     else if (vm.setup_required) panel.append(el('span', 'setup-state', '待完成设置'));
     const resources = el('div', 'machine-resources');
     const capacity = Number.isSafeInteger(vm.disk_capacity_bytes) && vm.disk_capacity_bytes > 0
-      ? ['虚拟磁盘容量', vm.disk_capacity_bytes / GIB, ' GiB'] : ['虚拟磁盘容量', vm.disk_gb, ' GB'];
+      ? ['磁盘容量', vm.disk_capacity_bytes / GIB, ' GiB'] : ['磁盘容量', vm.disk_gb, ' GB'];
     [['CPU', vm.cpu, ' 核'], ['内存', vm.memory_gib, ' GiB'], capacity].forEach(([label, value, unit]) => {
       const resource = el('div');
       const strong = el('strong', '', number(value));
@@ -691,12 +691,15 @@
   }
 
   function openArchiveJob(job) {
-    if (!connected || !job || job.mode !== 'preinstall' || job.phase !== 'failed' || job.recovery_required !== true
+    const interruptedDownload = job?.phase === 'interrupted' && job.published === false && job.interrupted_download_archivable === true;
+    if (!connected || !job || job.mode !== 'preinstall' || !(interruptedDownload || (job.phase === 'failed' && job.recovery_required === true))
       || job.published === true || typeof job.id !== 'string' || typeof job.name !== 'string' || !job.name) return;
     confirmContext = { type: 'archive-job', id: job.name, jobId: job.id };
-    $('confirm-title').textContent = `归档失败任务 ${job.name}？`;
-    $('confirm-description').textContent = `只移除这条失败任务的锁定记录，之后可以用新名称重新预装。不会删除、移动、续接或发布暂存盘：它仍保留在 ~/.tart/.gold-manager-staging/${job.id}，会继续占用磁盘空间，需要时请人工核对后自行删除。不会启动任何 VM。`;
-    $('confirm-submit').textContent = '归档失败任务';
+    $('confirm-title').textContent = `归档${interruptedDownload ? '已中断的下载' : '失败任务'} ${job.name}？`;
+    $('confirm-description').textContent = interruptedDownload
+      ? '这次下载进程已退出，尚未创建虚拟磁盘。仅归档这条任务记录，不删除共享下载缓存，不影响同名 VM，也不会重试。'
+      : `仅归档此任务，不停止其他任务，不清理下载缓存。不会删除、移动、续接或发布暂存盘：它仍保留在 ~/.tart/.gold-manager-staging/${job.id}。`;
+    $('confirm-submit').textContent = interruptedDownload ? '归档已中断的下载' : '归档失败任务';
     $('confirm-submit').className = 'button button-danger';
     $('confirm-submit').disabled = false;
     $('confirm-error').hidden = true;
@@ -909,6 +912,9 @@
       if (job.recovery_required === true && job.published !== true) {
         region.append(button('归档此失败任务（保留暂存盘）', 'text-button', () => openArchiveJob(job), !connected));
       }
+    }
+    if (job.mode === 'preinstall' && job.phase === 'interrupted' && job.published === false && job.interrupted_download_archivable === true) {
+      region.append(button('归档已中断的下载', 'text-button', () => openArchiveJob(job), !connected));
     }
     if (typeof job.progress === 'number') {
       const progress = el('progress'); progress.max = 1; progress.value = job.progress;

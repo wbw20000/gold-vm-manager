@@ -57,9 +57,9 @@
       <div class="field"><label for="build-name">虚拟机名称 · 由你填写</label><input id="build-name" maxlength="64" autocomplete="off" spellcheck="false" placeholder="输入名称，不会自动命名" required><button id="build-keep-name" class="text-button" type="button" hidden>使用原名称</button><small>支持中文、字母、数字、空格、短横线、下划线；不能覆盖其他 VM。</small></div>
       <div class="field"><label for="build-cpu">CPU（vCPU）</label><input id="build-cpu" type="number" min="2" step="1" value="2" required></div>
       <div class="field"><label for="build-memory">内存（GiB）</label><input id="build-memory" type="number" min="4" step="1" value="4" required></div>
-      <div class="field"><label for="build-disk">磁盘容量（30–1024 GiB，整数）</label><input id="build-disk" type="number" min="30" max="1024" step="1" value="50" required aria-describedby="build-disk-error build-disk-note">
+      <div class="field"><label for="build-disk">磁盘（GiB）</label><input id="build-disk" type="number" min="30" max="1024" step="1" value="50" required aria-describedby="build-disk-error build-disk-note">
         <p id="build-disk-error" class="form-error" role="status" hidden>磁盘容量无效：请输入 30–1024 GiB 范围内的整数。</p>
-        <small id="build-disk-note">默认 50 GiB。较小的磁盘可能放不下 macOS 或后续系统更新。默认 2 vCPU／4 GiB，可手动调整。镜像最低要求不满足时会拒绝，不会偷偷增加资源。2 核可能较慢或有稳定性风险。</small></div>
+        <small id="build-disk-note">30–1024 GiB，填整数，默认 50 GiB。较小的磁盘可能放不下 macOS 或后续系统更新。默认 2 vCPU／4 GiB，可手动调整。镜像最低要求不满足时会拒绝，不会偷偷增加资源。2 核可能较慢或有稳定性风险。</small></div>
       <div class="field"><label for="build-image-mode">全新 macOS 来源</label><select id="build-image-mode"><option value="latest">从 Apple 下载当前宿主支持的最新恢复镜像</option><option value="local">选择已有 Apple IPSW 恢复镜像</option></select></div>
       <div id="build-image-local" class="field" hidden><label for="build-ipsw">本机 IPSW 文件</label><div class="path-input"><input id="build-ipsw" autocomplete="off" placeholder="/绝对路径/macOS.ipsw"><button id="pick-ipsw" class="button button-secondary" type="button">选择镜像…</button></div></div>
       <div id="build-offline-notice" hidden><p class="write-warning">只安装 macOS 到新暂存盘。恢复后停止，不预装软件、不读取宿主代理，也不会创建可启动的 VM。</p><label class="checkbox-label"><input id="build-offline-ack" type="checkbox"><span>我确认只用已核验来源的本地 IPSW 安装到暂存盘，不自动下载或开机。</span></label></div>
@@ -78,7 +78,7 @@
     <form id="growth-form" novalidate>
       <div class="modal-heading"><h2 id="growth-title">扩容磁盘</h2></div>
       <p id="growth-current" class="modal-description"></p>
-      <div class="field"><label for="growth-target">扩容后的总容量（30–1024 GiB，整数）</label><input id="growth-target" type="number" min="30" max="1024" step="1" required aria-describedby="growth-note growth-error"><small id="growth-note">填写目标总容量，不是要增加的空间。只能扩大，不能缩小。</small></div>
+      <div class="field"><label for="growth-target">目标总容量（GiB）</label><input id="growth-target" type="number" min="30" max="1024" step="1" required aria-describedby="growth-note growth-error"><small id="growth-note">30–1024 GiB，填整数。填写扩容后的总容量，不是增量；只能扩大。</small></div>
       <p id="growth-warning" class="write-warning">建议先备份这台 VM。此操作仅扩大虚拟磁盘，不会自动开机，不在宿主机挂载或格式化磁盘。若客机未显示新增空间，可能还需在客机内扩展 GPT 分区和 APFS 容器。</p>
       <p id="growth-error" class="form-error" role="status" hidden></p>
       <div class="modal-footer"><button id="growth-cancel" class="button button-secondary dialog-close" type="button">关闭</button><button id="growth-submit" class="button button-primary" type="button" disabled>确认扩容</button></div>

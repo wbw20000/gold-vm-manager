@@ -108,7 +108,8 @@ test('legacy creation is no longer opened by the UI; explicit rebuild keeps its 
 });
 
 test('offline installation and legacy rebuild explain invalid disk sizes and send the chosen integer', async () => {
-  assert.match(html, /<label for="build-disk">[^<]*30–1024 GiB[^<]*整数/);
+  assert.match(html, /<label for="build-disk">磁盘（GiB）<\/label>/);
+  assert.match(html, /id="build-disk-note"[^>]*>[^<]*30–1024 GiB[^<]*整数/);
   assert.match(html, /id="build-disk-note"[^>]*>[^<]*较小[^<]*macOS[^<]*更新/);
   assert.match(html, /id="build-disk-error"[^>]*>磁盘容量无效：[^<]*30–1024 GiB[^<]*整数/);
   for (const offline of [true, false]) {

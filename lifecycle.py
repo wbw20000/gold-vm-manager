@@ -194,17 +194,202 @@ def job_alive(job):
     if type(pid) is not int or pid <= 1: return False
     args = process_identity.arguments(pid)
     entry = 'oneclick.py' if job.get('mode') == PREINSTALL_MODE else ('vm_deletion.py' if job.get('mode') == 'delete' else 'lifecycle.py')
-    paths = {str(HERE / entry)}
-    if not args or not any(p in args for p in paths): return False
+    if not args or not any(Path(a).name == entry for a in args): return False
     return any(args[i:i+2] == ['--worker', job.get('id')] for i in range(len(args)-1))
 
 
-def status(*, state_dir=None):
+def preinstall_worker_gone(pid, jid):
+    """An argv lookup failure is not proof of death. Never bind identity to HERE:
+    a worker started by a different bundle is still the worker for this job.
+    """
+    if type(pid) is not int or not 1 < pid <= 2**31 - 1:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError as error:
+        return error.errno == errno.ESRCH
+    try:
+        args = process_identity.arguments(pid)
+    except (OSError, ValueError):
+        return False
+    # Accept only positively identifiable, unrelated programs. In particular a
+    # partial/opaque interpreter invocation is weaker evidence than ESRCH.
+    return (type(args) is list and bool(args) and all(type(a) is str for a in args)
+            and os.path.isabs(args[0]) and 'python' not in Path(args[0]).name.casefold()
+            and not any(jid in a or 'oneclick' in a or a.startswith('--worker') for a in args))
+
+
+_DOWNLOAD_FLAGS = ('published', 'guest_started', 'system_restored', 'applications_preinstalled',
+                   'vpn_configuration_staged', 'old_deleted')
+_POST_DOWNLOAD_MARKERS = ('commit.json', 'vpn-wait.json', 'vpn-resume.json', 'archived-current.json',
+                          'image-inspection.json', 'installer.log', 'runtime-preparation.json', 'vpn-worker.log')
+_INTERRUPTED_MESSAGE = '下载进程已退出，尚未创建虚拟磁盘。下载材料和已绑定的配置均保留，不会自动重试。'
+_DOWNLOAD_CONFLICT = '下载任务记录不一致或不能确认已安全中断；请保留记录并人工核对。'
+
+
+def _owned_dir(path, *, optional=False):
+    """Refuse aliases, unreadable/foreign/writable parents; never mkdir to inspect."""
+    registry.safe_path(path, False)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        if optional:
+            return False
+        raise
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+        raise ValueError(_DOWNLOAD_CONFLICT)
+    return True
+
+
+def _missing(path):
+    # Unlike exists()/lexists(), only ENOENT proves absence. A dangling link is present.
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return True
+    return False
+
+
+def dead_pre_disk_download(raw, *, job_id, tart_home, state_dir):
+    """Read-only proof for a fresh, orphaned preinstall acquisition, never a disk job.
+
+    The published VM name can since have been reused. Look only for this UUID's
+    stage/environment and transaction evidence, never inspect the newer VM.
+    Callers that subsequently mutate state must hold the exclusive build.lock.
+    """
+    if (type(raw) is not dict or type(job_id) is not str or not re.fullmatch('[0-9a-f]{32}', job_id)
+            or type(raw.get('id')) is not str or raw['id'] != job_id
+            or raw.get('mode') != PREINSTALL_MODE or raw.get('phase') != 'acquiring'
+            or raw.get('source_vm', False) is not None or raw.get('stage_path', False) is not None
+            or any(raw.get(key) is not False for key in _DOWNLOAD_FLAGS)
+            or any(raw.get(key, False) is not False for key in ('recovery_required', 'guest_started',
+                   'desktop_verified', 'vpn_connected', 'network_independently_verified',
+                   'credentials_copied', 'host_credentials_copied'))
+            or any(raw.get(key) is not None for key in ('published_path', 'source_identity',
+                   'archived_at', 'failed_phase', 'interrupted_download'))):
+        return False
+    for key in ('offline_preinstall', 'vpn_configuration'):
+        op = raw.get(key)
+        if op is not None and (type(op) is not dict or op.get('active') is not False
+                               or op.get('recovery_required', False) is not False):
+            return False
+    try:
+        if registry.validate_name(raw.get('name')).casefold() in registry.LEGACY_NAMES:
+            return False
+        state, home = Path(state_dir), Path(tart_home)
+        jobs = state / 'build-jobs'
+        job = jobs / job_id
+        for directory in (state, home, jobs, job):
+            _owned_dir(directory)
+        for parent in (home / '.gold-manager-staging', state / 'environments'):
+            if _owned_dir(parent, optional=True) and not _missing(parent / job_id):
+                return False
+        return all(_missing(job / marker) for marker in _POST_DOWNLOAD_MARKERS) and preinstall_worker_gone(raw.get('pid'), job_id)
+    except (OSError, TypeError, ValueError, RuntimeError):
+        return False
+
+
+def _json_identity(value):
+    # Python dict equality, unlike JSON equality, treats True and 1 as equal.
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()).hexdigest()
+
+
+def _valid_timestamp(value):
+    try:
+        return type(value) is str and datetime.fromisoformat(value).tzinfo is not None
+    except ValueError:
+        return False
+
+
+def _interrupted_download(raw, stamp):
+    if not _valid_timestamp(stamp):
+        raise ValueError(_DOWNLOAD_CONFLICT)
+    return dict(raw, phase='interrupted', failed_phase='acquiring', pid=None, progress=None,
+                updated_at=stamp, message=_INTERRUPTED_MESSAGE, recovery_required=False,
+                interrupted_download={'source_sha256': _json_identity(raw), 'worker_pid': raw['pid']})
+
+
+def _download_candidate(value):
+    return type(value) is dict and (value.get('phase') == 'acquiring' or 'interrupted_download' in value
+                                    or (value.get('phase') == 'interrupted' and value.get('failed_phase') == 'acquiring'))
+
+
+def _read_build_record(path):
+    # Reject FIFOs/devices before read_private opens its fd; never block on a
+    # malformed record while holding the lifecycle lock.
+    registry.safe_path(path, False)
+    try:
+        s = path.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(s.st_mode):
+        raise ValueError(_DOWNLOAD_CONFLICT)
+    return registry.read_private(path)
+
+
+def finalize_replaced_download(state_dir, tart_home):
+    """Caller holds exclusive build.lock. Finish both copies *before* replacement.
+
+    Reconcile only identical acquiring snapshots, or one such snapshot plus
+    its exact terminal projection. Never overwrite a different generation,
+    manufacture an archive, read bound tickets or touch cached materials.
+    """
+    state = Path(state_dir)
+    current = state / 'build-current.json'
+    raw = _read_build_record(current)
+    if raw is None and _missing(current):
+        return
+    if type(raw) is not dict or type(raw.get('id')) is not str or not re.fullmatch('[0-9a-f]{32}', raw['id']):
+        raise ValueError(_DOWNLOAD_CONFLICT)
+    jid = raw['id']
+    history = state / 'build-jobs' / jid / 'status.json'
+    saved = _read_build_record(history)
+    if not any(_download_candidate(v) for v in (raw, saved)):
+        return
+
+    records = (saved, raw)
+    acquiring = [v for v in records if type(v) is dict and v.get('phase') == 'acquiring']
+    if acquiring:
+        source = acquiring[0]
+        if not dead_pre_disk_download(source, job_id=jid, state_dir=state, tart_home=tart_home):
+            raise ValueError(_DOWNLOAD_CONFLICT)
+        terminal = next((v for v in records if type(v) is dict and v.get('phase') == 'interrupted'), {})
+        result = _interrupted_download(source, terminal.get('updated_at') or timestamp())
+        valid = {_json_identity(source), _json_identity(result)}
+        if any(_json_identity(v) not in valid for v in records):
+            raise ValueError(_DOWNLOAD_CONFLICT)
+    else:
+        # Both writes made it to disk. Recheck the pre-disk facts before a
+        # replacement, even if the process crashed just before the directory sync.
+        proof = raw.get('interrupted_download')
+        if (_json_identity(saved) != _json_identity(raw) or type(proof) is not dict
+                or set(proof) != {'source_sha256', 'worker_pid'} or not _valid_timestamp(raw.get('updated_at'))
+                or raw.get('phase') != 'interrupted' or raw.get('failed_phase') != 'acquiring'
+                or raw.get('pid', False) is not None or raw.get('progress', False) is not None
+                or raw.get('recovery_required') is not False or raw.get('message') != _INTERRUPTED_MESSAGE
+                or type(proof.get('source_sha256')) is not str or not re.fullmatch('[0-9a-f]{64}', proof['source_sha256'])):
+            raise ValueError(_DOWNLOAD_CONFLICT)
+        source = dict(raw, phase='acquiring', pid=proof.get('worker_pid'), failed_phase=None, interrupted_download=None)
+        if not dead_pre_disk_download(source, job_id=jid, state_dir=state, tart_home=tart_home):
+            raise ValueError(_DOWNLOAD_CONFLICT)
+        result = raw
+
+    for path, value in zip((history, current), records):
+        if _json_identity(value) != _json_identity(result):
+            registry.write_private(path, result)  # fsync file, replace, fsync directory
+        else:
+            registry.sync_directory(path.parent)  # repair a crash between replace and fsync
+    return result
+
+
+def status(*, state_dir=None, tart_home=None):
     state = STATE if state_dir is None else Path(state_dir)
     path = state / 'build-current.json'
     d = registry.read_private(path, None)
     if not d: return None
     if type(d) is not dict or not re.fullmatch('[0-9a-f]{32}', str(d.get('id', ''))): raise ValueError('创建任务状态异常')
+    d.pop('interrupted_download_archivable', None)  # Derived only; never trust a stored UI hint.
+    raw = d
     queued_grace = False
     if d.get('phase') in ('queued', 'vpn_resume_queued') and d.get('pid') is None:
         try:
@@ -259,6 +444,9 @@ def status(*, state_dir=None):
         d = dict(d, recovery_required=True)
         if not is_active(d):
             d['message'] = '事务未完整结束，已锁定相关 VM 和后续操作。请保留任务记录，核对目录和注册状态；不会自动重试。'
+    if d.get('phase') == 'interrupted' and not d.get('recovery_required') and dead_pre_disk_download(
+            raw, job_id=d['id'], state_dir=state, tart_home=TART_HOME if tart_home is None else tart_home):
+        d['interrupted_download_archivable'] = True
     return d
 
 
@@ -274,6 +462,7 @@ def start(payload, known_names):
     try:
         try: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError: raise ValueError('已有新建/重建任务进行中，请等待完成') from None
+        finalize_replaced_download(STATE, TART_HOME)
         old = status()
         if old and old.get('recovery_required'): raise ValueError('上次替换事务需要人工恢复，未开始新任务')
         if waiting_for_vpn(old): raise ValueError('请先完成已暂存 VM 的 VPN 配置')

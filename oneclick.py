@@ -243,7 +243,8 @@ def start(payload, *, state_dir=None, tart_home=None):
     fd = os.open(str(registry.safe_path(state / 'build.lock', False)), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         _lock(fd, state)
-        old = lifecycle.status(state_dir=state)
+        lifecycle.finalize_replaced_download(state, home)
+        old = lifecycle.status(state_dir=state, tart_home=home)
         _need(not old or (not old.get('recovery_required') and not lifecycle.is_active(old)
                          and not lifecycle.waiting_for_vpn(old)
                          and not (old.get('offline_preinstall') or {}).get('active')),
@@ -974,13 +975,15 @@ def archive_failed(payload, *, state_dir=None, tart_home=None):
             raise OneClickError('lifecycle-lock-busy') from None
         current_path = state / 'build-current.json'
         raw = registry.read_private(current_path)
-        job = lifecycle.status(state_dir=state)
+        job = lifecycle.status(state_dir=state, tart_home=home)
         _need(type(raw) is dict and type(job) is dict and raw.get('id') == job.get('id') == payload['job_id'],
               'archive-job-not-current')
         _need(raw.get('mode') == MODE and job.get('mode') == MODE, 'archive-preinstall-only')
         _need(job.get('name') == payload['confirm_name'], 'archive-name-confirmation-mismatch')
-        # With build.lock held no worker is alive, so a derived 'interrupted'
-        # job is as dead as a 'failed' one. Anything else is still in progress.
+        # The lock fences current workers. A derived status alone is insufficient:
+        # unreadable argv, or a worker from a different app bundle, is not death.
+        if lifecycle.is_active(raw):
+            _need(lifecycle.preinstall_worker_gone(raw.get('pid'), raw['id']), 'archive-worker-not-confirmed-dead')
         _need(job.get('phase') in ('failed', 'interrupted') and not lifecycle.is_active(job)
               and not lifecycle.waiting_for_vpn(job), 'archive-job-not-failed')
         _need(job.get('published') is not True and raw.get('published') is not True, 'archive-published-job-refused')
@@ -991,14 +994,37 @@ def archive_failed(payload, *, state_dir=None, tart_home=None):
         jobdir = state / 'build-jobs' / payload['job_id']
         _need(not os.path.lexists(jobdir / 'commit.json'), 'archive-publication-journal-present')
         archived = jobdir / 'archived-current.json'
-        _need(not os.path.lexists(archived), 'archive-record-already-exists')
+        if os.path.lexists(archived):
+            # Retry after an explicit archive was durably written but unlink was
+            # interrupted. Never adopt an unrelated archive or an active snapshot.
+            existing = registry.read_private(archived)
+            _need(raw.get('phase') in ('failed', 'interrupted') and type(existing) is dict
+                  and type(existing.get('archived_at')) is str and bool(existing['archived_at'])
+                  and existing == dict(raw, archived_at=existing['archived_at'])
+                  and registry.read_private(jobdir / 'status.json') == raw, 'archive-record-already-exists')
+            if raw.get('failed_phase') == 'acquiring':
+                _need(not any(os.path.lexists(path) for path in (
+                    home / '.gold-manager-staging' / raw['id'], state / 'environments' / raw['id'],
+                    jobdir / 'vpn-wait.json', jobdir / 'vpn-resume.json')), 'archive-download-state-conflict')
+            registry.sync_directory(jobdir)
+        else:
+            try:
+                terminal = lifecycle.finalize_replaced_download(state, home)
+            except ValueError:
+                raise OneClickError('archive-download-state-conflict') from None
+            if terminal is not None:
+                raw = terminal
+            elif lifecycle.is_active(raw):
+                raw = dict(job, pid=None, progress=None, failed_phase=raw['phase'])
+            existing = None
         stage = home / '.gold-manager-staging' / payload['job_id'] / 'new-environment'
         image = stage / 'disk.img'
         if os.path.lexists(image):
             _require_detached(image)
-        record = dict(raw, archived_at=_now())
-        registry.write_private(archived, record)
-        _need(registry.read_private(archived) == record, 'archive-record-readback-failed')
+        if existing is None:
+            record = dict(raw, archived_at=_now())
+            registry.write_private(archived, record)
+            _need(registry.read_private(archived) == record, 'archive-record-readback-failed')
         os.unlink(str(registry.safe_path(current_path)))
         registry.sync_directory(state)
         return {'ok': True, 'job_id': payload['job_id'], 'name': job['name'], 'stage_retained': os.path.lexists(stage)}

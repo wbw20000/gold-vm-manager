@@ -217,6 +217,7 @@ def start(vm, confirm_name, acknowledge_erase, known_names):
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 _reject('已有新建、重建或删除任务进行中，请等待完成')
+            lifecycle.finalize_replaced_download(STATE, TART_HOME)
             previous = status()
             if previous and previous.get('recovery_required'):
                 _reject('上次事务需要人工恢复，未开始删除任务')

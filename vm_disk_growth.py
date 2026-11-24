@@ -212,7 +212,16 @@ def _binding(state, vm, path, environment_id):
     _need(vm in reg['vms'] and vm not in reg['retired'] and vm not in registry.LEGACY_NAMES)
     jid = reg['vms'][vm]['environment_id']
     _need(environment_id is None or jid == environment_id)
-    _idle(read(state / 'build-current.json', optional=True))
+    current = read(state / 'build-current.json', optional=True)
+    _idle(current)  # No dead-download exception for the current transaction.
+    historical = []
+    tart_home = path.parent.parent
+
+    def verify_dead_downloads():
+        for old_id, raw in historical:
+            _need(lifecycle.dead_pre_disk_download(raw, job_id=old_id, tart_home=tart_home,
+                                                  state_dir=state), _BUSY)
+
     jobs = registry.safe_path(state / 'build-jobs')
     _dir_info(jobs.lstat(), True)
     pins[jobs] = _stamp(jobs.lstat())
@@ -243,7 +252,18 @@ def _binding(state, vm, path, environment_id):
             archived = read(job / 'archived-current.json', optional=True)
             if archived is None:
                 _need(status.get('id') == job.name, _BUSY)
-                _idle(status)
+                if (job.name != jid and (current is None or
+                        (type(current['id']) is str and job.name != current['id']))
+                        and record is None and status.get('name') == vm
+                        and status.get('phase') == 'acquiring'):
+                    # _idle always rejects acquiring. Only an earlier same-name
+                    # download can qualify; never normalize or archive its record.
+                    historical.append((job.name, status))
+                    pins[job] = _stamp(job.lstat())
+                    pins[tart_home / '.gold-manager-staging' / job.name] = None
+                    pins[state / 'environments' / job.name] = None
+                else:
+                    _idle(status)
             else:
                 _need(record is None and archived.get('id') == job.name
                       and archived.get('name') == status.get('name')
@@ -255,7 +275,20 @@ def _binding(state, vm, path, environment_id):
     meta = read(base / 'environment.json')
     _need(type(meta.get('version')) is int and meta['version'] in (2, 3) and meta.get('vm_name') == vm
           and meta.get('vm_config') == str(path / 'config.json') and meta.get('tart_home') == str(path.parent.parent))
-    return meta, pins
+    if historical:
+        # Pin the parents too: a dangling symlink substituted for an absent
+        # staging root must not look like a still-absent job directory.
+        staging = registry.safe_path(tart_home / '.gold-manager-staging', False)
+        try:
+            staging_info = staging.lstat()
+        except FileNotFoundError:
+            pins[staging] = None
+        else:
+            _dir_info(staging_info, True)
+            pins[staging] = _stamp(staging_info)
+        pins[base.parent] = _stamp(base.parent.lstat())
+    verify_dead_downloads()
+    return meta, pins, verify_dead_downloads
 
 
 def _config(fd, meta):
@@ -358,7 +391,7 @@ def grow(vm, target_gib, expected_bytes, *, vm_root, state_dir, inventory, known
             _lock(conf_lock)
             _need(vm in (known_names() if callable(known_names) else known_names))
             path = _storage_path(vm, vm_root)
-            meta, pins = _binding(state, vm, path, expected_environment_id)
+            meta, pins, verify_dead_downloads = _binding(state, vm, path, expected_environment_id)
             item = inventory().get(vm)  # Never ask Tart to reacquire its own storage flock.
             _need(isinstance(item, dict) and (item.get('Name'), item.get('Source'), item.get('State'))
                   == (vm, 'local', 'stopped'), _OFFLINE)
@@ -401,6 +434,10 @@ def grow(vm, target_gib, expected_bytes, *, vm_root, state_dir, inventory, known
                 _need(not any(os.path.lexists(path / name) for name in _SAVED), _OFFLINE)
                 _need(socket_identity == lifecycle.stale_control_socket(path), _OFFLINE)
 
+            # The historical exception depends on a dead worker and absence of
+            # disk-side evidence, not just an immutable status.json. Refresh the
+            # proof under the existing build.lock, then recheck every file pin.
+            verify_dead_downloads()
             check_bindings()
             _need(disk_stamp == _stamp(os.fstat(disk)), _STALE)
             _only_open(disk)

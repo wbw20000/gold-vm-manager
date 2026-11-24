@@ -236,6 +236,108 @@ class DiskGrowthTest(unittest.TestCase):
         (other / 'commit.json').unlink()
         self.put(other / 'status.json', dict(self.status, id=other.name, phase='committing')); self.reject()
 
+    def old_download(self):
+        # Mirror the pre-disk acquiring status left behind before the selected
+        # same-name publication. No derived interrupted state or archive marker.
+        old = self.job.parent / ('b' * 32); old.mkdir(mode=0o700)
+        (old / 'build').mkdir(mode=0o700)
+        (old / 'worker.log').touch(mode=0o600)
+        self.put(old / 'request.json', {'id': old.name, 'mode': 'preinstall', 'name': self.vm})
+        with subprocess.Popen([sys.executable, '-B', '-c', 'pass']) as proc:
+            self.assertEqual(proc.wait(timeout=10), 0)
+        raw = {'id': old.name, 'name': self.vm, 'mode': 'preinstall', 'source_vm': None,
+               'phase': 'acquiring', 'pid': proc.pid, 'message': '正在获取固定版本公开材料（ipsw）；不连接 VPN 节点。',
+               'started_at': '2026-01-01T00:00:00+00:00', 'updated_at': '2026-01-01T00:00:05+00:00',
+               'progress': 0.01, 'stage_path': None, 'published': False, 'old_deleted': False,
+               'system_restored': False, 'applications_preinstalled': False, 'guest_started': False,
+               'desktop_verified': False, 'credentials_copied': False, 'host_credentials_copied': False,
+               'vpn_configuration_staged': False, 'user_vpn_configuration_supplied': False,
+               'vpn_connected': False, 'network_independently_verified': False}
+        self.put(old / 'status.json', raw)
+        return old, raw
+
+    def test_dead_historical_download_does_not_block_published_namesake(self):
+        old, _ = self.old_download()
+        def records():
+            return {p.relative_to(old): (growth._stamp(p.lstat()), p.read_bytes() if p.is_file() else None)
+                    for p in old.rglob('*')}
+        original = records()
+        truncate = os.ftruncate
+        def truncate_under_lock(fd, length):
+            with (self.state / 'build.lock').open('rb') as contender:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            truncate(fd, length)
+        with patch.object(os, 'ftruncate', truncate_under_lock):
+            self.assertEqual(self.grow()['virtual_capacity_bytes'], 31 * growth.GIB)
+        self.assertEqual(self.contents(self.disk, self.old), self.before)
+        self.assertLess(self.disk.stat().st_blocks * 512, 1024**2)
+        self.assertEqual(records(), original)  # No writes to old status, archive, request or job log.
+
+    def test_no_dead_download_exception_for_current_or_selected(self):
+        old, raw = self.old_download()
+        with patch.object(growth.lifecycle, 'dead_pre_disk_download') as proof:
+            self.put(self.state / 'build-current.json', raw); self.reject()
+            # Even mixed snapshots (idle current, acquiring private status) block.
+            self.put(self.state / 'build-current.json', dict(self.status, id=old.name)); self.reject()
+            (old / 'status.json').unlink()
+            self.put(self.state / 'build-current.json', self.status)
+            self.put(self.job / 'status.json', dict(raw, id=self.jid)); self.reject()
+            proof.assert_not_called()
+
+    def test_unproven_real_active_recovery_or_malformed_namesake_still_blocks(self):
+        old, raw = self.old_download()
+        self.put(old / 'status.json', dict(raw, pid=os.getpid()))
+        # A matching live worker (even from a different copy), or a live PID
+        # whose argv can't be inspected, is not evidence the old worker exited.
+        for argv in (['python3', '/other/oneclick.py', '--worker', old.name], []):
+            with patch.object(growth.lifecycle.process_identity, 'arguments', return_value=argv):
+                self.reject()
+        for change in ({'pid': None}, {'pid': True}, {'id': self.jid},
+                       {'phase': 'installing'}, {'phase': 'future-unknown'}, {'mode': 'rebuild'},
+                       {'source_vm': self.vm}, {'published': True}, {'stage_path': '/somewhere'},
+                       {'recovery_required': True}, {'offline_preinstall': {'active': True}},
+                       {'vpn_configuration': {'active': True}}, {'system_restored': True}):
+            with self.subTest(change=change):
+                self.put(old / 'status.json', dict(raw, **change)); self.reject()
+        missing = raw.copy(); del missing['published']
+        self.put(old / 'status.json', missing); self.reject()
+
+    def test_historical_stage_marker_or_symlink_and_unknown_job_entry_block(self):
+        old, _ = self.old_download()
+        stage_root = self.root.parent / '.gold-manager-staging'
+        stage = stage_root / old.name
+        stage_root.symlink_to(self.home / 'absent'); self.reject(); stage_root.unlink()
+        stage_root.mkdir(mode=0o700)
+        for marker in (stage, self.base.parent / old.name, old / 'commit.json', old / 'archived-current.json'):
+            with self.subTest(symlink=marker.name):
+                marker.symlink_to(self.home / 'absent'); self.reject(); marker.unlink()
+        stage.mkdir(mode=0o700); self.reject(); stage.rmdir()
+        # An otherwise complete unrelated journal is still a journal, not a
+        # dead download; leave the stock manual archive and job-scan gates alone.
+        for name, record in (('commit.json', {'phase': 'committed_old_removed'}), ('archived-current.json', {})):
+            self.put(old / name, record); self.reject(); (old / name).unlink()
+        (self.job.parent / '.DS_Store').touch(mode=0o600); self.reject()
+
+    def test_historical_evidence_rechecked_after_inventory(self):
+        old, raw = self.old_download()
+        stage_root = self.root.parent / '.gold-manager-staging'; stage_root.mkdir(mode=0o700)
+        for marker in (stage_root / old.name, old / 'commit.json', old / 'archived-current.json', self.base.parent / old.name):
+            with self.subTest(marker=marker):
+                def inventory():
+                    marker.touch(mode=0o600)
+                    return {self.vm: self.row}
+                self.reject(inventory=inventory); marker.unlink()
+        def rewrite_status():
+            self.put(old / 'status.json', dict(raw, pid=os.getpid()))
+            return {self.vm: self.row}
+        self.reject(inventory=rewrite_status)
+        self.put(old / 'status.json', raw)
+        # Even with byte-identical files, a second indeterminate/live process
+        # probe may no longer support the historical exception.
+        with patch.object(growth.lifecycle, 'dead_pre_disk_download', side_effect=[True, False]) as proof:
+            self.reject(); self.assertEqual(proof.call_count, 2)
+
     def test_busy_build_registry_and_storage_locks(self):
         for path in (self.state / 'build.lock', self.state / 'configuration.lock', self.root.parent):
             fd = os.open(path, os.O_RDONLY)

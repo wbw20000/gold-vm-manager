@@ -34,7 +34,7 @@ import oneclick
 import vpn_store
 
 APP = 'gold-vm-manager'
-VERSION = '1.5.1'
+VERSION = '1.5.2'
 VPN_VALIDATE_PATH = '/api/preinstall/vpn/validate'
 # Cover JSON escaping for the 256 KiB input limit without raising other routes' caps.
 VPN_VALIDATE_MAX_WIRE = 6 * 256 * 1024 + 16384
@@ -43,7 +43,7 @@ PREINSTALL_PHASE_FIELDS = frozenset(('id', 'mode', 'name', 'phase', 'pid', 'prog
     'guest_started', 'desktop_verified', 'host_credentials_copied', 'user_vpn_configuration_supplied',
     'vpn_configuration_staged', 'vpn_connected', 'network_independently_verified', 'published',
     'needs_host_security_authorization', 'recovery_required', 'failure_code', 'failed_phase',
-    'failed_step', 'failure_reason', 'failed_product', 'materials_source'))
+    'failed_step', 'failure_reason', 'failed_product', 'materials_source', 'interrupted_download_archivable'))
 # Preinstalled protected environments: v2 wrote apps and a first-login seed into
 # the guest disk; v3 writes nothing there and shares installers during first setup.
 PROTECTED_VERSIONS = (2, 3)

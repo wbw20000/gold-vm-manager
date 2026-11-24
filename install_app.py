@@ -88,7 +88,7 @@ def package_app(output, private_build_root):
         'CFBundleIdentifier':'local.gold.vm-manager','CFBundleVersion':'11',
         'CFBundleIconFile':'AppIcon',
         'LSApplicationCategoryType':'public.app-category.developer-tools',
-        'CFBundleShortVersionString':'1.5.2','CFBundleExecutable':'GoldVMManager',
+        'CFBundleShortVersionString':'1.5.3','CFBundleExecutable':'GoldVMManager',
         'CFBundlePackageType':'APPL','LSMinimumSystemVersion':'26.6.2',
         'NSHighResolutionCapable':True,
         'NSAppTransportSecurity':{'NSAllowsLocalNetworking':True},

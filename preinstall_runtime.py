@@ -65,6 +65,12 @@ _MAX_RECORD = 4 * 1024 * 1024
 NETWORK_MODE_NAME = 'network-mode.json'
 _FINISHED_MODE = {'version': 1, 'mode': 'protected'}
 FIRST_SETUP_NETWORK = 'first-setup-normal-network'
+# Host-only record outside the reviewed manifest, written once when a v3 VM is
+# prepared with tart-guest-agent in its installers folder (2026-11-23 on). Then
+# normal and first-setup starts omit --no-clipboard. Absent, as for every VM
+# prepared earlier: every start keeps --no-clipboard. Recovery always keeps it.
+CLIPBOARD_NAME = 'clipboard.json'
+_SHARED_CLIPBOARD = {'version': 1, 'clipboard': 'shared'}
 
 
 class RuntimePreparationError(RuntimeError):
@@ -310,7 +316,7 @@ def _installers_info(path):
 
 
 def prepare_environment(vm_name, vm_config, destination_private_base, *, published_vm_config,
-                        private_config, endpoints, gvproxy_path, tart_path, installers):
+                        private_config, endpoints, gvproxy_path, tart_path, installers, share_clipboard=False):
     """Prepare a v3 environment before publication; never launch or grant host authorization.
 
     vm_config is the existing staged private config. published_vm_config is the
@@ -321,8 +327,11 @@ def prepare_environment(vm_name, vm_config, destination_private_base, *, publish
     private_config is the unchanged vpn_config dictionary, never a host profile
     or implicit source selector. installers is the parent's finished 0755 folder
     on the same filesystem; it is moved, not copied, into the environment.
+    share_clipboard=True (only with the clipboard agent in installers) writes the
+    host-only clipboard record, so normal starts share the clipboard.
     """
     try:
+        _need(type(share_clipboard) is bool, 'invalid-clipboard-choice')
         vm_name = _name(vm_name)
         vm_config = _path(vm_config)
         _need(vm_config.name == 'config.json', 'invalid-staged-config-name')
@@ -357,6 +366,9 @@ def prepare_environment(vm_name, vm_config, destination_private_base, *, publish
         _need(_sha(copied_backend) == _sha(backend), 'copied-backend-mismatch')
         _preserve_quarantine(_path(gvproxy_path), base / 'gvproxy-darwin', source_q)
         _write(base / 'policy.json', _json({'guest_mac': mac, 'endpoints': endpoints}))
+        if share_clipboard:
+            _write(base / CLIPBOARD_NAME, _json(_SHARED_CLIPBOARD))
+        _need(clipboard_shared(base) is share_clipboard, 'clipboard-record-write-failed')
         os.rename(str(installers), str(base / INSTALLERS_NAME))
         _sync(installers.parent)
         _sync(base)
@@ -381,6 +393,7 @@ def prepare_environment(vm_name, vm_config, destination_private_base, *, publish
                 'metadata_path': str(base / 'environment.json'),
                 'status': 'awaiting_first_setup', 'endpoint_count': len(endpoints),
                 'needs_host_security_authorization': True, 'native_execution_approved': False,
+                'clipboard_shared': share_clipboard,
                 'backend_requires_executable_permission': not bool(backend_info.st_mode & stat.S_IXUSR),
                 'desktop_verified': False, 'network_independently_verified': False}
     except RuntimePreparationError:
@@ -492,6 +505,23 @@ def first_setup_pending(base):
         return False
     except Exception:
         raise RuntimePreparationError('invalid-network-mode') from None
+
+
+def clipboard_shared(base):
+    """True only for the exact private record written at preparation; absent is False.
+
+    Anything else at that name fails closed and is never repaired.
+    """
+    try:
+        base = _directory(base)
+        record = base / CLIPBOARD_NAME
+        if not os.path.lexists(str(record)):
+            return False
+        raw, _ = _read(record, cap=4096)
+        _need(_json(_parse(raw)) == _json(_SHARED_CLIPBOARD), 'invalid-clipboard-record')
+        return True
+    except Exception:
+        raise RuntimePreparationError('invalid-clipboard-record') from None
 
 
 def require_first_setup(base):
@@ -733,13 +763,16 @@ def authorize_backend_execution_bit(base, meta, *, acknowledged=False):
 def build_tart_command(base, meta, vm_name, network_fd, share_plan, no_graphics=False, recovery=False,
                        *, first_setup=False):
     _need(vm_name == meta['vm_name'], 'invalid-v2-launch-binding')
+    # Tart's clipboard channel is a virtio console, not a network path; the
+    # guest uses it only once the person has installed the agent there.
+    clipboard = [] if not recovery and clipboard_shared(base) else ['--no-clipboard']
     if first_setup:
         # Tart's own normal network for first setup only: no fenced NIC, no filter.
         _need(network_fd is None and not recovery, 'invalid-v2-launch-binding')
-        command = [meta['tart_binding']['path'], 'run', vm_name, '--no-clipboard']
+        command = [meta['tart_binding']['path'], 'run', vm_name] + clipboard
     else:
         _need(type(network_fd) is int and network_fd >= 0, 'invalid-v2-launch-binding')
-        command = [meta['tart_binding']['path'], 'run', vm_name, '--net-fd=' + str(network_fd), '--no-clipboard']
+        command = [meta['tart_binding']['path'], 'run', vm_name, '--net-fd=' + str(network_fd)] + clipboard
     if recovery:
         command.append('--recovery')
     else:

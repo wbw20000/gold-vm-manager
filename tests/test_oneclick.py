@@ -3,6 +3,7 @@ import builtins
 from contextlib import ExitStack
 import errno
 import fcntl
+import hashlib
 import io
 import json
 import os
@@ -356,6 +357,10 @@ class WorkerTests(Fixture):
         self.podman_package = SimpleNamespace(artifact_path=self.root / 'podman-installer.fixture')
         self.ensure_gvproxy = self.patch(host_tools, 'ensure_gvproxy',
                                          return_value=SimpleNamespace(executable_path=self.backend))
+        self.agent_archive = SimpleNamespace(artifact_path=self.root / 'tart-guest-agent.fixture')
+        self.guest_agent = SimpleNamespace(executable_path=self.root / 'agent.fixture', executable_sha256='2' * 64,
+                                           receipt_path=self.root / 'agent-receipt.fixture')
+        self.ensure_guest_agent = self.patch(host_tools, 'ensure_guest_agent', return_value=self.guest_agent)
         self.acquire = self.patch(host_artifacts, 'acquire', side_effect=self.acquire_fixture)
         image_info = self.image.stat()
         self.image_receipt = SimpleNamespace(artifact_path=self.image, device=image_info.st_dev,
@@ -404,7 +409,8 @@ class WorkerTests(Fixture):
         self.assertEqual(cache, self.state / 'host-materials')
         self.assertEqual(loopback_proxy, self.proxy)
         progress(SimpleNamespace(spec_key=key, completed_bytes=1, total_bytes=2))
-        return {'tart': self.tart_archive, 'podman-installer': self.podman_package}[key]
+        return {'tart': self.tart_archive, 'podman-installer': self.podman_package,
+                'tart-guest-agent': self.agent_archive}[key]
 
     def inspect_fixture(self, command, **kwargs):
         if command == ['/usr/sbin/sysctl', '-n', 'hw.memsize']:
@@ -441,10 +447,11 @@ class WorkerTests(Fixture):
         return SimpleNamespace(stdout=iter(['unstructured log\n'] + [json.dumps(e) for e in self.install_events]),
                                wait=mock.Mock(return_value=0))
 
-    def installers_fixture(self, target, materials, private_config):
+    def installers_fixture(self, target, materials, private_config, guest_agent):
         c = self.context
         self.assertEqual(target, c.jobdir / 'installers')
         self.assertIs(materials, self.materials)
+        self.assertIs(guest_agent, self.guest_agent)
         selected = vpn_store.load_configuration(self.state, self.selected, job_id=c.job_id)
         self.assertEqual(selected.bound_job, c.job_id)
         self.assertEqual(private_config, selected.private_config)
@@ -570,6 +577,10 @@ class WorkerTests(Fixture):
         self.assertIn('podman-installer', [c.args[0] for c in self.acquire.call_args_list])
         self.ensure_gvproxy.assert_called_once_with(self.state / 'tools', artifact_receipt=self.podman_package)
         self.assertEqual(self.runtime_prepare.call_args.kwargs['gvproxy_path'], self.backend)
+        # Every new VM gets the clipboard agent in its installers folder and shares the clipboard.
+        self.ensure_guest_agent.assert_called_once_with(self.state / 'tools', artifact_receipt=self.agent_archive)
+        self.assertIs(self.runtime_prepare.call_args.kwargs['share_clipboard'], True)
+        self.assertTrue(preinstall_runtime.clipboard_shared(self.context.base))
         self.assertLess(self.trace.index(('installer', 'inspect')), self.trace.index(('installer', 'create')))
         self.assertLess(self.trace.index(('installer', 'create')), self.trace.index(('installers', 'built')))
         self.assertLess(self.trace.index(('installers', 'built')), self.trace.index(('status', 'publishing')))
@@ -1144,18 +1155,27 @@ class DeferredBackendTests(unittest.TestCase):
         patch(preinstall_materials, 'MaterialManager')
         self.acquire = patch(host_artifacts, 'acquire', side_effect=AssertionError('no download'))
         self.extract = patch(host_tools, 'ensure_gvproxy', side_effect=AssertionError('no extraction'))
+        self.agent_tool = 'guest-agent-tool-' + 'c' * 32
+        self.agent_receipt = self.state / 'tools' / self.agent_tool / 'guest-agent.json'
+        self.loaded_agent = SimpleNamespace(receipt_path=self.agent_receipt)
+        self.load_agent = patch(host_tools, 'load_guest_agent', return_value=self.loaded_agent)
+        self.extract_agent = patch(host_tools, 'ensure_guest_agent', side_effect=AssertionError('no extraction'))
         self.service = oneclick.NativeServices(SimpleNamespace(state=self.state, jobdir=self.root / 'job'))
 
     def record(self):
         self.service.backend = SimpleNamespace(executable_path=self.path)
+        self.service.guest_agent = SimpleNamespace(receipt_path=self.agent_receipt)
         self.service.material_attempt_id = 'materials-fixture'
         return self.service.deferred_materials()
 
     def test_checkpoint_binds_the_signed_copy_and_its_quarantine(self):
         record = self.record()
         self.assertEqual(record['backend'], self.tool)
+        self.assertEqual(record['guest_agent'], self.agent_tool)
         self.service.load_deferred_materials(record)
         self.assertEqual(self.service.backend.executable_path, self.path)
+        self.load_agent.assert_called_with(self.agent_receipt)
+        self.assertIs(self.service.guest_agent, self.loaded_agent)
         self.quarantine = b'0083;0;Fixture;changed'
         with self.assertRaisesRegex(oneclick.OneClickError, '^deferred-backend-quarantine-changed$'):
             self.service.load_deferred_materials(record)
@@ -1167,6 +1187,29 @@ class DeferredBackendTests(unittest.TestCase):
             self.service.deferred_materials()
         self.acquire.assert_not_called()
         self.extract.assert_not_called()
+        self.extract_agent.assert_not_called()
+        self.quarantine = b'0083;0;Fixture;package-origin'
+        self.service.backend = SimpleNamespace(executable_path=self.path)
+        self.service.guest_agent = SimpleNamespace(receipt_path=self.root / 'elsewhere' / 'guest-agent.json')
+        with self.assertRaisesRegex(oneclick.OneClickError, '^guest-agent-path-mismatch$'):
+            self.service.deferred_materials()
+
+    def test_checkpoint_without_the_clipboard_agent_takes_the_pinned_one(self):
+        record = self.record()
+        del record['guest_agent']  # As written by a build before the clipboard agent.
+        archive, agent = object(), SimpleNamespace(receipt_path=self.root / 'new' / 'guest-agent.json')
+        self.acquire.side_effect, self.acquire.return_value = None, archive
+        self.extract_agent.side_effect, self.extract_agent.return_value = None, agent
+        self.service.load_deferred_materials(record)
+        self.acquire.assert_called_once_with('tart-guest-agent', self.state / 'host-materials')
+        self.extract_agent.assert_called_once_with(self.state / 'tools', artifact_receipt=archive)
+        self.assertIs(self.service.guest_agent, agent)
+        self.load_agent.assert_not_called()
+        for bad in ('guest-agent-tool-x', '../' + self.agent_tool, 7, None):
+            with self.subTest(bad=bad), self.assertRaisesRegex(oneclick.OneClickError, '^deferred-material-record-mismatch$'):
+                self.service.load_deferred_materials(dict(record, guest_agent=bad))
+        with self.assertRaisesRegex(oneclick.OneClickError, '^deferred-material-record-mismatch$'):
+            self.service.load_deferred_materials(dict(record, other='x'))
 
     def test_older_checkpoint_with_the_unnotarized_backend_takes_the_signed_one(self):
         record = dict(self.record(), backend='gvproxy-' + 'b' * 32)  # As written by an older build.
@@ -1262,6 +1305,84 @@ class BuildInstallersTests(unittest.TestCase):
         for path in (profile, self.target / oneclick.INSTALLERS_README):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
         self.assertNotIn(SECRET, note)
+
+    def agent_fixture(self):
+        tool = self.root / 'tools' / ('guest-agent-tool-' + 'd' * 32)
+        tool.mkdir(mode=0o700, parents=True)
+        binary = tool / 'tart-guest-agent'
+        binary.write_bytes(b'inert tart-guest-agent fixture; never execute')
+        binary.chmod(0o600)
+        (tool / 'LICENSE').write_bytes(b'FSL-1.1-ALv2 fixture')
+        (tool / 'LICENSE').chmod(0o600)
+        digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+        return SimpleNamespace(executable_path=binary, receipt_path=tool / 'guest-agent.json',
+                               executable_sha256=digest, documents=('LICENSE',))
+
+    def build_with_agent(self, agent, loaded=None):
+        import host_tools
+        with mock.patch('guest_app_artifacts._tree_snapshot', side_effect=lambda app, manifest: self.tree(app)), \
+                mock.patch.object(host_tools, 'load_guest_agent', return_value=loaded or agent) as load, \
+                mock.patch.object(quarantine_policy, 'propagate') as propagate:
+            result = oneclick.build_installers(self.target, self.materials, self.config, agent)
+        load.assert_called_once_with(agent.receipt_path)
+        return result, propagate
+
+    def test_clipboard_folder_holds_the_verified_agent_installer_script_and_note(self):
+        agent = self.agent_fixture()
+        result, propagate = self.build_with_agent(agent)
+        folder = result / oneclick.CLIPBOARD_FOLDER
+        self.assertEqual(sorted(p.name for p in self.target.iterdir()),
+                         sorted(['One.app', 'Two.app', oneclick.INSTALLERS_PROFILE, oneclick.INSTALLERS_README,
+                                 oneclick.CLIPBOARD_FOLDER]))
+        self.assertEqual(sorted(p.name for p in folder.iterdir()),
+                         sorted(['LICENSE', 'tart-guest-agent', oneclick.CLIPBOARD_SCRIPT, oneclick.CLIPBOARD_NOTE_NAME]))
+        modes = {p.name: stat.S_IMODE(p.stat().st_mode) for p in folder.iterdir()}
+        self.assertEqual(modes, {'LICENSE': 0o644, 'tart-guest-agent': 0o644, oneclick.CLIPBOARD_SCRIPT: 0o755,
+                                 oneclick.CLIPBOARD_NOTE_NAME: 0o644})
+        self.assertEqual(stat.S_IMODE(folder.stat().st_mode), 0o755)
+        self.assertEqual((folder / 'tart-guest-agent').read_bytes(), agent.executable_path.read_bytes())
+        propagate.assert_called_once_with(agent.executable_path, folder / 'tart-guest-agent')
+        script = (folder / oneclick.CLIPBOARD_SCRIPT).read_text(encoding='utf-8')
+        self.assertTrue(script.startswith('#!/bin/bash\n'))
+        self.assertIn("EXPECTED_SHA256='%s'" % agent.executable_sha256, script)
+        self.assertIn("TEAM='9M2P8L4D89'", script)
+        self.assertIn('<string>--run-vdagent</string>', script)
+        self.assertIn('org.goldvm.clipboard-agent', script)
+        self.assertNotIn('@', script)
+        # Only the clipboard part, as the guest user: no RPC/exec, root daemon,
+        # disk resize, network, privilege or Gatekeeper changes.
+        for forbidden in ('--run-rpc', '--run-agent', '--run-daemon', '--resize-disk', 'sudo ', 'xattr',
+                          'spctl', 'curl', 'LaunchDaemons', '/Library/LaunchAgents', 'chown', 'osascript'):
+            self.assertNotIn(forbidden, script.replace('不要用 sudo', '').replace('$HOME/Library/LaunchAgents', ''))
+        self.assertIn('AGENTS="$HOME/Library/LaunchAgents"', script)  # The guest account's own login items.
+        checked = subprocess.run(['/bin/bash', '-n', str(folder / oneclick.CLIPBOARD_SCRIPT)],
+                                 capture_output=True, timeout=30)
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        note = (folder / oneclick.CLIPBOARD_NOTE_NAME).read_text(encoding='utf-8')
+        for words in ('双击「安装剪贴板共享.command」', '不需要管理员密码', '互相复制粘贴文字', '卸载',
+                      'launchctl bootout gui/$(id -u)/org.goldvm.clipboard-agent', 'FSL-1.1-ALv2',
+                      'https://github.com/openai/tart-guest-agent/blob/main/LICENSE'):
+            self.assertIn(words, note)
+        readme = (self.target / oneclick.INSTALLERS_README).read_text(encoding='utf-8')
+        self.assertLess(readme.index('拖进「应用程序」'), readme.index('安装剪贴板共享.command'))
+        self.assertLess(readme.index('安装剪贴板共享.command'), readme.index('Clash Verge。macOS'))
+
+    def test_changed_agent_or_lost_quarantine_stops_before_the_folder_is_finished(self):
+        agent = self.agent_fixture()
+        changed = SimpleNamespace(**dict(vars(agent), executable_sha256='0' * 64))
+        with self.assertRaisesRegex(oneclick.OneClickError, '^guest-agent-changed$'):
+            self.build_with_agent(agent, loaded=changed)
+        self.assertNotEqual(stat.S_IMODE(self.target.stat().st_mode), 0o755)
+        shutil.rmtree(str(self.target))
+        def read(path):
+            return b'0083;0;Fixture;other' if Path(path).parent.name == oneclick.CLIPBOARD_FOLDER else b'0083;0;Fixture;origin'
+        with mock.patch.object(quarantine_policy, 'read', side_effect=read), \
+                self.assertRaisesRegex(oneclick.OneClickError, '^installer-quarantine-mismatch$'):
+            self.build_with_agent(agent)
+        self.assertNotEqual(stat.S_IMODE(self.target.stat().st_mode), 0o755)
+        for bad in ('0' * 63, 'G' * 64, None):
+            with self.subTest(bad=bad), self.assertRaises(oneclick.OneClickError):
+                oneclick.clipboard_script(bad)
 
     def test_copy_mismatch_or_lost_quarantine_stops(self):
         real = self.verified

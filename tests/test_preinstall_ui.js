@@ -651,6 +651,10 @@ test('failed preinstall card names the failed step, explains the reason and keep
   assert.match(text, /不代表 VPN 已连通/);
   assert.doesNotMatch(text, /管理员授权|属主/);
   assert.equal(JSON.stringify(buttons), JSON.stringify([{ text: '归档此失败任务（保留暂存盘）', disabled: false }]));
+  const agent = renderFailedJob({ id: JOB_ID, mode: 'preinstall', name: 'backup2', phase: 'failed',
+    failed_phase: 'preparing_runtime', failure_code: 'guest-agent-changed', recovery_required: true, published: false });
+  assert.match(agent.text, /原因：剪贴板组件 tart-guest-agent 与已核验的文件不一致/);
+  assert.match(agent.text, /代码：guest-agent-changed/);
 });
 
 test('failure details fall back to phase labels and never invent a reason', () => {
@@ -745,6 +749,9 @@ test('a material failure names the product, explains the transfer cause and keep
   assert.match(view.text, /代码：downloading-failed/);
   view = failed({ failure_code: 'host-disk-full', failed_product: undefined });
   assert.match(view.text, /磁盘空间不足/);
+  view = failed({ failure_code: 'guest-agent-notarization-required', failed_product: undefined });
+  assert.match(view.text, /原因：剪贴板组件 tart-guest-agent 没有通过 Apple 公证检查/);
+  assert.match(view.text, /代码：guest-agent-notarization-required/);
 });
 
 test('the job card says whether application materials were reused or downloaded', () => {

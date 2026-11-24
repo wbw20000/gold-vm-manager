@@ -6,6 +6,8 @@
 
 负责人决定简化流程。新建 VM 只恢复全新 macOS；4 个应用和节点配置放进一个只读安装文件夹，首次设置时挂给客机，由用户用 Finder 安装、在 Clash Verge 里导入。离线写盘、文件归属授权（root 助手和管理员弹窗）、首次登录导入程序都已删除。详见下文「不再写客机磁盘（追加）」。下面 2026-11-18 起的记录保留作历史，其中关于离线写盘和属主授权的内容已经过时。
 
+2026-11-23 起（1.5.3）：新建的 VM 默认和宿主共享剪贴板，见下文「宿主与客机共享剪贴板（追加）」。
+
 ## 当前状态（2026-11-18，历史）
 
 - **实机进度**：有一次真实运行完成了 macOS 恢复和四个原版应用的独立只读验收，随后在 VPN 阶段的 `authorized-ownership-apply` 失败。操作者没看到管理员弹窗；没有 `apply.started` 或成功回执；暂存盘已正常卸载，未发布、未开机。之后重跑又失败，界面只显示「请查看失败步骤」，却没有列出任何步骤。
@@ -191,6 +193,20 @@
 - **镜像**：缓存本来就会复用（选「经审核的固定镜像」时不再下载，只重新核对哈希），问题只是界面没说。[host_artifacts.py](<host_artifacts.py>) 新增 `cached`，只看记录、文件身份和大小，不哈希、不加锁；能力接口多一个 `restore_image_cached`，对话框据此显示「不再下载，也不用选文件」。再选一次本机 IPSW 会另存一份约 20 GB 的副本（`import_local` 总是复制），界面也会提示。
 - **界面**：有可沿用的 VM 时「节点来源」默认选它，仍要点一次「沿用并校验这组节点」；改回「填写新的节点」就是原来的 YAML 路径或手工表单。待配置 VPN 的续接任务同样可以沿用。
 - **没做的**：复制已有 VM 再清理、恢复后未开机的模板盘，都没有做。
+
+### 宿主与客机共享剪贴板（追加，2026-11-23）
+
+负责人要求新建的 VM 也有剪贴板共享（之前只在 gold fresh 里手动装过），并决定**默认开启，不让用户选择**。客机磁盘仍然不写；agent 由用户在首次设置时自己装。
+
+- **原理**：Tart 只要不带 `--no-clipboard`，就给 VM 加一个 SPICE agent 控制台端口（virtio console，不是网卡，和 `--net-fd`、包过滤无关）。macOS 客机里必须运行 [tart-guest-agent](https://github.com/openai/tart-guest-agent) 的剪贴板组件 `--run-vdagent` 才能用。以前 v2/v3 的每次启动都固定带 `--no-clipboard`。
+- **宿主材料**（[host_artifacts.py](<host_artifacts.py>)、[host_tools.py](<host_tools.py>)）：固定 `tart-guest-agent` 0.15.0 的 `tart-guest-agent-darwin-all.tar.gz`（10,057,123 字节，SHA-256 `eb47f402…80b7`，发布方 GitHub 摘要，与其 Homebrew 配方一致）。`ensure_guest_agent` 只接受顶层的 `tart-guest-agent` 加最多 `LICENSE`、`LICENSE.md`、`README.md`、`CHANGELOG.md`，其他任何成员、链接、目录、setuid、可写权限都拒绝；静态核验 arm64、`Developer ID Application: Cirrus Labs, Inc. (9M2P8L4D89)`、标识 `tart-guest-agent`、`Notarized Developer ID`；隔离属性传给副本并保留。宿主从不运行它。`load_guest_agent` 按回执重新核验（等待配置 VPN 的续接用它）。
+- **安装文件夹**（[oneclick.py](<oneclick.py>) `build_installers`）：多一个 `剪贴板共享/`：agent 副本（0644，哈希和隔离属性逐项核对）、发布包里的文档、按这份哈希生成的 `安装剪贴板共享.command`（0755）和 `说明.txt`（用法、卸载、许可证链接）。「先读我.txt」新增第 2 步。
+- **客机脚本**：只用系统自带工具，不联网、不用 sudo、不改隔离属性。核对哈希和签名要求后，把 agent 复制到 `~/Library/Application Support/GoldClipboard/`，写 `~/Library/LaunchAgents/org.goldvm.clipboard-agent.plist`（只有 `--run-vdagent`，没有 `--run-rpc`/`tart exec`、root 守护进程或磁盘扩容），`launchctl bootstrap gui/<uid>`，再看 `/dev/cu.com.redhat.spice.0` 报告结果。可重复运行。
+- **启动**（[preinstall_runtime.py](<preinstall_runtime.py>)）：`prepare_environment(..., share_clipboard=True)` 在私有环境里写 `clipboard.json`（精确内容 `{"version":1,"clipboard":"shared"}`，0600，像 `network-mode.json` 一样在受审清单之外）。有这条记录时，首次设置和受保护启动都不带 `--no-clipboard`；恢复模式始终带。没有记录（2026-11-23 之前建的全部 VM，以及所有 v2）照旧带。内容、权限、链接或属主不对就拒绝启动（`invalid-clipboard-record`），不修复也不覆盖。旧的 v1 启动器（gold fresh 用的）没有改动。
+- **续接兼容**：暂停待配置 VPN 的检查点多一个 `guest_agent`；旧版写的检查点没有它，续接时会补下载并核验 agent。
+- **界面和文档**：首次设置确认框和卡片提到剪贴板共享；新增失败代码在 `static/app.js` 里有中文原因；README（中英）、一键预装指南、运行环境说明、宿主材料说明已更新。版本 1.5.3。
+- **安全边界**：剪贴板是双向通道。VM 运行期间宿主复制的内容（包括密码管理器里的密码、节点资料）可能进客机，反之亦然。不经过网络，不暴露宿主 IP。tart-guest-agent 是 FSL-1.1-ALv2，在宿主上按固定版本从官方发布页下载，不随源码分发。
+- **没验证的**：发布包的实际成员（没在客机里下载；若宿主报 `unexpected-guest-agent-archive` 就按实际结构调整）；带隔离属性、已公证的命令行程序由 launchd 启动时 macOS 是否放行；真实 VM 里两个方向的复制粘贴。
 
 ## 验证
 

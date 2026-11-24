@@ -261,7 +261,7 @@
       const imported = vm.preinstalled.configuration === 'imported';
       const manual = vm.preinstalled.configuration === 'manual_recovery_required';
       const installers = vm.preinstalled.installers_share === true;
-      if (firstSetup && installers) panel.append(el('p', 'machine-notice', '首次设置使用普通网络，并在客机 Finder「My Shared Files」里挂只读文件夹 gold-installers。按里面「先读我.txt」用 Finder 安装 4 个应用、在 Clash Verge 导入节点并打开虚拟网卡模式；确认连上节点后关机，再点「标记首次设置完成」。之后每次都受保护启动。'));
+      if (firstSetup && installers) panel.append(el('p', 'machine-notice', '首次设置使用普通网络，并在客机 Finder「My Shared Files」里挂只读文件夹 gold-installers。按里面「先读我.txt」用 Finder 安装 4 个应用、双击安装剪贴板共享、在 Clash Verge 导入节点并打开虚拟网卡模式；确认连上节点后关机，再点「标记首次设置完成」。之后每次都受保护启动。'));
       else if (firstSetup) panel.append(el('p', 'machine-notice', '首次设置使用普通网络，设置助理可以连上 Apple。进入桌面后确认 Clash Verge 已连上节点，再点「标记首次设置完成」；之后每次都受保护启动。'));
       if (!installers) panel.append(el('p', 'machine-notice', imported ? '客机报告：已导入配置。系统授权和连通性尚未验收。' : manual ? '客机报告：未覆盖已有资料，请在客机中检查配置。' : '私有配置已布置；首次登录后导入，尚无客机回执。'));
     }
@@ -531,7 +531,7 @@
     confirmContext = { type: 'action', id, action, dangerous, backend, firstSetup };
     $('confirm-title').textContent = `${ACTION_LABELS[action]} ${id}？`;
     const installersNote = vm.preinstalled?.installers_share === true
-      ? '客机 Finder 的「My Shared Files」里会出现只读文件夹 gold-installers，装着 4 个应用、节点配置和说明：用 Finder 把应用拖进「应用程序」，在 Clash Verge 导入节点并打开虚拟网卡模式，确认已经连上节点后关机，再点「标记首次设置完成」。之后每次启动都走受保护启动，这个文件夹也不再出现。'
+      ? '客机 Finder 的「My Shared Files」里会出现只读文件夹 gold-installers，装着 4 个应用、剪贴板共享的安装脚本、节点配置和说明：用 Finder 把应用拖进「应用程序」，双击安装剪贴板共享（之后宿主和客机可互相复制粘贴文字），在 Clash Verge 导入节点并打开虚拟网卡模式，确认已经连上节点后关机，再点「标记首次设置完成」。之后每次启动都走受保护启动，这个文件夹也不再出现。'
       : '进入桌面后，Clash Verge 会自动导入节点；按提示授权它的服务，确认已经连上节点后，再点「标记首次设置完成」。之后每次启动都走受保护启动。';
     $('confirm-description').textContent = firstSetup ? '首次设置使用普通网络：这次启动不经过网络过滤，客机直接使用本机网络，Apple 等服务会看到本机的真实 IP；这样设置助理才能连上 Apple。不运行网络后端，也不需要后端授权。' + installersNote : action === 'finish-first-setup' ? '请先在客机里确认 Clash Verge 已连上节点。标记后，之后每次启动都走受保护启动：客机只能连到你的 VPN 节点，Clash 没连上时客机没有网络。此标记不能撤销；如果 VM 正在运行，这次运行仍是普通网络，关机后生效。' : backend ? '网络后端 gvproxy 取自 Podman 官方安装包（Red Hat 签名、经 Apple 公证、固定 SHA-256），不安装 Podman。点击「同意尝试受保护启动」，即允许仅为本机这份私有副本设置所有者执行位，并请求 macOS 正常执行。较早预装的 VM 会先换用这份签名版后端并更新受保护启动文件，首次可能需要下载约 77 MB；磁盘和网络过滤规则不变。不会清除隔离属性或关闭系统保护；如被 macOS 拒绝则不启动，也不改用普通网络。首次系统设置、账号及服务授权仍需亲自完成。' : action === 'recovery-start' ? '仅为找回这台虚拟机遗忘的本地登录密码而进入 macOS 恢复模式。保留现有磁盘、数据与 VM 身份，不创建新身份，不抹除、不重建，也不清除钥匙串。本次恢复启动挂载的宿主共享目录为零。你需要亲自在虚拟机窗口内完成恢复，可能需要 FileVault 恢复密钥或 Apple Account。不要向模型提供任何密码、恢复密钥或账号凭据。此操作仅启动恢复模式，不保证能重设密码。' : action === 'shutdown' ? '向客机发送正常关机请求，不会强制终止进程。客机可能弹出确认窗口，请在虚拟机内完成确认；发送请求不等于已关机。' : action === 'force-stop' ? '将立即终止虚拟机，未保存的工作可能永久丢失。请优先使用正常关机。此操作不会删除虚拟机或主机共享目录。' : '将丢弃保存的运行状态，暂停时未保存的工作可能永久丢失。此操作不会删除虚拟机磁盘或主机共享目录；随后需重新启动。';
     $('confirm-submit').textContent = firstSetup ? '用普通网络启动首次设置' : backend ? '同意尝试受保护启动' : ACTION_LABELS[action];
@@ -881,6 +881,10 @@
         'checksum-mismatch': '文件校验值与固定版本不符，已拒绝使用。',
         'declared-size-mismatch': '文件大小与固定版本不符，已拒绝使用。',
         'host-disk-full': '本机磁盘空间不足。',
+        'unexpected-guest-agent-archive': '剪贴板组件 tart-guest-agent 的安装包内容和审核过的不一致，已拒绝使用。',
+        'guest-agent-binary-required': '剪贴板组件 tart-guest-agent 的安装包里没有程序文件，已拒绝使用。',
+        'guest-agent-signing-identity-mismatch': '剪贴板组件 tart-guest-agent 的签名不是 Cirrus Labs，已拒绝使用。',
+        'guest-agent-notarization-required': '剪贴板组件 tart-guest-agent 没有通过 Apple 公证检查，已拒绝使用。',
       };
       if (own(products, job.failed_product)) region.append(el('span', 'build-job-failure', `失败项目：${products[job.failed_product]}`));
       region.append(el('span', 'build-job-failure', `原因：${own(causes, job.failure_code) ? causes[job.failure_code] : '未能识别具体原因，请按下方代码排查。'}`));
@@ -900,6 +904,8 @@
         'installer-copy-failed': '把应用复制到首次设置文件夹失败（例如本机磁盘空间不足）。',
         'installer-copy-mismatch': '复制后的应用与已核验的原件不一致，已停止。',
         'installer-quarantine-mismatch': '复制后的应用缺少下载来源标记，已停止。',
+        'guest-agent-changed': '剪贴板组件 tart-guest-agent 与已核验的文件不一致，已停止。',
+        'guest-agent-receipt-invalid': '剪贴板组件的核验记录没有通过复核，已停止。',
         'runtime-preparation-failed': '准备受保护启动环境失败。',
         'internal-error': '内部检查出现意外错误；已保留现场。',
       };

@@ -42,6 +42,17 @@ GVPROXY_IDENTIFIER = 'gvproxy'
 GVPROXY_SHA256 = '45881c33400a14c4c50d4ed7e814b69a60248aa0d78e9b541e879edc05346a85'
 GVPROXY_SIZE = 27024976
 _GVPROXY_PAYLOAD = 'podman.pkg/Payload/podman/bin/gvproxy'
+# tart-guest-agent v0.15.0: the release's universal command-line binary, signed
+# by Cirrus Labs (Tart's team) and notarized. It is put into a new VM's
+# read-only installers folder; the person sets up only its clipboard component
+# inside the guest. The host never runs it.
+GUEST_AGENT_VERSION = '0.15.0'
+GUEST_AGENT_TEAM = TART_TEAM
+GUEST_AGENT_IDENTIFIER = 'tart-guest-agent'
+GUEST_AGENT_MAX_BYTES = 64 * 1024 * 1024
+# The binary plus at most these release documents, kept only as data.
+_GUEST_AGENT_DOCUMENTS = ('LICENSE', 'LICENSE.md', 'README.md', 'CHANGELOG.md')
+_GUEST_AGENT_DOCUMENT_BYTES = 256 * 1024
 MAX_ENTRIES = 20000
 MAX_EXPANDED_BYTES = 512 * 1024 * 1024
 MAX_FILE_BYTES = 256 * 1024 * 1024
@@ -673,15 +684,28 @@ def _reviewed_podman_spec():
     return host_artifacts.SPECS['podman-installer']
 
 
+def _reviewed_guest_agent_spec():
+    return host_artifacts.SPECS['tart-guest-agent']
+
+
+# Looked up by name at call time, so a single reviewed pin stays the only source.
+_ARCHIVE_SOURCES = {
+    'tart': ('_reviewed_tart_spec', 'reviewed-tart-receipt-required'),
+    'podman-installer': ('_reviewed_podman_spec', 'reviewed-podman-receipt-required'),
+    'tart-guest-agent': ('_reviewed_guest_agent_spec', 'reviewed-guest-agent-receipt-required'),
+}
+
+
 @contextmanager
 def _archive_source(receipt, key='tart'):
     _need(type(receipt) is host_artifacts.Receipt, 'host-artifact-receipt-required')
-    spec = _reviewed_tart_spec() if key == 'tart' else _reviewed_podman_spec()
+    reviewed, refused = _ARCHIVE_SOURCES[key]
+    spec = globals()[reviewed]()
     _need(receipt.spec_key == key and receipt.spec_sha256 == spec.spec_sha256
           and receipt.version == spec.version and receipt.sha256 == spec.sha256
           and receipt.size_bytes == spec.size_bytes and receipt.digest_verified is True
           and receipt.quarantine_ensured is True and receipt.native_execution_approved is False,
-          'reviewed-tart-receipt-required' if key == 'tart' else 'reviewed-podman-receipt-required')
+          refused)
     path = _path(receipt.artifact_path)
     _private_root(path.parent)
     _need(path.name == spec.filename and path.parent.name == receipt.attempt_id
@@ -924,3 +948,155 @@ def ensure_gvproxy(private_tools_root, *, artifact_receipt):
         raise
     except Exception:
         raise HostToolError('gvproxy-preparation-failed') from None
+
+
+@dataclasses.dataclass(frozen=True)
+class GuestAgentReceipt:
+    executable_path: Path
+    receipt_path: Path
+    version: str
+    team_id: str
+    executable_sha256: str
+    archive_sha256: str
+    notarized: bool
+    documents: tuple = ()
+    execution_performed: bool = False
+
+
+def _guest_agent_plan(archive, deadline):
+    """Only top-level regular files: the binary and at most the listed release documents."""
+    members, count = {}, 0
+    for member in archive:
+        _need(time.monotonic() < deadline, 'tar-deadline-exceeded')
+        count += 1
+        _need(count <= 1 + len(_GUEST_AGENT_DOCUMENTS), 'unexpected-guest-agent-archive')
+        name = member.name
+        _need(name == GUEST_AGENT_IDENTIFIER or name in _GUEST_AGENT_DOCUMENTS, 'unexpected-guest-agent-archive')
+        _need(name not in members, 'duplicate-tar-path')
+        _need(member.type in (tarfile.REGTYPE, tarfile.AREGTYPE), 'unsupported-tar-member')
+        _need(not member.sparse and not any(k.startswith('GNU.sparse') for k in member.pax_headers),
+              'sparse-tar-refused')
+        _need(set(member.pax_headers) <= {'path', 'mtime', 'atime', 'ctime', 'size'}, 'unsupported-tar-metadata')
+        _need(not member.mode & 0o7022, 'unsafe-tar-mode')
+        if name == GUEST_AGENT_IDENTIFIER:
+            _need(0 < member.size <= GUEST_AGENT_MAX_BYTES, 'tar-file-too-large')
+        else:
+            _need(0 < member.size <= _GUEST_AGENT_DOCUMENT_BYTES and not member.mode & 0o111,
+                  'invalid-guest-agent-document')
+        members[name] = member
+    _need(GUEST_AGENT_IDENTIFIER in members, 'guest-agent-binary-required')
+    return members
+
+
+def _tar_bytes(archive, member, deadline):
+    source = archive.extractfile(member)
+    _need(source is not None, 'tar-file-missing')
+    with source:
+        chunks, total = [], 0
+        while True:
+            _need(time.monotonic() < deadline, 'tar-deadline-exceeded')
+            chunk = source.read(min(1024 * 1024, member.size - total + 1))
+            if not chunk:
+                break
+            total += len(chunk)
+            _need(total <= member.size, 'tar-size-mismatch')
+            chunks.append(chunk)
+    _need(total == member.size, 'tar-size-mismatch')
+    return b''.join(chunks)
+
+
+def verify_guest_agent(binary):
+    """Static Developer ID and notarization assessment of tart-guest-agent; never runs it."""
+    binary = _path(binary)
+    before = _digest(binary, cap=GUEST_AGENT_MAX_BYTES)
+    architectures = _tool(['/usr/bin/lipo', '-archs', str(binary)]).stdout.decode('ascii').split()
+    _need('arm64' in architectures and set(architectures) <= {'arm64', 'arm64e', 'x86_64'}, 'arm64-required')
+    requirement = ('=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists '
+                   'and certificate leaf[field.1.2.840.113635.100.6.1.13] exists '
+                   'and certificate leaf[subject.OU] = "%s" and identifier "%s"'
+                   % (GUEST_AGENT_TEAM, GUEST_AGENT_IDENTIFIER))
+    _tool(['/usr/bin/codesign', '--verify', '--strict', '-R', requirement, str(binary)])
+    display = _tool(['/usr/bin/codesign', '--display', '--verbose=4', str(binary)])
+    signature = (display.stdout + display.stderr).decode('utf-8', 'replace')
+    _need(re.findall(r'^TeamIdentifier=(.+)$', signature, re.M) == [GUEST_AGENT_TEAM]
+          and re.findall(r'^Identifier=(.+)$', signature, re.M) == [GUEST_AGENT_IDENTIFIER]
+          and re.findall(r'^Authority=Developer ID Application: (.+)$', signature, re.M)
+          in ([f'Cirrus Labs, Inc. ({GUEST_AGENT_TEAM})'], [f'Cirrus Labs Inc. ({GUEST_AGENT_TEAM})']),
+          'guest-agent-signing-identity-mismatch')
+    # Standalone code, assessed the way Gatekeeper treats a command-line tool.
+    assessment = _tool(['/usr/sbin/spctl', '--assess', '--type', 'open', '--context',
+                        'context:primary-signature', '-vv', str(binary)])
+    verdict = (assessment.stdout + assessment.stderr).decode('utf-8', 'replace')
+    _need(re.search(r': accepted\s*$', verdict, re.M)
+          and re.search(r'^source=Notarized Developer ID\s*$', verdict, re.M)
+          and re.search(r'^origin=Developer ID Application: Cirrus Labs,? Inc\. \(%s\)\s*$' % GUEST_AGENT_TEAM,
+                        verdict, re.M),
+          'guest-agent-notarization-required')
+    _need(_digest(binary, cap=GUEST_AGENT_MAX_BYTES) == before, 'guest-agent-changed-during-verification')
+    return before
+
+
+def ensure_guest_agent(private_tools_root, *, artifact_receipt):
+    """Take tart-guest-agent from its pinned release archive; never install or run it.
+
+    The archive's quarantine is propagated onto the binary, so macOS in the
+    guest still assesses it when it is first run there. The copy is 0600.
+    """
+    try:
+        root = _attempt(private_tools_root, 'guest-agent-tool')
+        binary = root / GUEST_AGENT_IDENTIFIER
+        with _archive_source(artifact_receipt, 'tart-guest-agent') as (archive_path, stream, archive_sha):
+            deadline = time.monotonic() + 900
+            with gzip.GzipFile(fileobj=stream, mode='rb') as expanded:
+                bounded = _BoundedTarIO(expanded, deadline)
+                with tarfile.open(fileobj=bounded, mode='r:') as archive:
+                    plan = _guest_agent_plan(archive, deadline)
+                    contents = {name: _tar_bytes(archive, member, deadline) for name, member in plan.items()}
+            documents = tuple(sorted(name for name in contents if name != GUEST_AGENT_IDENTIFIER))
+            for name in documents:
+                _write(root / name, contents[name])
+            _write(binary, contents[GUEST_AGENT_IDENTIFIER])
+            quarantine_policy.propagate(archive_path, binary)
+        digest = verify_guest_agent(binary)
+        receipt = GuestAgentReceipt(binary, root / 'guest-agent.json', GUEST_AGENT_VERSION, GUEST_AGENT_TEAM,
+                                    digest, archive_sha, True, documents)
+        value = dataclasses.asdict(receipt)
+        for key in ('executable_path', 'receipt_path'):
+            value[key] = str(value[key])
+        value['documents'] = list(documents)
+        _write(receipt.receipt_path, _json(value))
+        return receipt
+    except HostToolError:
+        raise
+    except Exception:
+        raise HostToolError('guest-agent-preparation-failed') from None
+
+
+def load_guest_agent(receipt_path):
+    """Re-verify a receipt written by ensure_guest_agent in the same private tools root."""
+    try:
+        candidate = Path(os.fspath(receipt_path))
+        _need(candidate.name == 'guest-agent.json'
+              and re.fullmatch(r'guest-agent-tool-[0-9a-f]{32}', candidate.parent.name), 'invalid-guest-agent-receipt')
+        path = _path(candidate)
+        _private_root(path.parent.parent)
+        value = json.loads(_read(path, private=True))
+        binary = path.parent / GUEST_AGENT_IDENTIFIER
+        _need(type(value) is dict and set(value) == {f.name for f in dataclasses.fields(GuestAgentReceipt)}
+              and value['executable_path'] == str(binary) and value['receipt_path'] == str(path)
+              and value['version'] == GUEST_AGENT_VERSION and value['team_id'] == GUEST_AGENT_TEAM
+              and value['archive_sha256'] == _reviewed_guest_agent_spec().sha256
+              and value['notarized'] is True and value['execution_performed'] is False
+              and type(value['documents']) is list
+              and all(name in _GUEST_AGENT_DOCUMENTS for name in value['documents'])
+              and value['documents'] == sorted(set(value['documents'])), 'invalid-guest-agent-receipt')
+        quarantine_policy.read(binary)  # Its download origin must still be there.
+        _need(verify_guest_agent(binary) == value['executable_sha256'], 'guest-agent-changed')
+        for name in value['documents']:
+            _read(path.parent / name, cap=_GUEST_AGENT_DOCUMENT_BYTES, private=True)
+        return GuestAgentReceipt(binary, path, value['version'], value['team_id'], value['executable_sha256'],
+                                 value['archive_sha256'], True, tuple(value['documents']))
+    except HostToolError:
+        raise
+    except Exception:
+        raise HostToolError('guest-agent-receipt-invalid') from None

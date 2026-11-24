@@ -58,19 +58,151 @@ INSTALLERS_NOTE = """首次设置用的安装文件（只读，只在首次设�
    一个一个拖到客机桌面，再从桌面一个一个拖进「应用程序」。
    不要从这个共享文件夹直接拖进「应用程序」，也不要在共享文件夹里打开应用。
    安装完后，只打开「应用程序」里的副本。
-2. 打开「应用程序」里的 Clash Verge。macOS 提示这是从互联网下载的应用时，选「打开」。
-3. 导入节点：在 Clash Verge 左侧点「订阅」，点「新建」，类型选「本地」，点「选择文件」，
+2. 开启剪贴板共享：打开这里的「剪贴板共享」文件夹，双击「安装剪贴板共享.command」，
+   等终端窗口显示结果后按回车关闭。不需要管理员密码。装好后宿主和客机可以互相复制粘贴文字。
+3. 打开「应用程序」里的 Clash Verge。macOS 提示这是从互联网下载的应用时，选「打开」。
+4. 导入节点：在 Clash Verge 左侧点「订阅」，点「新建」，类型选「本地」，点「选择文件」，
    选这个文件夹里的「Clash 节点配置.yaml」，再点「保存」。然后点一下新出现的订阅，让它处于使用中。
-4. 在 Clash Verge 的「设置」里打开「虚拟网卡模式」，按提示安装系统服务并输入你的管理员密码。
-5. 确认代理已启用后，从「应用程序」打开 CCBaga A，点「浏览器环境」进行检测。
+5. 在 Clash Verge 的「设置」里打开「虚拟网卡模式」，按提示安装系统服务并输入你的管理员密码。
+6. 确认代理已启用后，从「应用程序」打开 CCBaga A，点「浏览器环境」进行检测。
    点「电脑环境」可快速对齐时区；如不需要定位，可在客机的「系统设置 → 隐私与安全性 → 定位服务」中关闭定位。
-6. 调整后重新检测，直到 CCBaga A 的检测项全部变绿。再用客机浏览器打开 https://ip.net.coffee/claude/，
+7. 调整后重新检测，直到 CCBaga A 的检测项全部变绿。再用客机浏览器打开 https://ip.net.coffee/claude/，
    确认评分达到 70 分或以上，且本次检测未报告 IP 或 DNS 泄露。这是第三方自检，不代表 Claude 官方准入或账户资格。
    不要在检测网页输入账户密码、节点凭据或支付信息。
-7. 自检通过后可打开 Claude Code，按提示在 Claude 官方页面注册或登录；免费账户、Claude Code 使用权限和套餐升级以官方页面显示为准。
-8. 确认 Clash 已通过节点联网后，在客机里正常关机，回到 Gold VM 管理器，点「标记首次设置完成…」。
+8. 自检通过后可打开 Claude Code，按提示在 Claude 官方页面注册或登录；免费账户、Claude Code 使用权限和套餐升级以官方页面显示为准。
+9. 确认 Clash 已通过节点联网后，在客机里正常关机，回到 Gold VM 管理器，点「标记首次设置完成…」。
    之后每次启动都受保护，客机只能连到你的节点，这个文件夹也不再出现。
 """
+# Inside the installers folder: tart-guest-agent, a generated script that sets
+# up only its clipboard component for the guest account, and a note.
+CLIPBOARD_FOLDER = '剪贴板共享'
+CLIPBOARD_SCRIPT = '安装剪贴板共享.command'
+CLIPBOARD_NOTE_NAME = '说明.txt'
+CLIPBOARD_AGENT = 'tart-guest-agent'
+CLIPBOARD_LABEL = 'org.goldvm.clipboard-agent'
+CLIPBOARD_NOTE = """剪贴板共享（tart-guest-agent 0.15.0 的剪贴板组件）
+
+安装：首次设置期间，在这个文件夹里双击「安装剪贴板共享.command」。不需要管理员密码，不联网。
+它只把 tart-guest-agent 复制到你账户的「资源库/Application Support/GoldClipboard」，
+并添加一个只运行剪贴板组件（--run-vdagent）的登录项。macOS 可能提示「已添加后台项目」，这是正常的。
+
+装好后，VM 运行期间宿主和这台客机可以互相复制粘贴文字：宿主上复制的内容可能出现在客机里，反过来也一样。
+复制密码、节点资料等敏感内容前请留意。传文件请继续用共享文件夹。
+
+卸载：在客机「终端」里依次运行
+launchctl bootout gui/$(id -u)/org.goldvm.clipboard-agent
+rm ~/Library/LaunchAgents/org.goldvm.clipboard-agent.plist
+rm -r ~/Library/Application\\ Support/GoldClipboard ~/Library/Logs/GoldClipboard
+
+tart-guest-agent 由 Cirrus Labs 签名并经 Apple 公证，按 FSL-1.1-ALv2 许可发布：
+https://github.com/openai/tart-guest-agent/blob/main/LICENSE
+"""
+# Generated per VM with the verified digest. Plain bash/system tools only; no
+# network, no sudo, no xattr changes: a normal copy keeps the download origin,
+# so macOS still assesses the binary when launchd first runs it.
+CLIPBOARD_SCRIPT_TEMPLATE = r"""#!/bin/bash
+# Gold VM 管理器生成：开启这台客机和宿主之间的剪贴板共享。
+# 只安装 tart-guest-agent 的剪贴板组件（--run-vdagent），作为当前账户的登录项运行。
+# 不需要管理员密码，不联网，不改系统设置。卸载方法见同一文件夹里的「说明.txt」。
+set -u
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+EXPECTED_SHA256='@SHA256@'
+TEAM='@TEAM@'
+LABEL='@LABEL@'
+SHARE_COPY='/Volumes/My Shared Files/gold-installers/@FOLDER@/@AGENT@'
+HERE="$(cd "$(dirname "$0")" 2>/dev/null && pwd -P)"
+DEST_DIR="$HOME/Library/Application Support/GoldClipboard"
+DEST="$DEST_DIR/@AGENT@"
+LOG_DIR="$HOME/Library/Logs/GoldClipboard"
+AGENTS="$HOME/Library/LaunchAgents"
+PLIST="$AGENTS/$LABEL.plist"
+DOMAIN="gui/$(id -u)"
+
+finish() {
+  echo
+  read -r -p "按回车键关闭这个窗口。" _
+  exit "$1"
+}
+fail() {
+  echo
+  echo "没有安装：$1"
+  finish 1
+}
+digest() {
+  shasum -a 256 "$1" | awk '{print $1}'
+}
+
+echo "正在安装剪贴板共享……"
+[ "$(id -u)" != "0" ] || fail "请直接双击运行，不要用 sudo。"
+[ "$(uname -m)" = "arm64" ] || fail "这台客机不是 Apple 芯片的 macOS。"
+SOURCE="$HERE/@AGENT@"
+[ -f "$SOURCE" ] || SOURCE="$SHARE_COPY"
+{ [ -f "$SOURCE" ] && [ ! -L "$SOURCE" ]; } || fail "找不到 gold-installers 里的 @AGENT@。请在首次设置期间直接双击共享文件夹里的这个脚本。"
+[ "$(digest "$SOURCE")" = "$EXPECTED_SHA256" ] || fail "@AGENT@ 和管理器核验过的文件不一致。"
+REQUIREMENT="=anchor apple generic and certificate leaf[subject.OU] = \"$TEAM\" and identifier \"@AGENT@\""
+codesign --verify --strict -R "$REQUIREMENT" "$SOURCE" >/dev/null 2>&1 || fail "@AGENT@ 的签名没有通过核对。"
+
+mkdir -p "$DEST_DIR" "$LOG_DIR" "$AGENTS" || fail "无法创建安装目录。"
+chmod 700 "$DEST_DIR"
+launchctl bootout "$DOMAIN/$LABEL" >/dev/null 2>&1
+TMP="$DEST_DIR/.@AGENT@.$$"
+rm -f "$TMP" "$PLIST.tmp"
+cp "$SOURCE" "$TMP" || fail "复制 @AGENT@ 失败。"
+chmod 755 "$TMP"
+[ "$(digest "$TMP")" = "$EXPECTED_SHA256" ] || { rm -f "$TMP"; fail "复制后的文件不一致。"; }
+mv -f "$TMP" "$DEST" || fail "复制 @AGENT@ 失败。"
+
+cat > "$PLIST.tmp" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>$LABEL</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>$DEST</string>
+		<string>--run-vdagent</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>$LOG_DIR/agent.log</string>
+	<key>StandardErrorPath</key>
+	<string>$LOG_DIR/agent.log</string>
+</dict>
+</plist>
+PLIST
+plutil -lint -s "$PLIST.tmp" >/dev/null 2>&1 || { rm -f "$PLIST.tmp"; fail "生成的登录项配置无效。"; }
+mv -f "$PLIST.tmp" "$PLIST" || fail "无法写入登录项配置。"
+launchctl bootstrap "$DOMAIN" "$PLIST" >/dev/null 2>&1 || fail "macOS 没有加载剪贴板服务。请在「系统设置 → 通用 → 登录项与扩展」里确认它没有被关闭，再运行一次。"
+sleep 2
+echo
+if launchctl print "$DOMAIN/$LABEL" 2>/dev/null | grep -q "state = running"; then
+  if [ -e /dev/cu.com.redhat.spice.0 ]; then
+    echo "已开启。在宿主上复制一段文字，到客机里粘贴试试；反过来也可以。"
+  else
+    echo "已安装，但这次启动没有剪贴板通道。下次用 Gold VM 管理器正常启动后自动生效。"
+  fi
+else
+  echo "已安装，但剪贴板服务没有保持运行。请查看 ~/Library/Logs/GoldClipboard/agent.log，或注销后重新登录再试。"
+fi
+echo "macOS 可能提示「已添加后台项目」，这是正常的。"
+finish 0
+"""
+
+
+def clipboard_script(agent_sha256):
+    """The guest-side installer for one verified agent digest."""
+    _need(type(agent_sha256) is str and re.fullmatch('[0-9a-f]{64}', agent_sha256), 'invalid-guest-agent-digest')
+    text = CLIPBOARD_SCRIPT_TEMPLATE
+    for key, value in (('@SHA256@', agent_sha256), ('@TEAM@', '9M2P8L4D89'), ('@LABEL@', CLIPBOARD_LABEL),
+                       ('@FOLDER@', CLIPBOARD_FOLDER), ('@AGENT@', CLIPBOARD_AGENT)):
+        text = text.replace(key, value)
+    _need('@' not in text, 'clipboard-script-template-incomplete')
+    return text
 
 
 class OneClickError(ValueError):
@@ -214,6 +346,7 @@ def capabilities():
             'source_prerequisites': prerequisites,
             'limitations': ['下载/复制失败保留材料，不自动续传或覆盖重试。',
                             '不往客机磁盘写任何东西。首次设置另行确认，使用普通网络（不经过滤），并挂一个只读文件夹，里面是核验过的 4 个应用和节点配置，由你在客机里用 Finder 安装、在 Clash 里导入。',
+                            '新 VM 默认和宿主共享剪贴板（文字，双向）：安装文件夹里有核验过的 tart-guest-agent 和安装脚本，由你在首次设置时双击安装；恢复模式不共享。',
                             '确认 Clash 连上节点后由你标记首次设置完成；之后每次启动都受保护，网络后端 gvproxy 取自 Podman 官方安装包（Red Hat 签名、已公证，不安装 Podman），保留隔离属性，由 macOS 自行核验。',
                             '系统设置、应用安装、节点导入和 VPN 连通都没有自动验收；未提供真实节点不能验收连通。']}
 
@@ -429,6 +562,9 @@ class NativeServices:
         # Only gvproxy is taken from Podman's notarized installer; Podman itself is never installed.
         backend_package = host_artifacts.acquire('podman-installer', c.state / 'host-materials', **options)
         self.backend = host_tools.ensure_gvproxy(c.state / 'tools', artifact_receipt=backend_package)
+        # tart-guest-agent for the installers folder: only its clipboard part is set up, in the guest.
+        agent_archive = host_artifacts.acquire('tart-guest-agent', c.state / 'host-materials', **options)
+        self.guest_agent = host_tools.ensure_guest_agent(c.state / 'tools', artifact_receipt=agent_archive)
         if request['ipsw'] == 'reviewed':
             self.ipsw = host_artifacts.acquire('ipsw', c.state / 'host-materials', **options)
         else:
@@ -476,8 +612,12 @@ class NativeServices:
               'backend-path-mismatch')
         quarantine = _quarantine(path)
         _need(quarantine is not None, 'deferred-backend-quarantine-missing')
+        agent = Path(self.guest_agent.receipt_path)
+        _need(re.fullmatch(r'guest-agent-tool-[0-9a-f]{32}', agent.parent.name)
+              and agent == c.state / 'tools' / agent.parent.name / 'guest-agent.json', 'guest-agent-path-mismatch')
         return {'applications': self.material_attempt_id, 'backend': tool, 'backend_stamp': list(_stamp(path)),
-                'backend_quarantine': _qhash(quarantine), 'tart': registry.read_private(c.state / 'tart-tool.json')}
+                'backend_quarantine': _qhash(quarantine), 'tart': registry.read_private(c.state / 'tart-tool.json'),
+                'guest_agent': agent.parent.name}
 
     def load_deferred_materials(self, value):
         import host_artifacts
@@ -486,7 +626,8 @@ class NativeServices:
         from preinstall_runtime import _verified_backend, _qhash, _quarantine
         from types import SimpleNamespace
         c = self.context
-        _need(type(value) is dict and set(value) == {'applications','backend','backend_stamp','backend_quarantine','tart'}
+        keys = {'applications', 'backend', 'backend_stamp', 'backend_quarantine', 'tart'}
+        _need(type(value) is dict and set(value) in (keys, keys | {'guest_agent'})
               and type(value['tart']) is dict and value['tart'] == registry.read_private(c.state / 'tart-tool.json')
               and type(value['backend']) is str and re.fullmatch(r'gvproxy-(tool-)?[0-9a-f]{32}', value['backend']),
               'deferred-material-record-mismatch')
@@ -506,6 +647,14 @@ class NativeServices:
             _need(q is not None and _qhash(q) == value['backend_quarantine'] and list(_stamp(path)) == value['backend_stamp'],
                   'deferred-backend-quarantine-changed')
             self.backend = SimpleNamespace(executable_path=path)
+        if 'guest_agent' in value:
+            _need(type(value['guest_agent']) is str
+                  and re.fullmatch(r'guest-agent-tool-[0-9a-f]{32}', value['guest_agent']), 'deferred-material-record-mismatch')
+            self.guest_agent = host_tools.load_guest_agent(c.state / 'tools' / value['guest_agent'] / 'guest-agent.json')
+        else:
+            # Paused by a build without the clipboard agent: take the pinned one now.
+            archive = host_artifacts.acquire('tart-guest-agent', c.state / 'host-materials')
+            self.guest_agent = host_tools.ensure_guest_agent(c.state / 'tools', artifact_receipt=archive)
         self.materials = MaterialManager(c.state / 'application-materials').load(value['applications'])
 
     def restore(self, request, update):
@@ -571,14 +720,14 @@ class NativeServices:
         c = self.context
         registry.private_dir(c.base.parent)
         installers = c.jobdir / 'installers'
-        update('preparing_runtime', '正在准备首次设置用的只读文件夹：复核 4 个应用并复制，写入节点配置；不往客机磁盘写入。')
-        build_installers(installers, self.materials, stored.private_config)
+        update('preparing_runtime', '正在准备首次设置用的只读文件夹：复核 4 个应用和剪贴板组件并复制，写入节点配置；不往客机磁盘写入。')
+        build_installers(installers, self.materials, stored.private_config, self.guest_agent)
         update('preparing_runtime', '绑定受保护启动环境；不启动网络后端或 VM。')
         return prepare_environment(request['name'], c.stage / 'config.json', c.base,
                                    published_vm_config=c.tart_home / 'vms' / request['name'] / 'config.json',
                                    private_config=stored.private_config, endpoints=stored.endpoints,
                                    gvproxy_path=Path(self.backend.executable_path), tart_path=self.tart.executable_path,
-                                   installers=installers)
+                                   installers=installers, share_clipboard=True)
 
     def publish(self, request, update):
         return publish_fresh(self.context, request, update)
@@ -602,22 +751,48 @@ def _clone(source, target):
     _need(result.returncode == 0, 'installer-copy-failed')
 
 
-def _write_shared(path, raw):
-    """A new 0644 file: readable by the guest user whatever its UID."""
+def _write_shared(path, raw, mode=0o644):
+    """A new 0644 (or 0755) file: readable by the guest user whatever its UID."""
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
         view = memoryview(raw)
         while view:
             view = view[os.write(fd, view):]
-        os.fchmod(fd, 0o644)
+        os.fchmod(fd, mode)
         os.fsync(fd)
     finally:
         os.close(fd)
 
 
-def build_installers(target, materials, private_config):
+def _build_clipboard_folder(folder, guest_agent):
+    """tart-guest-agent (re-verified, download origin kept), its release documents,
+    the generated installer script and a note. Nothing is run or installed here."""
+    import host_tools
+    import quarantine_policy
+    agent = host_tools.load_guest_agent(guest_agent.receipt_path)
+    _need(agent.executable_sha256 == guest_agent.executable_sha256
+          and Path(agent.executable_path) == Path(guest_agent.executable_path), 'guest-agent-changed')
+    source = Path(agent.executable_path)
+    raw = source.read_bytes()
+    _need(hashlib.sha256(raw).hexdigest() == agent.executable_sha256, 'guest-agent-changed')
+    folder.mkdir(mode=0o700)
+    copy = folder / CLIPBOARD_AGENT
+    _write_shared(copy, raw)
+    quarantine_policy.propagate(source, copy)
+    _need(quarantine_policy.read(copy) == quarantine_policy.read(source), 'installer-quarantine-mismatch')
+    _need(hashlib.sha256(copy.read_bytes()).hexdigest() == agent.executable_sha256, 'installer-copy-mismatch')
+    for name in agent.documents:
+        _write_shared(folder / name, (source.parent / name).read_bytes())
+    _write_shared(folder / CLIPBOARD_SCRIPT, clipboard_script(agent.executable_sha256).encode('utf-8'), 0o755)
+    _write_shared(folder / CLIPBOARD_NOTE_NAME, CLIPBOARD_NOTE.encode('utf-8'))
+    registry.sync_directory(folder)
+    os.chmod(str(folder), 0o755)
+
+
+def build_installers(target, materials, private_config, guest_agent=None):
     """Build the read-only first-setup folder at a new path: the 4 verified apps,
-    the Clash profile and a short note. Nothing is installed or executed.
+    the Clash profile, a short note and, with guest_agent, the clipboard folder.
+    Nothing is installed or executed.
 
     The sources are verified again here (signature, notarization, quarantine and
     tree digest); each copy must match its source's verified tree and quarantine.
@@ -629,6 +804,8 @@ def build_installers(target, materials, private_config):
     from preinstall_materials import verify_materials
     target = registry.safe_path(Path(target), False)
     _need(type(private_config) is dict and type(private_config.get('proxies')) is list, 'validated-private-config-required')
+    _need(guest_agent is None or type(getattr(guest_agent, 'executable_sha256', None)) is str,
+          'guest-agent-receipt-required')
     receipts = verify_materials(materials)
     trees = {app['name']: (app['bundle_tree_sha256'], app['bundle_bytes'], app['bundle_entries'])
              for receipt in receipts for app in receipt.apps}
@@ -642,6 +819,8 @@ def build_installers(target, materials, private_config):
     profile = json.dumps(private_config, ensure_ascii=False, indent=2, allow_nan=False) + '\n'
     _write_shared(target / INSTALLERS_PROFILE, profile.encode('utf-8'))
     _write_shared(target / INSTALLERS_README, INSTALLERS_NOTE.encode('utf-8'))
+    if guest_agent is not None:
+        _build_clipboard_folder(target / CLIPBOARD_FOLDER, guest_agent)
     registry.sync_directory(target)
     os.chmod(str(target), 0o755)
     return target

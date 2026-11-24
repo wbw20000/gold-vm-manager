@@ -81,6 +81,16 @@ SPECS = MappingProxyType({
         'tart.tar.gz', 'publisher-github-release-digest',
         'https://api.github.com/repos/openai/tart/releases/tags/2.41.1',
         ('release-assets.githubusercontent.com',)),
+    # Only its clipboard component (--run-vdagent) is configured, by the person,
+    # inside a guest. The host never runs it. The same digest is in the
+    # publisher's Homebrew formula (openai/homebrew-tools, tart-guest-agent.rb).
+    'tart-guest-agent': Spec(
+        'tart-guest-agent', '0.15.0',
+        'https://github.com/openai/tart-guest-agent/releases/download/v0.15.0/tart-guest-agent-darwin-all.tar.gz',
+        10057123, 'eb47f402f18e742a8ea96344115ca776179f9c4c67494bc0c46a10a68db280b7',
+        'tart-guest-agent-darwin-all.tar.gz', 'publisher-github-release-digest',
+        'https://api.github.com/repos/openai/tart-guest-agent/releases/tags/v0.15.0',
+        ('release-assets.githubusercontent.com',)),
     'ipsw': Spec(
         'ipsw', '26.6.2/25G83',
         'https://updates.cdn-apple.com/2026SummerFCS/fullrestores/140-75212/'

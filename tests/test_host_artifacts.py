@@ -90,7 +90,14 @@ class HostArtifactTests(unittest.TestCase):
         self.quarantine.assert_not_called()
 
     def test_public_registry_pins_and_immutable_types(self):
-        self.assertEqual(set(REAL_SPECS), {'podman-installer', 'tart', 'ipsw'})
+        self.assertEqual(set(REAL_SPECS), {'podman-installer', 'tart', 'tart-guest-agent', 'ipsw'})
+        agent = REAL_SPECS['tart-guest-agent']
+        self.assertEqual((agent.version, agent.size_bytes, agent.filename),
+                         ('0.15.0', 10057123, 'tart-guest-agent-darwin-all.tar.gz'))
+        self.assertEqual(agent.sha256, 'eb47f402f18e742a8ea96344115ca776179f9c4c67494bc0c46a10a68db280b7')
+        self.assertEqual(agent.url, 'https://github.com/openai/tart-guest-agent/releases/download/'
+                                    'v0.15.0/tart-guest-agent-darwin-all.tar.gz')
+        self.assertEqual(agent.redirect_hosts, ('release-assets.githubusercontent.com',))
         podman = REAL_SPECS['podman-installer']
         self.assertEqual((podman.version, podman.size_bytes), ('6.2.0', 76730429))
         self.assertEqual(podman.sha256, 'b4628a29a4c70bbec757a84d0e429882d358cab18956a0017f99df74b37201a7')

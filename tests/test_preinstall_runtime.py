@@ -468,6 +468,78 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn('--net-fd=42', protected)
         self.assertFalse(any('gold-status' in arg or 'guest-status' in arg for arg in command + protected))
 
+    def test_vms_prepared_before_the_clipboard_agent_keep_no_clipboard_everywhere(self):
+        result = self.prepare()
+        self.assertIs(result['clipboard_shared'], False)
+        self.assertFalse((self.base / runtime.CLIPBOARD_NAME).exists())
+        self.assertFalse(runtime.clipboard_shared(self.base))
+        plan = SimpleNamespace(shares=[], arguments=[])
+        with mock.patch.object(launcher, 'BASE', self.base):
+            commands = [launcher.build_tart_command(self.name, None, plan, environment=self.meta(), first_setup=True),
+                        launcher.build_tart_command(self.name, 42, plan, environment=self.meta()),
+                        launcher.build_tart_command(self.name, 42, plan, recovery=True, environment=self.meta())]
+        for command in commands:
+            self.assertEqual(command.count('--no-clipboard'), 1)
+
+    def test_new_vm_shares_the_clipboard_on_normal_and_first_setup_starts_but_never_in_recovery(self):
+        result = self.prepare(share_clipboard=True)
+        self.assertIs(result['clipboard_shared'], True)
+        record = self.base / runtime.CLIPBOARD_NAME
+        self.assertEqual(json.loads(record.read_bytes()), {'version': 1, 'clipboard': 'shared'})
+        self.assertEqual(stat.S_IMODE(record.stat().st_mode), 0o600)
+        self.assertNotIn(runtime.CLIPBOARD_NAME, self.meta()['source_sha256'])  # Host-only record.
+        runtime.validate_environment(self.base)
+        plan = SimpleNamespace(shares=[{'name': 'data'}], arguments=['--dir=data:/fixture/user-data:ro'])
+        with mock.patch.object(launcher, 'BASE', self.base):
+            first = launcher.build_tart_command(self.name, None, plan, environment=self.meta(), first_setup=True)
+            protected = launcher.build_tart_command(self.name, 42, plan, environment=self.meta())
+            recovery = launcher.build_tart_command(self.name, 42, plan, recovery=True, environment=self.meta())
+        self.assertEqual(first[:3], [str(self.tart), 'run', self.name])
+        self.assertNotIn('--no-clipboard', first)
+        self.assertFalse(any(arg.startswith('--net') for arg in first))
+        self.assertEqual(protected[:4], [str(self.tart), 'run', self.name, '--net-fd=42'])
+        self.assertNotIn('--no-clipboard', protected)
+        self.assertIn('--dir=data:/fixture/user-data:ro', protected)
+        self.assertIn('--recovery', recovery)
+        self.assertIn('--no-clipboard', recovery)
+        self.assertFalse(any(arg.startswith('--dir=') for arg in recovery))
+        # Marking first setup finished changes the network, not the clipboard.
+        self.assertTrue(runtime.finish_first_setup(self.base))
+        self.assertTrue(runtime.clipboard_shared(self.base))
+
+    def test_any_other_clipboard_record_fails_closed_and_is_never_repaired(self):
+        self.prepare(share_clipboard=True)
+        record = self.base / runtime.CLIPBOARD_NAME
+        plan = SimpleNamespace(shares=[], arguments=[])
+        for raw in (b'{"version":1,"clipboard":"off"}', b'{"version":2,"clipboard":"shared"}', b'',
+                    b'{"version":1,"clipboard":"shared","x":1}', b'{"version":1,"version":1,"clipboard":"shared"}'):
+            with self.subTest(raw=raw):
+                record.chmod(0o600)
+                record.write_bytes(raw)
+                with self.assertRaisesRegex(runtime.RuntimePreparationError, '^invalid-clipboard-record$'):
+                    runtime.clipboard_shared(self.base)
+                with mock.patch.object(launcher, 'BASE', self.base), \
+                        self.assertRaisesRegex(runtime.RuntimePreparationError, '^invalid-clipboard-record$'):
+                    launcher.build_tart_command(self.name, 42, plan, environment=self.meta())
+                self.assertEqual(record.read_bytes(), raw)
+        record.write_bytes(b'{"version":1,"clipboard":"shared"}')
+        record.chmod(0o644)
+        with self.assertRaisesRegex(runtime.RuntimePreparationError, '^invalid-clipboard-record$'):
+            runtime.clipboard_shared(self.base)
+        record.unlink()
+        other = self.root / 'shared-elsewhere.json'
+        other.write_bytes(b'{"version":1,"clipboard":"shared"}')
+        other.chmod(0o600)
+        record.symlink_to(other)
+        with self.assertRaisesRegex(runtime.RuntimePreparationError, '^invalid-clipboard-record$'):
+            runtime.clipboard_shared(self.base)
+        shutil.rmtree(str(self.base))
+        for bad in (1, 'yes', None):
+            with self.subTest(choice=bad), \
+                    self.assertRaisesRegex(runtime.RuntimePreparationError, '^invalid-clipboard-choice$'):
+                self.prepare(share_clipboard=bad)
+            self.assertFalse(self.base.exists())  # Refused before anything is created.
+
     def first_setup_launch(self, *flags):
         self.run.side_effect = None
         self.run.return_value = SimpleNamespace(stdout=json.dumps([

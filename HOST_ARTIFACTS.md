@@ -20,7 +20,7 @@ receipt = import_local('ipsw', selected_file, private_cache_root,
                        deadline_seconds=86400)
 ```
 
-- `SPECS` is a read-only mapping of frozen `Spec` values. Only string keys `podman-installer`, `tart`, and `ipsw` are accepted. There is no URL, custom manifest, mutable registry, or `Spec` parameter in the acquisition API. Small test fixtures replace the module mapping **only inside tests**.
+- `SPECS` is a read-only mapping of frozen `Spec` values. Only string keys `podman-installer`, `tart`, `tart-guest-agent`, and `ipsw` are accepted. There is no URL, custom manifest, mutable registry, or `Spec` parameter in the acquisition API. Small test fixtures replace the module mapping **only inside tests**.
 - `Spec` exposes `key`, `version`, `url`, `size_bytes`, `sha256`, `filename`, `hash_provenance`, `review_source`, `redirect_hosts`, and computed `spec_sha256`.
 - `Progress` is frozen: `spec_key`, `attempt_id`, `phase`, `completed_bytes`, `total_bytes`. Phases: `download`, `import`, `verify`, `cache-verify`, `accepted`. Counts restart for the separate full-file disk-verification pass. Cache reuse emits `cache-verify`; no transfer is implied. Progress is throttled to about four callbacks per second, except phase boundaries/completion, to avoid flooding the UI during a 20 GB transfer. Callbacks run synchronously and must return promptly.
 - `cancelled()` must return an actual boolean. Cancellation/error keeps the attempt's bytes, never deletes them. `ArtifactError.code` is a stable safe code; `.attempt_id` identifies a locally generated attempt when one was created. Error text deliberately excludes URL responses, credentials, private source paths and exception causes. Transfer failures carry a fixed cause code instead of the generic `artifact-io-failed` when one applies (`download-timeout`, `download-connection-lost`, `download-connect-failed`, `download-dns-failed`, `download-tls-failed`, `download-network-unreachable`, `download-protocol-error`, `host-disk-full`).
@@ -35,12 +35,14 @@ receipt = import_local('ipsw', selected_file, private_cache_root,
 |---|---|---:|---|
 | `podman-installer` | 6.2.0 | 76,730,429 | Publisher GitHub release API digest |
 | `tart` | 2.41.1 | 22,959,557 | Publisher GitHub release API digest |
+| `tart-guest-agent` | 0.15.0 | 10,057,123 | Publisher GitHub release API digest; same value in the publisher's Homebrew formula |
 | `ipsw` | 26.6.2 / 25G83 | 19,772,231,540 | Reviewed local SHA of official HTTPS acquisition; **not an independently published Apple hash** |
 
 Public inputs and pins:
 
 - [Podman macOS installer](<https://github.com/podman-container-tools/podman/releases/download/v6.2.0/podman-installer-macos-arm64.pkg>), [review source](<https://api.github.com/repos/podman-container-tools/podman/releases/tags/v6.2.0>): `b4628a29a4c70bbec757a84d0e429882d358cab18956a0017f99df74b37201a7`. Only its gvproxy is used (see below).
 - [Tart archive](<https://github.com/openai/tart/releases/download/2.41.1/tart.tar.gz>), [review source](<https://api.github.com/repos/openai/tart/releases/tags/2.41.1>): `e680a734febccfce7d4e910c1f7f13fc3b00f19a181c945e2d746de3214c32c2`.
+- [tart-guest-agent archive](<https://github.com/openai/tart-guest-agent/releases/download/v0.15.0/tart-guest-agent-darwin-all.tar.gz>), [review source](<https://api.github.com/repos/openai/tart-guest-agent/releases/tags/v0.15.0>): `eb47f402f18e742a8ea96344115ca776179f9c4c67494bc0c46a10a68db280b7`. `host_tools.ensure_guest_agent` keeps only the top-level `tart-guest-agent` binary and at most `LICENSE`, `LICENSE.md`, `README.md`, `CHANGELOG.md` as data; anything else in the archive is refused. The binary must be a universal/arm64 Mach-O signed `Developer ID Application: Cirrus Labs, Inc. (9M2P8L4D89)` with identifier `tart-guest-agent` and assessed as `Notarized Developer ID`. Its quarantine is propagated and kept; the host never runs it. FSL-1.1-ALv2; it is fetched on your Mac at build time and not distributed with this source.
 - [Apple IPSW](<https://updates.cdn-apple.com/2026SummerFCS/fullrestores/140-75212/A2A24B94-1FC1-45A3-93F7-C51B02AF1F4D/UniversalMac_26.6.2_25G83_Restore.ipsw>): `885503b7f4b06609e9a512f2befd40f59730640a3f1233e3892d60affdd51c95`.
 
 The supplied authorized local IPSW was **stat'ed only** to obtain the exact size above. This implementation session did not hash, mount, execute, or read its contents. No private acquisition path is embedded in source or receipts. Public source/API URLs are provenance notes, never dynamic version discovery; changing `/latest` upstream does not change the pin.

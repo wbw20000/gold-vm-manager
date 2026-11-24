@@ -10,7 +10,7 @@
 
 > **我的使用记录（本人确认：2026-11-21）**：我现在就在用这台虚拟机跑 Claude Code。用 Pro 的 4 天没有被封；升级 Max 后，截至这次记录，用了 2 天，也没有被封。[我的使用分享 ↗](https://x.com/clarkwang258/status/2123747367639994757)
 >
-> **升级 Max 起的日历计数：第 <!-- max-days:start -->4<!-- max-days:end --> 天。** 数字每天按新加坡日期更新，不登录或查询我的 Claude 账号；上面那段是我本人确认过的记录。
+> **升级 Max 起的日历计数：第 <!-- max-days:start -->5<!-- max-days:end --> 天。** 数字每天按新加坡日期更新，不登录或查询我的 Claude 账号；上面那段是我本人确认过的记录。
 
 [![管理器实际界面：左侧选择虚拟机，右侧查看状态和操作](docs/media/manager-overview.png)](docs/media/manager-overview.png?raw=true)
 *实际界面，使用演示数据。点图可放大。*

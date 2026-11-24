@@ -34,7 +34,7 @@ import oneclick
 import vpn_store
 
 APP = 'gold-vm-manager'
-VERSION = '1.6.0'
+VERSION = '1.5.1'
 VPN_VALIDATE_PATH = '/api/preinstall/vpn/validate'
 # Cover JSON escaping for the 256 KiB input limit without raising other routes' caps.
 VPN_VALIDATE_MAX_WIRE = 6 * 256 * 1024 + 16384

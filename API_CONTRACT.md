@@ -27,7 +27,7 @@ POST /api/pick-directory `{vm:"gold"}` -> {ok:true,path:"/canonical/path"} OR {o
 
 POST /api/reveal-directory `{vm:"gold",share_id:"uuid"}` -> {ok:true} opens Finder for EXISTING configured share only. The manager does not offer a host Claude launch or command-copy action and does not read shared file contents.
 
-### New disk size and offline expansion (1.6)
+### New disk size and offline expansion (1.5.1)
 
 `disk_gib` on creation is a whole integer **30–1024** (default 50). In one-click preflight on one filesystem, allow disk + 12 GiB when reusing the cached, reviewed IPSW, otherwise disk + 32 GiB. With separate filesystems: disk + 2 GiB for VM storage and 10 / 30 GiB on the materials volume. Cache metadata is only a budgeting hint: image hashing and the native pre-create space check still run.
 

@@ -6,7 +6,7 @@
 
 在 Apple Silicon Mac 上创建独立的 macOS 虚拟机，在客机里使用 Claude Code。首次设置用普通网络；完成设置后，受保护启动只允许客机通过已配置的代理节点出站，不会在代理断开时自动直连。
 
-**[下载 v1.5.1 源码](https://github.com/wbw20000/gold-vm-manager/releases/tag/v1.5.1) · [填写 YAML](#下载并填写-yaml宿主-mac) · [创建窗口逐项点](#创建窗口逐项点) · [看 23 秒安装演示](docs/media/guest-install.gif?raw=true) · [装好后怎么用](#四个应用装好后怎么用客机) · [删除与重建](#删除与重建) · [English](README.en.md)**
+**[下载 v1.5.3 源码](https://github.com/wbw20000/gold-vm-manager/releases/tag/v1.5.3) · [填写 YAML](#下载并填写-yaml宿主-mac) · [创建窗口逐项点](#创建窗口逐项点) · [看 23 秒安装演示](docs/media/guest-install.gif?raw=true) · [装好后怎么用](#四个应用装好后怎么用客机) · [删除与重建](#删除与重建) · [English](README.en.md)**
 
 > **我的使用记录（本人确认：2026-11-21）**：我现在就在用这台虚拟机跑 Claude Code。用 Pro 的 4 天没有被封；升级 Max 后，截至这次记录，用了 2 天，也没有被封。[我的使用分享 ↗](https://x.com/clarkwang258/status/2123747367639994757)
 >
@@ -18,14 +18,14 @@
 ## 安装管理器（宿主 Mac）
 
 1. **先核对：**Apple Silicon、macOS **26.6.2**（当前验证版本）、Apple Command Line Tools 或 Xcode、系统 Python 3.9+ 和 Ruby/Psych。1.5.1 版新建磁盘可设 **30–1024 GiB**（整数，默认 50）。选 30 GiB、镜像和虚拟盘在同一卷时，复用镜像需 **42 GiB** 可用空间，下载或重新导入则需 **62 GiB**。30 GiB 盘后续的应用与系统更新空间较紧。旧版 1.5.0 要求最低 50 GiB、至少 82 GiB 可用空间。
-2. 在 [v1.5.1 发布页](https://github.com/wbw20000/gold-vm-manager/releases/tag/v1.5.1)下载 **Source code (zip)** 并解压。双击 [Install.command](Install.command)，或在源码目录运行 `./Install.command`。完成后，从 `~/Applications` 打开 **Gold VM 管理器**。
+2. 在 [v1.5.3 发布页](https://github.com/wbw20000/gold-vm-manager/releases/tag/v1.5.3)下载 **Source code (zip)** 并解压。双击 [Install.command](Install.command)，或在源码目录运行 `./Install.command`。完成后，从 `~/Applications` 打开 **Gold VM 管理器**。
 3. 这是**本地签名的源码构建**，不是 Apple 公证的成品安装包。安装器不覆盖已有 App，也不自动开机；不要关闭 Gatekeeper。另装新版本见[源码安装指南](SOURCE_INSTALL.md)。
 
 **打开后的第一屏：**在 Finder 的「前往 → 前往文件夹…」输入 `~/Applications`，双击 **Gold VM 管理器**。在「虚拟机控制台」看 **本机资源 → 可用磁盘**。右上角点 **新建 VM 及预装软件**；不要点旁边的「高级选项 → 仅安装 VM」，后者只生成系统暂存盘，不会发布可用的机器。左侧列表用于选择**已有**机器，不是创建入口。
 
 ## 下载并填写 YAML（宿主 Mac）
 
-1. **下载。** 在管理器点「新建 VM 及预装软件 → 下载 YAML 填写模板」，或打开 [GitHub 模板](examples/vpn/clash.yaml)，点右上角 **Download raw file（下载原始文件）**。[也可直接打开原始 YAML](https://raw.githubusercontent.com/wbw20000/gold-vm-manager/v1.5.1/examples/vpn/clash.yaml)；如果浏览器显示文本而没下载，按 `⌘S`。把文件存到仓库之外，命名为 `clash.local.yaml`，不要带 `.txt` 后缀。
+1. **下载。** 在管理器点「新建 VM 及预装软件 → 下载 YAML 填写模板」，或打开 [GitHub 模板](examples/vpn/clash.yaml)，点右上角 **Download raw file（下载原始文件）**。[也可直接打开原始 YAML](https://raw.githubusercontent.com/wbw20000/gold-vm-manager/v1.5.3/examples/vpn/clash.yaml)；如果浏览器显示文本而没下载，按 `⌘S`。把文件存到仓库之外，命名为 `clash.local.yaml`，不要带 `.txt` 后缀。
 2. **选协议。** 用纯文本编辑器打开文件，把 `proxies: []` 改为 `proxies:`。找到与你的节点协议一致的一组示例，只删除**那一组**每行开头的 `# `，保留剩下的空格缩进。不要把订阅链接粘进 `server`。
 3. **填节点服务商给你的值。** 例如 Trojan TLS/TCP 填好后的**格式**如下。`server` 是节点公网地址，`port` 是整数端口，`password` 是节点密码，`sni` 是服务商指定的 TLS 域名；以下全是占位值，不能直接连接。VLESS、TUIC 等请填模板里对应协议的字段，不要照搬 Trojan 密码栏。
 

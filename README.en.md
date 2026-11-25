@@ -6,7 +6,7 @@
 
 Run Claude Code in a dedicated macOS VM on an Apple Silicon Mac. First setup uses ordinary networking. After setup, Protected Start restricts outbound traffic to the configured proxy endpoints rather than falling back to a direct connection.
 
-**[Download v1.5.1 source](https://github.com/wbw20000/gold-vm-manager/releases/tag/v1.5.1) · [Watch the 23-second install guide](docs/media/guest-install.gif?raw=true) · [Download and fill in the YAML](#download-and-fill-in-the-yaml-host-mac) · [After installing the four apps](#after-installing-the-four-apps-guest) · [简体中文](README.md)**
+**[Download v1.5.3 source](https://github.com/wbw20000/gold-vm-manager/releases/tag/v1.5.3) · [Watch the 23-second install guide](docs/media/guest-install.gif?raw=true) · [Download and fill in the YAML](#download-and-fill-in-the-yaml-host-mac) · [After installing the four apps](#after-installing-the-four-apps-guest) · [简体中文](README.md)**
 
 > **My experience (last personally confirmed: 2026-11-21):** I use this VM for Claude Code. I used Pro for four days without a ban, then upgraded to Max. On my second day of Max, my account was still active. [Why I built this ↗](https://x.com/clarkwang258/status/2123747367639994757)
 >
@@ -20,12 +20,12 @@ Run Claude Code in a dedicated macOS VM on an Apple Silicon Mac. First setup use
 ## Install the manager (host Mac)
 
 1. **Check first:** Apple Silicon, macOS **26.6.2** (validated version), Apple Command Line Tools or Xcode, system Python 3.9+, and system Ruby with Psych. Version 1.5.1 accepts whole-number disk sizes from **30 to 1024 GiB**, default 50. For a 30 GiB guest on a single host volume, allow **42 GiB** free when reusing the reviewed IPSW cache, or **62 GiB** for a new download or local import. Small disks leave less room for apps and updates. The previous 1.5.0 release has a 50 GiB minimum and an 82 GiB preflight.
-2. On the [v1.5.1 release page](https://github.com/wbw20000/gold-vm-manager/releases/tag/v1.5.1), download **Source code (zip)** and extract it. Double-click [Install.command](Install.command) or run `./Install.command` from the source directory. Open **Gold VM 管理器** in `~/Applications`.
+2. On the [v1.5.3 release page](https://github.com/wbw20000/gold-vm-manager/releases/tag/v1.5.3), download **Source code (zip)** and extract it. Double-click [Install.command](Install.command) or run `./Install.command` from the source directory. Open **Gold VM 管理器** in `~/Applications`.
 3. This is a **locally ad-hoc signed source build**, not a notarized app download. It neither overwrites an existing app nor starts a VM. Leave Gatekeeper enabled. See [build options](SOURCE_INSTALL.md) for a side-by-side installation.
 
 ## Download and fill in the YAML (host Mac)
 
-1. **Download.** In **新建 VM 及预装软件** (Create VM and Prepare Apps), click **下载 YAML 填写模板**. Alternatively, open the [template on GitHub](examples/vpn/clash.yaml) and click **Download raw file** at the top right. If the [raw YAML](https://raw.githubusercontent.com/wbw20000/gold-vm-manager/v1.5.1/examples/vpn/clash.yaml) opens as text in your browser, press `⌘S`. Save it **outside the repository** as `clash.local.yaml`, not `.yaml.txt`.
+1. **Download.** In **新建 VM 及预装软件** (Create VM and Prepare Apps), click **下载 YAML 填写模板**. Alternatively, open the [template on GitHub](examples/vpn/clash.yaml) and click **Download raw file** at the top right. If the [raw YAML](https://raw.githubusercontent.com/wbw20000/gold-vm-manager/v1.5.3/examples/vpn/clash.yaml) opens as text in your browser, press `⌘S`. Save it **outside the repository** as `clash.local.yaml`, not `.yaml.txt`.
 2. **Choose a protocol.** Open the file in a plain-text editor. Change `proxies: []` to `proxies:`. Find the block matching your node's protocol and remove the leading `# ` from its configuration lines, keeping the indentation. Leave the other blocks commented. Do not paste a subscription URL into `server`.
 3. **Fill in your provider's values.** For Trojan TLS/TCP, `server` is your node's public address, `port` is its numeric port, `password` is the node password, and `sni` is the provider's TLS hostname. This example shows the structure only; its values cannot connect. For VLESS, TUIC or another protocol, use that protocol's fields instead.
 

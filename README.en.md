@@ -6,14 +6,14 @@
 
 Run Claude Code in a dedicated macOS VM on an Apple Silicon Mac. First setup uses ordinary networking. After setup, Protected Start restricts outbound traffic to the configured proxy endpoints rather than falling back to a direct connection.
 
-**[Download v1.5.3 source](https://github.com/wbw20000/gold-vm-manager/releases/tag/v1.5.3) · [Watch the 23-second install guide](docs/media/guest-install.gif?raw=true) · [Download and fill in the YAML](#download-and-fill-in-the-yaml-host-mac) · [After installing the four apps](#after-installing-the-four-apps-guest) · [简体中文](README.md)**
+**[Download v1.5.3 source](https://github.com/wbw20000/gold-vm-manager/releases/tag/v1.5.3) · [Watch the full walkthrough](docs/media/full-walkthrough.gif?raw=true) · [Download and fill in the YAML](#download-and-fill-in-the-yaml-host-mac) · [After installing the four apps](#after-installing-the-four-apps-guest) · [简体中文](README.md)**
 
 > **My experience (last personally confirmed: 2026-11-21):** I use this VM for Claude Code. I used Pro for four days without a ban, then upgraded to Max. On my second day of Max, my account was still active. [Why I built this ↗](https://x.com/clarkwang258/status/2123747367639994757)
 >
 > **Calendar day since my Max upgrade: <!-- max-days:start -->6<!-- max-days:end -->.** This counter follows the Singapore calendar. It does not sign in to Claude or verify my account status; the dated note above is my personal observation.
 
-[![The actual manager interface showing a VM list and controls](docs/media/manager-overview.png)](docs/media/manager-overview.png?raw=true)
-*Actual interface with demo data. Click to enlarge.*
+[![Create a macOS VM, install the four apps, import the YAML profile, and read a project file with Claude Code](docs/media/full-walkthrough.gif)](docs/media/full-walkthrough.gif?raw=true)
+*Illustrated walkthrough of v1.5.0 (1 min 58 s, in Chinese). The screens use demo data and show an example Claude response.*
 
 **Already installed and have your YAML?** Start at [Create your first VM](#create-your-first-vm-host-mac), then [install the apps inside it](#first-run-what-to-do-next). Already have a VM? Jump to [daily controls](#daily-controls-host-mac), [shared folders](#share-a-host-folder) or [rebuild and deletion](#rebuild-or-delete-a-vm).
 

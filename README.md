@@ -6,14 +6,14 @@
 
 在 Apple Silicon Mac 上创建独立的 macOS 虚拟机，在客机里使用 Claude Code。首次设置用普通网络；完成设置后，受保护启动只允许客机通过已配置的代理节点出站，不会在代理断开时自动直连。
 
-**[下载 v1.5.3 源码](https://github.com/wbw20000/gold-vm-manager/releases/tag/v1.5.3) · [填写 YAML](#下载并填写-yaml宿主-mac) · [创建窗口逐项点](#创建窗口逐项点) · [看 23 秒安装演示](docs/media/guest-install.gif?raw=true) · [装好后怎么用](#四个应用装好后怎么用客机) · [删除与重建](#删除与重建) · [English](README.en.md)**
+**[下载 v1.5.3 源码](https://github.com/wbw20000/gold-vm-manager/releases/tag/v1.5.3) · [填写 YAML](#下载并填写-yaml宿主-mac) · [创建窗口逐项点](#创建窗口逐项点) · [看全流程动图](docs/media/full-walkthrough.gif?raw=true) · [装好后怎么用](#四个应用装好后怎么用客机) · [删除与重建](#删除与重建) · [English](README.en.md)**
 
 > **我的使用记录（本人确认：2026-11-21）**：我现在就在用这台虚拟机跑 Claude Code。用 Pro 的 4 天没有被封；升级 Max 后，截至这次记录，用了 2 天，也没有被封。[我的使用分享 ↗](https://x.com/clarkwang258/status/2123747367639994757)
 >
 > **升级 Max 起的日历计数：第 <!-- max-days:start -->6<!-- max-days:end --> 天。** 数字每天按新加坡日期更新，不登录或查询我的 Claude 账号；上面那段是我本人确认过的记录。
 
-[![管理器实际界面：左侧选择虚拟机，右侧查看状态和操作](docs/media/manager-overview.png)](docs/media/manager-overview.png?raw=true)
-*实际界面，使用演示数据。点图可放大。*
+[![从新建 macOS 虚拟机、安装四个应用和导入 YAML，到用 Claude Code 读取项目文件](docs/media/full-walkthrough.gif)](docs/media/full-walkthrough.gif?raw=true)
+*基于 v1.5.0 的全流程示意，约 1 分 58 秒。画面使用演示数据，Claude 回复为示例。*
 
 ## 安装管理器（宿主 Mac）
 

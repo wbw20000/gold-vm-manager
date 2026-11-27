@@ -10,7 +10,7 @@ Run Claude Code in a dedicated macOS VM on an Apple Silicon Mac. First setup use
 
 > **My experience (last personally confirmed: 2026-11-21):** I use this VM for Claude Code. I used Pro for four days without a ban, then upgraded to Max. On my second day of Max, my account was still active. [Why I built this ↗](https://x.com/clarkwang258/status/2123747367639994757)
 >
-> **Calendar day since my Max upgrade: <!-- max-days:start -->7<!-- max-days:end -->.** This counter follows the Singapore calendar. It does not sign in to Claude or verify my account status; the dated note above is my personal observation.
+> **Calendar day since my Max upgrade: <!-- max-days:start -->8<!-- max-days:end -->.** This counter follows the Singapore calendar. It does not sign in to Claude or verify my account status; the dated note above is my personal observation.
 
 [![Create a macOS VM, install the four apps, import the YAML profile, and read a project file with Claude Code](docs/media/full-walkthrough.gif)](docs/media/full-walkthrough.gif?raw=true)
 *Illustrated walkthrough of v1.5.0 (1 min 58 s, in Chinese). The screens use demo data and show an example Claude response.*

@@ -1,19 +1,15 @@
 # Gold VM Manager
 
-**[加入 Gold VM 微信交流群](https://weixin.qq.com/g/AQYAAMoC6cPVM_wJbKwTY4TAaGCjDxIoHfW81qVt9QjcPD3nTesOm66syMumSJMb)** · 用微信扫一扫；手机上可长按识别。群邀请有有效期。
+在 Apple Silicon Mac 上为 Claude Code 创建一台独立的 macOS 虚拟机。需要处理 Mac 上的项目时，你可以选择要共享的项目目录，默认只读。
 
-<a href="docs/media/wechat-group.png?raw=true"><img src="docs/media/wechat-group.png" width="180" alt="Gold VM 微信交流群二维码，点开放大"></a>
-
-在 Apple Silicon Mac 上创建独立的 macOS 虚拟机，在客机里使用 Claude Code。首次设置用普通网络；完成设置后，受保护启动只允许客机通过已配置的代理节点出站，不会在代理断开时自动直连。
-
-**[下载 v1.5.3 源码](https://github.com/wbw20000/gold-vm-manager/releases/tag/v1.5.3) · [填写 YAML](#下载并填写-yaml宿主-mac) · [创建窗口逐项点](#创建窗口逐项点) · [看全流程动图](docs/media/full-walkthrough.gif?raw=true) · [装好后怎么用](#四个应用装好后怎么用客机) · [删除与重建](#删除与重建) · [English](README.en.md)**
-
-> **我的使用记录（本人确认：2026-11-21）**：我现在就在用这台虚拟机跑 Claude Code。用 Pro 的 4 天没有被封；升级 Max 后，截至这次记录，用了 2 天，也没有被封。[我的使用分享 ↗](https://x.com/clarkwang258/status/2123747367639994757)
->
-> **升级 Max 起的日历计数：第 <!-- max-days:start -->8<!-- max-days:end --> 天。** 数字每天按新加坡日期更新，不登录或查询我的 Claude 账号；上面那段是我本人确认过的记录。
+**[开始安装](#安装管理器宿主-mac)** · [下载 v1.5.3 源码](https://github.com/wbw20000/gold-vm-manager/releases/tag/v1.5.3) · [English](README.en.md)
 
 [![从新建 macOS 虚拟机、安装四个应用和导入 YAML，到用 Claude Code 读取项目文件](docs/media/full-walkthrough.gif)](docs/media/full-walkthrough.gif?raw=true)
 *基于 v1.5.0 的全流程示意，约 1 分 58 秒。画面使用演示数据，Claude 回复为示例。*
+
+首次设置用普通网络；完成设置后，受保护启动只允许客机通过已配置的代理节点出站，不会在代理断开时自动直连。
+
+[填写 YAML](#下载并填写-yaml宿主-mac) · [创建虚拟机](#创建窗口逐项点) · [在客机使用 Claude](#四个应用装好后怎么用客机) · [删除与重建](#删除与重建)
 
 ## 安装管理器（宿主 Mac）
 
@@ -115,3 +111,15 @@
 **没有「彻底重建…」但想从头来？** 走右上角 **新建 VM 及预装软件**，用不同名称创建。先验证新机可以使用，再决定是否备份并删除旧机，不必先冒险删盘。
 
 [遇到问题？空间不足 / 设置助理转圈 / Clash 提示临时路径](docs/first-run-troubleshooting.md) · [完整设置指南](ONE_CLICK_PREINSTALL.md) · [隐私与安全](SECURITY.md)
+
+## 作者使用记录
+
+> **我的使用记录（本人确认：2026-11-21）**：我现在就在用这台虚拟机跑 Claude Code。用 Pro 的 4 天没有被封；升级 Max 后，截至这次记录，用了 2 天，也没有被封。[我的使用分享 ↗](https://x.com/clarkwang258/status/2123747367639994757)
+>
+> **升级 Max 起的日历计数：第 <!-- max-days:start -->8<!-- max-days:end --> 天。** 数字每天按新加坡日期更新，不登录或查询我的 Claude 账号；上面那段是我本人确认过的记录。
+
+## 微信交流群
+
+**[加入 Gold VM 微信交流群](https://weixin.qq.com/g/AQYAAMoC6cPVM_wJbKwTY4TAaGCjDxIoHfW81qVt9QjcPD3nTesOm66syMumSJMb)** · 用微信扫一扫；手机上可长按识别。群邀请有有效期。
+
+<a href="docs/media/wechat-group.png?raw=true"><img src="docs/media/wechat-group.png" width="180" alt="Gold VM 微信交流群二维码，点开放大"></a>

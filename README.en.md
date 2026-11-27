@@ -1,19 +1,15 @@
 # Gold VM Manager
 
-**[Join the Gold VM WeChat group](https://weixin.qq.com/g/AQYAAMoC6cPVM_wJbKwTY4TAaGCjDxIoHfW81qVt9QjcPD3nTesOm66syMumSJMb)** · Scan with WeChat, or long-press the code in WeChat on mobile. Group invitations expire.
+Create a dedicated macOS VM for Claude Code on your Apple Silicon Mac. When Claude needs a project from your Mac, choose a project folder to share. Shared project folders are read-only by default.
 
-<a href="docs/media/wechat-group.png?raw=true"><img src="docs/media/wechat-group.png" width="180" alt="Gold VM WeChat group QR code; click to enlarge"></a>
-
-Run Claude Code in a dedicated macOS VM on an Apple Silicon Mac. First setup uses ordinary networking. After setup, Protected Start restricts outbound traffic to the configured proxy endpoints rather than falling back to a direct connection.
-
-**[Download v1.5.3 source](https://github.com/wbw20000/gold-vm-manager/releases/tag/v1.5.3) · [Watch the full walkthrough](docs/media/full-walkthrough.gif?raw=true) · [Download and fill in the YAML](#download-and-fill-in-the-yaml-host-mac) · [After installing the four apps](#after-installing-the-four-apps-guest) · [简体中文](README.md)**
-
-> **My experience (last personally confirmed: 2026-11-21):** I use this VM for Claude Code. I used Pro for four days without a ban, then upgraded to Max. On my second day of Max, my account was still active. [Why I built this ↗](https://x.com/clarkwang258/status/2123747367639994757)
->
-> **Calendar day since my Max upgrade: <!-- max-days:start -->8<!-- max-days:end -->.** This counter follows the Singapore calendar. It does not sign in to Claude or verify my account status; the dated note above is my personal observation.
+**[Install Gold VM Manager](#install-the-manager-host-mac)** · [Download the v1.5.3 source](https://github.com/wbw20000/gold-vm-manager/releases/tag/v1.5.3) · [简体中文](README.md)
 
 [![Create a macOS VM, install the four apps, import the YAML profile, and read a project file with Claude Code](docs/media/full-walkthrough.gif)](docs/media/full-walkthrough.gif?raw=true)
 *Illustrated walkthrough of v1.5.0 (1 min 58 s, in Chinese). The screens use demo data and show an example Claude response.*
+
+First setup uses ordinary networking. After setup, Protected Start restricts outbound traffic to the configured proxy endpoints rather than falling back to a direct connection.
+
+[Download and fill in the YAML](#download-and-fill-in-the-yaml-host-mac) · [Use Claude in the guest](#after-installing-the-four-apps-guest)
 
 **Already installed and have your YAML?** Start at [Create your first VM](#create-your-first-vm-host-mac), then [install the apps inside it](#first-run-what-to-do-next). Already have a VM? Jump to [daily controls](#daily-controls-host-mac), [shared folders](#share-a-host-folder) or [rebuild and deletion](#rebuild-or-delete-a-vm).
 
@@ -131,3 +127,15 @@ Use this to expose an existing project folder, **not** to install the four apps.
 - For help, give the manager/host versions and the **失败步骤 / 原因 / 代码** (step, reason, code), not your YAML, addresses, credentials, token or raw logs.
 
 [Troubleshooting: disk space, setup spinner, or Clash running from a temporary path](docs/first-run-troubleshooting.md#english) · [Full guide (Chinese)](ONE_CLICK_PREINSTALL.md) · [Security](SECURITY.md)
+
+## Author’s usage notes
+
+> **My experience (last personally confirmed: 2026-11-21):** I use this VM for Claude Code. I used Pro for four days without a ban, then upgraded to Max. On my second day of Max, my account was still active. [Why I built this ↗](https://x.com/clarkwang258/status/2123747367639994757)
+>
+> **Calendar day since my Max upgrade: <!-- max-days:start -->8<!-- max-days:end -->.** This counter follows the Singapore calendar. It does not sign in to Claude or verify my account status; the dated note above is my personal observation.
+
+## WeChat group
+
+**[Join the Gold VM WeChat group](https://weixin.qq.com/g/AQYAAMoC6cPVM_wJbKwTY4TAaGCjDxIoHfW81qVt9QjcPD3nTesOm66syMumSJMb)** · Scan with WeChat, or long-press the code in WeChat on mobile. Group invitations expire.
+
+<a href="docs/media/wechat-group.png?raw=true"><img src="docs/media/wechat-group.png" width="180" alt="Gold VM WeChat group QR code; click to enlarge"></a>

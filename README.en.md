@@ -132,7 +132,7 @@ Use this to expose an existing project folder, **not** to install the four apps.
 
 > **My experience (last personally confirmed: 2026-11-21):** I use this VM for Claude Code. I used Pro for four days without a ban, then upgraded to Max. On my second day of Max, my account was still active. [Why I built this ↗](https://x.com/clarkwang258/status/2123747367639994757)
 >
-> **Calendar day since my Max upgrade: <!-- max-days:start -->8<!-- max-days:end -->.** This counter follows the Singapore calendar. It does not sign in to Claude or verify my account status; the dated note above is my personal observation.
+> **Calendar day since my Max upgrade: <!-- max-days:start -->9<!-- max-days:end -->.** This counter follows the Singapore calendar. It does not sign in to Claude or verify my account status; the dated note above is my personal observation.
 
 ## WeChat group
 
